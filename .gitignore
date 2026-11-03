@@ -1,0 +1,5 @@
+demo-workspace/
+backend/bin/
+*.exe
+.env
+*KEY*.txt
