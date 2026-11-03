@@ -217,3 +217,55 @@ A caller with an `analyze` key gets `403 forbidden_scope` on all `/api/keys*` ro
 ### CLI
 
 `server keys create --name NAME --scope admin|analyze` prints the secret once on stdout. `server keys list` and `server keys revoke ID` also exist. All three use `DATA_DIR` and work while the server is stopped or running.
+
+## Completion notifications (v3)
+
+### Request
+
+`POST /api/analyses` accepts two optional fields:
+
+```json
+{ "repo": "pagination-demo", "baseline": "03492ae", "command_id": "node-test",
+  "notify_url": "https://hooks.example.com/…", "notify_format": "json" }
+```
+
+- `notify_format` is `json` (the default) or `slack`.
+- The server must have `WEBHOOK_SECRET` set. Otherwise any `notify_url` is rejected with `400 webhooks_disabled`.
+- `notify_url` must be `https://`, at most 2048 characters, have no user info, and use port 443 or none. Otherwise `400 invalid_notify_url`.
+- At delivery time the host is resolved. Every resolved address must be public: no loopback, private, link-local, CGNAT, multicast, unspecified, or cloud-metadata addresses, for IPv4 and IPv6 alike. The connection is made only to an address that passed this check, so a DNS rebind between the check and the connection cannot redirect it. Redirects are not followed.
+- **Treat a notify URL as a secret.** Slack webhook URLs contain a token. The full URL is never logged, never returned by the API, and never written to `DATA_DIR`. It lives in memory only until delivery finishes.
+
+### Delivery
+
+- **When:** once, after the analysis reaches `done` or `error`.
+- **Request:** `POST`, `Content-Type: application/json`, `User-Agent: RegressionMap-Webhook/1`, with a 5 s timeout per attempt.
+- **Retries:** up to 3 attempts, with backoff of 1 s and then 4 s. Only network errors and 5xx/429 responses are retried.
+- **Signature (`json` format only):** header `X-RegressionMap-Signature: sha256=<hex HMAC-SHA256 of the exact body using WEBHOOK_SECRET>` and header `X-RegressionMap-Event: analysis.completed`.
+
+`json` body:
+
+```json
+{ "event": "analysis.completed", "id": "a…", "repo": "pagination-demo", "status": "done",
+  "error": "", "baseline": "40-hex", "current": "40-hex",
+  "baseline_passed": true, "current_passed": false,
+  "model_status": "ok",
+  "top_hypothesis": { "rank": 1, "title": "…", "file": "src/pagination.ts",
+                      "line_start": 7, "line_end": 13, "confidence_label": "high" },
+  "created_at": "RFC3339", "finished_at": "RFC3339" }
+```
+
+`top_hypothesis` is `null` when the model produced no valid hypothesis.
+
+`slack` body: `{ "text": "<one-paragraph summary>" }`. The summary contains the repo, the status, PASS/FAIL for the baseline and HEAD, and the top hypothesis title with its `file:line` and confidence. It always ends with "AI-generated hypothesis, not verified." It contains no evidence excerpts and no source code.
+
+### Status on the analysis
+
+`GET /api/analyses/{id}` adds `"notification": null` or:
+
+```json
+{ "host": "hooks.example.com", "format": "json",
+  "status": "pending" | "delivered" | "failed",
+  "attempts": 1, "last_status_code": 200, "last_error": "" }
+```
+
+Only the host is shown. `last_error` never contains the URL path or query.
