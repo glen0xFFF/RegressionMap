@@ -3,3 +3,4 @@ backend/bin/
 *.exe
 .env
 *KEY*.txt
+.data/

@@ -144,3 +144,9 @@ func Worktree(ctx context.Context, dir, sha string) (string, func(), error) {
 	}
 	return wt, cleanup, nil
 }
+
+// Prune drops worktree registrations whose directories no longer exist.
+func Prune(ctx context.Context, dir string) error {
+	_, err := git(ctx, dir, "worktree", "prune")
+	return err
+}

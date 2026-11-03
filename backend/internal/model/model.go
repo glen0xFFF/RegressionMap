@@ -9,10 +9,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"net/http"
 	"path"
+	"strconv"
 	"strings"
 	"time"
 
@@ -64,6 +67,50 @@ type Client struct {
 	APIKey  string
 	Model   string
 	HTTP    *http.Client
+
+	// Retry policy. Zero values mean the defaults below.
+	MaxAttempts int           // total attempts including the first; default 3
+	BackoffBase time.Duration // first backoff ceiling; default 500ms
+	BackoffCap  time.Duration // max single wait, also caps Retry-After; default 8s
+	Timeout     time.Duration // overall deadline across all attempts; default 120s
+
+	rand  func() float64                                   // jitter source in [0,1); nil = math/rand/v2
+	sleep func(ctx context.Context, d time.Duration) error // nil = timer bound to ctx
+}
+
+const (
+	defaultMaxAttempts = 3
+	defaultBackoffBase = 500 * time.Millisecond
+	defaultBackoffCap  = 8 * time.Second
+	defaultTimeout     = 120 * time.Second
+)
+
+func (c *Client) maxAttempts() int {
+	if c.MaxAttempts > 0 {
+		return c.MaxAttempts
+	}
+	return defaultMaxAttempts
+}
+
+func (c *Client) backoffBase() time.Duration {
+	if c.BackoffBase > 0 {
+		return c.BackoffBase
+	}
+	return defaultBackoffBase
+}
+
+func (c *Client) backoffCap() time.Duration {
+	if c.BackoffCap > 0 {
+		return c.BackoffCap
+	}
+	return defaultBackoffCap
+}
+
+func (c *Client) timeout() time.Duration {
+	if c.Timeout > 0 {
+		return c.Timeout
+	}
+	return defaultTimeout
 }
 
 func (c *Client) Configured() bool { return c.APIKey != "" }
@@ -140,24 +187,11 @@ func (c *Client) Analyze(ctx context.Context, in Input) Result {
 			"json_schema": map[string]any{"name": "RegressionHypotheses", "strict": true, "schema": schema()},
 		},
 	})
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimSuffix(c.BaseURL, "/")+"/chat/completions", bytes.NewReader(body))
-	if err != nil {
-		return c.result("error", "could not build request")
-	}
-	req.Header.Set("Authorization", "Bearer "+c.APIKey)
-	req.Header.Set("Content-Type", "application/json")
-	hc := c.HTTP
-	if hc == nil {
-		hc = &http.Client{Timeout: 90 * time.Second}
-	}
-	resp, err := hc.Do(req)
-	if err != nil {
-		return c.result("error", "model request failed: "+scrub(err.Error(), c.APIKey))
-	}
-	defer resp.Body.Close()
-	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if resp.StatusCode != http.StatusOK {
-		return c.result("error", fmt.Sprintf("model API returned HTTP %d: %s", resp.StatusCode, scrub(apiMessage(raw), c.APIKey)))
+	ctx, cancel := context.WithTimeout(ctx, c.timeout())
+	defer cancel()
+	raw, failure := c.post(ctx, body)
+	if failure != "" {
+		return c.result("error", failure)
 	}
 	var cc struct {
 		Choices []struct {
@@ -185,16 +219,131 @@ func (c *Client) Analyze(ctx context.Context, in Input) Result {
 	return r
 }
 
-func apiMessage(raw []byte) string {
+// post sends the chat-completions request, retrying on HTTP 429/500/502/503/504
+// and on transport errors with exponential backoff and full jitter (or the
+// server's Retry-After, capped by BackoffCap). Other statuses and context
+// cancellation end the loop at once. On failure it returns a key-free message
+// that states how many attempts were made.
+func (c *Client) post(ctx context.Context, body []byte) ([]byte, string) {
+	hc := c.HTTP
+	if hc == nil {
+		hc = &http.Client{Timeout: 90 * time.Second}
+	}
+	max := c.maxAttempts()
+	for attempt := 1; ; attempt++ {
+		var wait time.Duration
+		var failure string
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimSuffix(c.BaseURL, "/")+"/chat/completions", bytes.NewReader(body))
+		if err != nil {
+			return nil, "could not build request"
+		}
+		req.Header.Set("Authorization", "Bearer "+c.APIKey)
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := hc.Do(req)
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil, c.stopped(ctx, attempt)
+			}
+			failure = fmt.Sprintf("model request failed after %s: %s", attempts(attempt), scrub(err.Error(), c.APIKey))
+			wait = c.backoff(attempt)
+		} else {
+			raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+			resp.Body.Close()
+			if resp.StatusCode == http.StatusOK {
+				return raw, ""
+			}
+			failure = fmt.Sprintf("model API returned HTTP %d after %s: %s", resp.StatusCode, attempts(attempt), apiMessage(raw, c.APIKey))
+			if !retryableStatus(resp.StatusCode) {
+				return nil, failure
+			}
+			wait = c.backoff(attempt)
+			if ra, ok := retryAfter(resp.Header.Get("Retry-After")); ok {
+				wait = min(ra, c.backoffCap())
+			}
+		}
+		if attempt >= max {
+			return nil, failure
+		}
+		if err := c.doSleep(ctx, wait); err != nil {
+			return nil, c.stopped(ctx, attempt)
+		}
+	}
+}
+
+func (c *Client) stopped(ctx context.Context, attempt int) string {
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return "model request timed out after " + attempts(attempt)
+	}
+	return "model request cancelled after " + attempts(attempt)
+}
+
+func attempts(n int) string {
+	if n == 1 {
+		return "1 attempt"
+	}
+	return fmt.Sprintf("%d attempts", n)
+}
+
+func retryableStatus(code int) bool {
+	switch code {
+	case http.StatusTooManyRequests, http.StatusInternalServerError, http.StatusBadGateway,
+		http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+		return true
+	}
+	return false
+}
+
+// backoff is full jitter: a uniform wait in [0, min(cap, base*2^(attempt-1))).
+func (c *Client) backoff(attempt int) time.Duration {
+	ceil := c.backoffCap()
+	if shift := attempt - 1; shift < 32 {
+		if d := c.backoffBase() << shift; d > 0 && d < ceil {
+			ceil = d
+		}
+	}
+	r := c.rand
+	if r == nil {
+		r = rand.Float64
+	}
+	return time.Duration(r() * float64(ceil))
+}
+
+// retryAfter parses a Retry-After header given in seconds.
+func retryAfter(v string) (time.Duration, bool) {
+	s, err := strconv.Atoi(strings.TrimSpace(v))
+	if err != nil || s < 0 {
+		return 0, false
+	}
+	return time.Duration(s) * time.Second, true
+}
+
+func (c *Client) doSleep(ctx context.Context, d time.Duration) error {
+	if c.sleep != nil {
+		return c.sleep(ctx, d)
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.C:
+		return nil
+	}
+}
+
+// apiMessage extracts the API error message, scrubbing the key BEFORE
+// truncating so a key echoed across the 300-byte cut cannot leak in part.
+func apiMessage(raw []byte, key string) string {
 	var e struct {
 		Error struct {
 			Message string `json:"message"`
 		} `json:"error"`
 	}
+	msg := string(raw)
 	if json.Unmarshal(raw, &e) == nil && e.Error.Message != "" {
-		return truncate(e.Error.Message, 300)
+		msg = e.Error.Message
 	}
-	return truncate(string(raw), 300)
+	return truncate(scrub(msg, key), 300)
 }
 
 func truncate(s string, n int) string {

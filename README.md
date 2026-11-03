@@ -18,9 +18,30 @@ A test passed at a known-good commit and fails now. RegressionMap runs the test 
 
 Licence: MIT (see `LICENSE`).
 
-Not implemented: other test runners than `node --test`, screenshots, ESLint, a production build served by the Go server.
+Production hardening (also verified 2026-11-04):
+
+- Every request passes a middleware chain: access log (method, path, status, duration; never headers or bodies), panic recovery, security headers with a strict Content-Security-Policy, and Host/Origin checks that block DNS rebinding and cross-site requests. POST requests must be `application/json`.
+- The server refuses to listen on a non-loopback address unless `REGRESSIONMAP_ALLOW_REMOTE=1` is set.
+- Model calls retry on HTTP 429, 5xx and network errors with exponential backoff and jitter, honour `Retry-After`, and never retry other 4xx responses.
+- One running analysis per repository (409), a global cap on concurrent analyses (429), a bounded in-memory job list, a whole-analysis timeout, and stale worktree cleanup at startup.
+- With `DATA_DIR`, analyses are saved as JSON files (atomic writes, mode 0600) and survive restarts. `GET /api/analyses` lists them.
+- `WEB_DIR` lets the Go binary serve the built UI, so production is one process. Graceful shutdown on SIGINT/SIGTERM.
+- GitHub Actions CI runs the Go and web suites on Ubuntu and Windows.
+
+Not implemented: other test runners than `node --test`, ESLint.
 
 ## Run it
+
+One command (creates `demo-workspace/` with the fixture if missing, starts the API with `go run` and Vite):
+
+```sh
+scripts/dev.sh                                               # macOS / Linux / Git Bash
+powershell -ExecutionPolicy Bypass -File scripts\dev.ps1     # Windows
+```
+
+The scripts never read a key file themselves. To enable the model step, set `MODEL_API_KEY` or `MODEL_API_KEY_FILE` in your own environment first. The backend reads it.
+
+Or step by step:
 
 ```sh
 # 1. demo repository
@@ -29,7 +50,6 @@ go run ./cmd/mkfixture ../demo-workspace
 
 # 2. API (key stays on the backend; never commit it)
 WORKSPACE_ROOT=../demo-workspace MODEL_API_KEY_FILE=/path/to/key.txt go run ./cmd/server
-#   or MODEL_API_KEY=... ; optional MODEL_ID, MODEL_BASE_URL, ADDR
 
 # 3. UI
 cd ../web
@@ -37,14 +57,53 @@ npm install
 npm run dev        # http://localhost:5173, proxies /api to 127.0.0.1:8787
 ```
 
+Server environment:
+
+| Variable | Default | Notes |
+| --- | --- | --- |
+| `WORKSPACE_ROOT` | (required) | Must be an existing directory. Repositories are its direct children. |
+| `ADDR` | `127.0.0.1:8787` | Must be a loopback address (`127.x`, `::1`, `localhost`). Otherwise the server refuses to start. |
+| `REGRESSIONMAP_ALLOW_REMOTE` | unset | Only `1` allows a non-loopback `ADDR`. A warning is logged, because the API has no authentication. |
+| `MODEL_API_KEY` / `MODEL_API_KEY_FILE` | unset | Model key, or a file that contains only the key. It is never logged. |
+| `MODEL_ID`, `MODEL_BASE_URL` | `muse-spark-1.3`, `https://api.meta.ai/v1` | |
+| `WEB_DIR` | unset | Built UI (`web/dist`, must contain `index.html`), served at `/`. See "Production build". |
+| `DATA_DIR` | unset | Reserved for persisted state. |
+| `LOG_FORMAT` | `text` | `text` or `json` (log/slog on stderr). |
+
+The server stops cleanly on Ctrl+C or SIGTERM: in-flight requests get up to 10 s to finish.
+
 Demo flow: pick `pagination-demo`, pick the first commit as the baseline, start the analysis, read the hypotheses, then run `go run ./cmd/mkfixture -fix ../demo-workspace`, tick the approval box and run the verification. Reset with `git -C demo-workspace/pagination-demo checkout -- src/pagination.ts`.
 
 ## Tests
 
 ```sh
-cd backend && go vet ./... && go test ./...
+cd backend && gofmt -l . && go vet ./... && go test -count=1 ./...   # gofmt -l must print nothing
 cd web && npx vitest run && npx tsc -b && npm run build
 ```
+
+The backend tests need `git` and Node 24 on `PATH`, because the fixture tests run `node --test`.
+
+CI (`.github/workflows/ci.yml`) runs the same checks on every push to `main` and on every pull request, on `ubuntu-latest` and `windows-latest`. The gofmt check runs on Linux only. Windows runners check out with CRLF line endings, which gofmt would flag.
+
+## Production build
+
+```sh
+scripts/build.sh                                             # or: powershell -ExecutionPolicy Bypass -File scripts\build.ps1
+```
+
+This runs `npm ci && npm run build` in `web/` and `go build` into `backend/bin/regressionmap` (`.exe` on Windows). One process then serves the UI and the API on one port:
+
+```sh
+WORKSPACE_ROOT=./demo-workspace WEB_DIR=./web/dist backend/bin/regressionmap
+# open http://127.0.0.1:8787
+```
+
+With `WEB_DIR` set:
+
+- `/api/*` goes to the API.
+- Other GET/HEAD requests are served from `WEB_DIR`. A path that is not a file returns `index.html` (SPA fallback).
+- Other methods outside `/api` return 405.
+- Files are opened through `os.Root`, so `..` and symlinks cannot reach outside `WEB_DIR`.
 
 ## Safety design
 

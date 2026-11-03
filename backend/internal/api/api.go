@@ -6,10 +6,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -18,6 +20,7 @@ import (
 	"regressionmap/internal/gitx"
 	"regressionmap/internal/model"
 	"regressionmap/internal/proc"
+	"regressionmap/internal/store"
 )
 
 // Command is one allowlisted test command. The UI selects it by ID only.
@@ -35,7 +38,12 @@ type Config struct {
 	Root     string // workspace root; repos are its direct children
 	Model    *model.Client
 	Commands []Command
-	Timeout  time.Duration
+	Timeout  time.Duration // per test process
+
+	MaxConcurrent int           // running analyses across all repos (default 2)
+	MaxJobs       int           // analyses kept in memory (default 100)
+	JobTimeout    time.Duration // whole-analysis deadline (default 5 min)
+	DataDir       string        // where analyses are persisted; "" = memory only
 }
 
 type CommandRef struct {
@@ -64,17 +72,51 @@ type Analysis struct {
 	Evidence      []evidence.Item    `json:"evidence"`
 	Model         *model.Result      `json:"model"`
 	Verifications []Verification     `json:"verifications"`
+	CreatedAt     string             `json:"created_at"`
+}
+
+// Summary is one row of GET /api/analyses.
+type Summary struct {
+	ID            string `json:"id"`
+	Repo          string `json:"repo"`
+	Status        string `json:"status"`
+	Baseline      string `json:"baseline"`
+	Current       string `json:"current"`
+	CreatedAt     string `json:"created_at"`
+	CurrentPassed *bool  `json:"current_passed"`
+}
+
+func (a *Analysis) summary() Summary {
+	s := Summary{ID: a.ID, Repo: a.Repo, Status: a.Status, Baseline: a.Baseline, Current: a.Current, CreatedAt: a.CreatedAt}
+	if a.CurrentRun != nil {
+		p := a.CurrentRun.Passed
+		s.CurrentPassed = &p
+	}
+	return s
 }
 
 type Server struct {
 	cfg  Config
 	mux  *http.ServeMux
 	mu   sync.Mutex
-	seq  int
 	jobs map[string]*Analysis
+	// order is insertion order of jobs, used to evict the oldest finished.
+	order []string
+
+	active    int               // running analyses
+	running   map[string]string // repo -> id of its running analysis
+	verifying map[string]bool   // repo -> a verification is running
+	store     *store.Store      // nil when DataDir is empty
+	saveMu    sync.Mutex        // serialises persistence so writes land in order
+	tempDir   string            // where gitx creates regressionmap-wt-* dirs
 }
 
-const maxOutput = 256 << 10
+const (
+	maxOutput   = 256 << 10
+	maxListed   = 50
+	staleTmpAge = time.Hour
+	msgTimedOut = "analysis timed out"
+)
 
 func New(cfg Config) *Server {
 	if cfg.Commands == nil {
@@ -83,11 +125,27 @@ func New(cfg Config) *Server {
 	if cfg.Timeout == 0 {
 		cfg.Timeout = 60 * time.Second
 	}
-	s := &Server{cfg: cfg, mux: http.NewServeMux(), jobs: map[string]*Analysis{}}
+	if cfg.MaxConcurrent <= 0 {
+		cfg.MaxConcurrent = 2
+	}
+	if cfg.MaxJobs <= 0 {
+		cfg.MaxJobs = 100
+	}
+	if cfg.JobTimeout <= 0 {
+		cfg.JobTimeout = 5 * time.Minute
+	}
+	s := &Server{
+		cfg: cfg, mux: http.NewServeMux(), jobs: map[string]*Analysis{},
+		running: map[string]string{}, verifying: map[string]bool{}, tempDir: os.TempDir(),
+	}
+	if cfg.DataDir != "" {
+		s.store = store.New(cfg.DataDir)
+	}
 	s.mux.HandleFunc("GET /api/health", s.health)
 	s.mux.HandleFunc("GET /api/repos", s.repos)
 	s.mux.HandleFunc("GET /api/repos/{name}/commits", s.commits)
 	s.mux.HandleFunc("GET /api/commands", s.commands)
+	s.mux.HandleFunc("GET /api/analyses", s.list)
 	s.mux.HandleFunc("POST /api/analyses", s.create)
 	s.mux.HandleFunc("GET /api/analyses/{id}", s.get)
 	s.mux.HandleFunc("POST /api/analyses/{id}/verify", s.verify)
@@ -114,20 +172,75 @@ func decode(w http.ResponseWriter, r *http.Request, v any) error {
 
 var repoNameRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$`)
 
-// repoDir returns the directory for a repo name, or an error if the name is
-// not a plain child of the workspace root that contains a .git directory.
-func (s *Server) repoDir(name string) (string, error) {
+// repoDir resolves a repo name to its canonical name (the workspace entry
+// that holds it) and its directory, or fails if the name is not a plain child
+// of the workspace root that contains a .git directory. Aliases that reach the
+// same directory (different case or a trailing dot on Windows) resolve to the
+// same canonical name, so busy state keyed by it covers every spelling.
+func (s *Server) repoDir(name string) (string, string, error) {
+	errInvalid := errors.New("invalid repository name")
+	errNotRepo := errors.New("not a git repository in the workspace")
 	if !repoNameRe.MatchString(name) || strings.Contains(name, "..") {
-		return "", errors.New("invalid repository name")
+		return "", "", errInvalid
 	}
-	dir := filepath.Join(s.cfg.Root, name)
-	if filepath.Dir(dir) != filepath.Clean(s.cfg.Root) {
-		return "", errors.New("invalid repository name")
+	root := filepath.Clean(s.cfg.Root)
+	target := filepath.Join(root, name)
+	if filepath.Dir(target) != root {
+		return "", "", errInvalid
 	}
+	want, err := os.Stat(target)
+	if err != nil {
+		return "", "", errNotRepo
+	}
+	ents, err := os.ReadDir(root)
+	if err != nil {
+		return "", "", errNotRepo
+	}
+	canon := ""
+	for _, e := range ents {
+		if !e.IsDir() || !repoNameRe.MatchString(e.Name()) {
+			continue
+		}
+		if st, err := os.Stat(filepath.Join(root, e.Name())); err == nil && os.SameFile(want, st) {
+			canon = e.Name()
+			break
+		}
+	}
+	if canon == "" {
+		// Not a real directory entry (e.g. a symlink): only the exact
+		// entry name is accepted.
+		for _, e := range ents {
+			if e.Name() == name {
+				canon = name
+				break
+			}
+		}
+	}
+	if canon == "" {
+		return "", "", errNotRepo
+	}
+	dir := filepath.Join(root, canon)
 	if st, err := os.Stat(filepath.Join(dir, ".git")); err != nil || !st.IsDir() {
-		return "", errors.New("not a git repository in the workspace")
+		return "", "", errNotRepo
 	}
-	return dir, nil
+	return canon, dir, nil
+}
+
+// repoNames lists the valid repositories directly under the workspace root.
+func (s *Server) repoNames() ([]string, error) {
+	ents, err := os.ReadDir(s.cfg.Root)
+	if err != nil {
+		return nil, err
+	}
+	out := []string{}
+	for _, e := range ents {
+		if e.IsDir() {
+			if canon, _, err := s.repoDir(e.Name()); err == nil && canon == e.Name() {
+				out = append(out, e.Name())
+			}
+		}
+	}
+	return out, nil
 }
 
 func (s *Server) command(id string) (Command, bool) {
@@ -144,24 +257,20 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) repos(w http.ResponseWriter, r *http.Request) {
-	ents, err := os.ReadDir(s.cfg.Root)
+	names, err := s.repoNames()
 	if err != nil {
 		fail(w, 500, "workspace_unreadable", "cannot read workspace root")
 		return
 	}
 	out := []map[string]string{}
-	for _, e := range ents {
-		if e.IsDir() {
-			if _, err := s.repoDir(e.Name()); err == nil {
-				out = append(out, map[string]string{"name": e.Name()})
-			}
-		}
+	for _, n := range names {
+		out = append(out, map[string]string{"name": n})
 	}
 	writeJSON(w, 200, map[string]any{"repos": out})
 }
 
 func (s *Server) commits(w http.ResponseWriter, r *http.Request) {
-	dir, err := s.repoDir(r.PathValue("name"))
+	_, dir, err := s.repoDir(r.PathValue("name"))
 	if err != nil {
 		fail(w, 400, "invalid_repo", err.Error())
 		return
@@ -178,23 +287,144 @@ func (s *Server) commands(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"commands": s.cfg.Commands})
 }
 
-func (s *Server) snapshot(id string) (Analysis, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	a, ok := s.jobs[id]
-	if !ok {
-		return Analysis{}, false
-	}
+// ---- job table -------------------------------------------------------------
+
+// copyLocked returns a copy whose slices the caller may keep. s.mu must be held.
+func copyLocked(a *Analysis) Analysis {
 	c := *a
 	c.Verifications = append([]Verification{}, a.Verifications...)
-	return c, true
+	return c
 }
 
-func (s *Server) update(id string, f func(a *Analysis)) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	f(s.jobs[id])
+// insertLocked adds a to the in-memory table and evicts the oldest finished
+// analyses beyond MaxJobs. Running analyses are never evicted. s.mu must be held.
+func (s *Server) insertLocked(a *Analysis) {
+	if _, ok := s.jobs[a.ID]; !ok {
+		s.order = append(s.order, a.ID)
+	}
+	s.jobs[a.ID] = a
+	for len(s.jobs) > s.cfg.MaxJobs {
+		victim := -1
+		for i, id := range s.order {
+			if j := s.jobs[id]; j != nil && j.Status != "running" {
+				victim = i
+				break
+			}
+		}
+		if victim < 0 {
+			return
+		}
+		delete(s.jobs, s.order[victim])
+		s.order = append(s.order[:victim], s.order[victim+1:]...)
+	}
 }
+
+// loadStored reads an analysis that is not in memory from the store. An
+// analysis persisted as running belongs to a previous process that died.
+func (s *Server) loadStored(id string) (Analysis, bool) {
+	if s.store == nil || !store.ValidID(id) {
+		return Analysis{}, false
+	}
+	b, err := s.store.Load(id)
+	if err != nil {
+		return Analysis{}, false
+	}
+	var a Analysis
+	if err := json.Unmarshal(b, &a); err != nil || a.ID != id {
+		return Analysis{}, false
+	}
+	if a.Status == "running" {
+		a.Status, a.Error = "error", "analysis interrupted: the server stopped while it was running"
+	}
+	if a.ChangedFiles == nil {
+		a.ChangedFiles = []gitx.ChangedFile{}
+	}
+	if a.Evidence == nil {
+		a.Evidence = []evidence.Item{}
+	}
+	if a.Verifications == nil {
+		a.Verifications = []Verification{}
+	}
+	return a, true
+}
+
+func (s *Server) snapshot(id string) (Analysis, bool) {
+	s.mu.Lock()
+	if a, ok := s.jobs[id]; ok {
+		c := copyLocked(a)
+		s.mu.Unlock()
+		return c, true
+	}
+	s.mu.Unlock()
+	return s.loadStored(id)
+}
+
+// mutate applies f to the in-memory analysis (adopting fallback from the
+// store when it was evicted or created by an earlier process) and persists
+// the result. f returns false to skip the change.
+func (s *Server) mutate(id string, fallback *Analysis, f func(a *Analysis) bool) {
+	s.saveMu.Lock()
+	defer s.saveMu.Unlock()
+	s.mu.Lock()
+	a, ok := s.jobs[id]
+	if !ok {
+		if fallback == nil {
+			s.mu.Unlock()
+			return
+		}
+		c := *fallback
+		a = &c
+		s.insertLocked(a)
+	}
+	if !f(a) {
+		s.mu.Unlock()
+		return
+	}
+	b, err := json.Marshal(a)
+	s.mu.Unlock()
+	if err == nil {
+		s.persist(id, b)
+	}
+}
+
+func (s *Server) persist(id string, b []byte) {
+	if s.store == nil {
+		return
+	}
+	if err := s.store.Save(id, b); err != nil {
+		log.Printf("persist analysis %s: %v", id, err)
+	}
+}
+
+// progress updates a running analysis; it is a no-op once the job finished.
+func (s *Server) progress(id string, f func(a *Analysis)) {
+	s.mutate(id, nil, func(a *Analysis) bool {
+		if a.Status != "running" {
+			return false
+		}
+		f(a)
+		return true
+	})
+}
+
+// finish moves a running analysis to its final state and frees its repo and
+// global slots in the same critical section, so a client that sees the final
+// status can immediately start new work on that repo.
+func (s *Server) finish(id string, f func(a *Analysis)) {
+	s.mutate(id, nil, func(a *Analysis) bool {
+		if a.Status != "running" {
+			return false
+		}
+		f(a)
+		if s.running[a.Repo] == id {
+			delete(s.running, a.Repo)
+			s.active--
+		}
+		return true
+	})
+}
+
+// ---- handlers ------------------------------------------------------------
 
 func (s *Server) create(w http.ResponseWriter, r *http.Request) {
 	var req struct {
@@ -206,7 +436,7 @@ func (s *Server) create(w http.ResponseWriter, r *http.Request) {
 		fail(w, 400, "bad_request", "invalid JSON body")
 		return
 	}
-	dir, err := s.repoDir(req.Repo)
+	repo, dir, err := s.repoDir(req.Repo)
 	if err != nil {
 		fail(w, 400, "invalid_repo", err.Error())
 		return
@@ -226,19 +456,73 @@ func (s *Server) create(w http.ResponseWriter, r *http.Request) {
 		fail(w, 400, "invalid_repo", "repository has no HEAD commit")
 		return
 	}
+
+	s.saveMu.Lock()
 	s.mu.Lock()
-	s.seq++
+	switch {
+	case s.running[repo] != "":
+		s.mu.Unlock()
+		s.saveMu.Unlock()
+		fail(w, 409, "analysis_running", "an analysis of this repository is already running")
+		return
+	case s.verifying[repo]:
+		s.mu.Unlock()
+		s.saveMu.Unlock()
+		fail(w, 409, "repo_busy", "a verification of this repository is running")
+		return
+	case s.active >= s.cfg.MaxConcurrent:
+		s.mu.Unlock()
+		s.saveMu.Unlock()
+		fail(w, 429, "too_many_analyses", fmt.Sprintf("at most %d analyses can run at once", s.cfg.MaxConcurrent))
+		return
+	}
 	a := &Analysis{
-		ID: fmt.Sprintf("a%d", s.seq), Status: "running", Repo: req.Repo, Baseline: base, Current: cur,
+		ID: store.NewID(), Status: "running", Repo: repo, Baseline: base, Current: cur,
 		Command: CommandRef{ID: cmd.ID, Argv: cmd.Argv}, ChangedFiles: []gitx.ChangedFile{},
 		Evidence: []evidence.Item{}, Verifications: []Verification{},
+		CreatedAt: time.Now().UTC().Format(time.RFC3339),
 	}
-	s.jobs[a.ID] = a
-	snap := *a
+	s.insertLocked(a)
+	s.running[repo] = a.ID
+	s.active++
+	snap := copyLocked(a)
+	b, err := json.Marshal(a)
 	s.mu.Unlock()
+	if err == nil {
+		s.persist(a.ID, b)
+	}
+	s.saveMu.Unlock()
 
-	go s.run(a.ID, dir, cmd, base, cur)
+	go s.supervise(a.ID, dir, cmd, base, cur)
 	writeJSON(w, 202, snap)
+}
+
+// supervise runs one analysis under JobTimeout. If the deadline passes first
+// the job ends as an error; the run goroutine sees the cancelled context and
+// its later updates are ignored because the job is no longer running.
+func (s *Server) supervise(id, dir string, cmd Command, base, cur string) {
+	ctx, cancel := context.WithTimeout(context.Background(), s.cfg.JobTimeout)
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		defer func() {
+			if p := recover(); p != nil {
+				log.Printf("analysis %s panicked: %v", id, p)
+				s.finish(id, func(a *Analysis) { a.Status, a.Error = "error", "internal error" })
+			}
+		}()
+		s.run(ctx, id, dir, cmd, base, cur)
+	}()
+	select {
+	case <-done:
+	case <-ctx.Done():
+	}
+	msg := "analysis ended without a result"
+	if ctx.Err() != nil {
+		msg = msgTimedOut
+	}
+	s.finish(id, func(a *Analysis) { a.Status, a.Error = "error", msg })
 }
 
 // runAt runs cmd in a temporary worktree checked out at sha. It returns the
@@ -255,33 +539,43 @@ func (s *Server) runAt(ctx context.Context, dir, sha string, cmd Command) (proc.
 	return res, wt, cleanup, nil
 }
 
-func (s *Server) run(id, dir string, cmd Command, base, cur string) {
-	ctx := context.Background()
-	failJob := func(err error) {
-		s.update(id, func(a *Analysis) { a.Status, a.Error = "error", err.Error() })
+func (s *Server) run(ctx context.Context, id, dir string, cmd Command, base, cur string) {
+	// stop ends the job with err (or the timeout) and reports whether the
+	// caller must return.
+	stop := func(err error) bool {
+		if ctx.Err() != nil {
+			err = errors.New(msgTimedOut)
+		}
+		if err == nil {
+			return false
+		}
+		s.finish(id, func(a *Analysis) { a.Status, a.Error = "error", err.Error() })
+		return true
 	}
 
 	baseRun, _, cleanBase, err := s.runAt(ctx, dir, base, cmd)
-	if err != nil {
-		failJob(err)
+	if stop(err) {
+		if cleanBase != nil {
+			cleanBase()
+		}
 		return
 	}
 	cleanBase()
 	curRun, curWT, cleanCur, err := s.runAt(ctx, dir, cur, cmd)
-	if err != nil {
-		failJob(err)
+	if stop(err) {
+		if cleanCur != nil {
+			cleanCur()
+		}
 		return
 	}
 	cleanCur()
 
 	files, err := gitx.ChangedFiles(ctx, dir, base, cur)
-	if err != nil {
-		failJob(err)
+	if stop(err) {
 		return
 	}
 	diff, err := gitx.Diff(ctx, dir, base, cur)
-	if err != nil {
-		failJob(err)
+	if stop(err) {
 		return
 	}
 	failures := evidence.ParseNodeTest(curRun.Stdout, curWT)
@@ -289,7 +583,7 @@ func (s *Server) run(id, dir string, cmd Command, base, cur string) {
 		return gitx.ShowFile(ctx, dir, cur, p)
 	}, evidence.Limits{MaxExcerpt: 3000, MaxTotal: 40000})
 
-	s.update(id, func(a *Analysis) {
+	s.progress(id, func(a *Analysis) {
 		a.BaselineRun, a.CurrentRun, a.ChangedFiles, a.Evidence = &baseRun, &curRun, files, ev
 	})
 
@@ -301,7 +595,10 @@ func (s *Server) run(id, dir string, cmd Command, base, cur string) {
 		Command: strings.Join(cmd.Argv, " "), BaselinePassed: baseRun.Passed, CurrentPassed: curRun.Passed,
 		CurrentExit: curRun.ExitCode, ChangedFiles: paths, Evidence: ev,
 	})
-	s.update(id, func(a *Analysis) { a.Model, a.Status = &mr, "done" })
+	if stop(nil) {
+		return
+	}
+	s.finish(id, func(a *Analysis) { a.Model, a.Status = &mr, "done" })
 }
 
 func (s *Server) get(w http.ResponseWriter, r *http.Request) {
@@ -311,6 +608,45 @@ func (s *Server) get(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, a)
+}
+
+// list returns summaries of in-memory and stored analyses, newest first.
+// IDs are time-sortable, so string order is creation order.
+func (s *Server) list(w http.ResponseWriter, r *http.Request) {
+	rows := map[string]Summary{}
+	s.mu.Lock()
+	for id, a := range s.jobs {
+		rows[id] = a.summary()
+	}
+	s.mu.Unlock()
+	ids := make([]string, 0, len(rows))
+	for id := range rows {
+		ids = append(ids, id)
+	}
+	if s.store != nil {
+		stored, err := s.store.List()
+		if err != nil {
+			log.Printf("list stored analyses: %v", err)
+		}
+		for _, id := range stored {
+			if _, ok := rows[id]; !ok {
+				ids = append(ids, id)
+			}
+		}
+	}
+	sort.Sort(sort.Reverse(sort.StringSlice(ids)))
+	out := []Summary{}
+	for _, id := range ids {
+		if len(out) == maxListed {
+			break
+		}
+		if row, ok := rows[id]; ok {
+			out = append(out, row)
+		} else if a, ok := s.loadStored(id); ok {
+			out = append(out, a.summary())
+		}
+	}
+	writeJSON(w, 200, map[string]any{"analyses": out})
 }
 
 func (s *Server) verify(w http.ResponseWriter, r *http.Request) {
@@ -336,13 +672,74 @@ func (s *Server) verify(w http.ResponseWriter, r *http.Request) {
 		fail(w, 400, "unknown_command", "command_id is not in the allowlist")
 		return
 	}
-	dir, err := s.repoDir(a.Repo)
+	repo, dir, err := s.repoDir(a.Repo)
 	if err != nil {
 		fail(w, 400, "invalid_repo", err.Error())
 		return
 	}
+	s.mu.Lock()
+	if s.running[repo] != "" || s.verifying[repo] {
+		s.mu.Unlock()
+		fail(w, 409, "repo_busy", "an analysis or verification of this repository is running")
+		return
+	}
+	s.verifying[repo] = true
+	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		delete(s.verifying, repo)
+		s.mu.Unlock()
+	}()
+
 	res := proc.Run(r.Context(), proc.Spec{Argv: cmd.Argv, Dir: dir, Timeout: s.cfg.Timeout, MaxOutput: maxOutput})
 	v := Verification{CommandID: cmd.ID, Argv: cmd.Argv, At: time.Now().UTC().Format(time.RFC3339), Run: res}
-	s.update(a.ID, func(a *Analysis) { a.Verifications = append(a.Verifications, v) })
+	s.mutate(a.ID, &a, func(j *Analysis) bool {
+		j.Verifications = append(j.Verifications, v)
+		return true
+	})
 	writeJSON(w, 200, v)
+}
+
+// Cleanup is startup hygiene: it removes regressionmap-wt-* temp dirs older
+// than an hour (left by a crashed process) and then runs "git worktree prune"
+// in every workspace repo that is not busy, dropping their registrations.
+func (s *Server) Cleanup(ctx context.Context) error {
+	var errs []error
+	if ents, err := os.ReadDir(s.tempDir); err == nil {
+		cutoff := time.Now().Add(-staleTmpAge)
+		for _, e := range ents {
+			if !e.IsDir() || !strings.HasPrefix(e.Name(), "regressionmap-wt-") {
+				continue
+			}
+			info, err := e.Info()
+			if err != nil || info.ModTime().After(cutoff) {
+				continue
+			}
+			if err := os.RemoveAll(filepath.Join(s.tempDir, e.Name())); err != nil {
+				errs = append(errs, err)
+			}
+		}
+	} else {
+		errs = append(errs, err)
+	}
+	names, err := s.repoNames()
+	if err != nil {
+		return errors.Join(append(errs, err)...)
+	}
+	for _, n := range names {
+		s.mu.Lock()
+		busy := s.running[n] != "" || s.verifying[n]
+		s.mu.Unlock()
+		if busy {
+			continue
+		}
+		_, dir, err := s.repoDir(n)
+		if err == nil {
+			err = gitx.Prune(ctx, dir)
+		}
+		if err != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", n, err))
+		}
+	}
+	return errors.Join(errs...)
 }

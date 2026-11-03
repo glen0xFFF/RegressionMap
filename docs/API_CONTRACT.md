@@ -37,6 +37,17 @@ The allowlist. The UI picks by `id`; it never sends a command string.
 { "commands": [ { "id": "node-test", "argv": ["node", "--test"], "description": "Run node:test suite" } ] }
 ```
 
+## GET /api/analyses
+
+Newest first, at most 50, in-memory and persisted analyses combined.
+
+```json
+{ "analyses": [ { "id": "a…", "repo": "pagination-demo", "status": "done",
+  "baseline": "40-hex", "current": "40-hex", "created_at": "RFC3339", "current_passed": false } ] }
+```
+
+`current_passed` is false while the current run has not finished.
+
 ## POST /api/analyses
 
 Request:
@@ -51,7 +62,8 @@ Response `202` with an Analysis (status `running`). Poll `GET /api/analyses/{id}
 
 ```jsonc
 {
-  "id": "a1",
+  "id": "a…",                     // opaque, matches ^a[0-9a-z-]{1,40}$
+  "created_at": "RFC3339",
   "status": "running" | "done" | "error",
   "error": "string, only when status=error",
   "repo": "pagination-demo",
@@ -126,3 +138,17 @@ Response `200` with a `Verification`:
 ```
 
 The verification is also appended to the analysis `verifications` list.
+
+## Errors added by production hardening
+
+| Status | `code` | When |
+|---|---|---|
+| 403 | `forbidden_host` | Host header is not an allowed host (default 127.0.0.1, localhost, [::1]). |
+| 403 | `forbidden_origin` | Unsafe method with a foreign `Origin`, `Origin: null`, or `Sec-Fetch-Site` other than same-origin/none. |
+| 415 | `unsupported_media_type` | POST without `Content-Type: application/json`. |
+| 409 | `analysis_running` | An analysis of the same repository is already running. |
+| 409 | `repo_busy` | Verification requested while the repository is being analysed or verified. |
+| 429 | `too_many_analyses` | The global cap on concurrent analyses is reached. |
+| 500 | `internal` | A handler panicked. |
+
+A model `error` result message now states how many attempts were made, for example `model API returned HTTP 503 after 3 attempt(s): …`.

@@ -92,3 +92,32 @@ func TestWorktreeAddRemove(t *testing.T) {
 		t.Fatalf("worktree not removed: %v", err)
 	}
 }
+
+func TestPruneRemovesStaleWorktreeRegistration(t *testing.T) {
+	dir, s := repo(t)
+	ctx := context.Background()
+	wt, _, err := Worktree(ctx, dir, s.Baseline)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Simulate a crash: the temp dir vanished without "git worktree remove".
+	if err := os.RemoveAll(filepath.Dir(wt)); err != nil {
+		t.Fatal(err)
+	}
+	countWT := func() int {
+		out, err := git(ctx, dir, "worktree", "list", "--porcelain")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return strings.Count(out, "worktree ")
+	}
+	if n := countWT(); n != 2 {
+		t.Fatalf("before prune: %d worktrees, want 2", n)
+	}
+	if err := Prune(ctx, dir); err != nil {
+		t.Fatal(err)
+	}
+	if n := countWT(); n != 1 {
+		t.Fatalf("after prune: %d worktrees, want 1", n)
+	}
+}
