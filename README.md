@@ -24,6 +24,8 @@ Production hardening (also verified 2026-11-04):
 - The server refuses to listen on a non-loopback address unless `REGRESSIONMAP_ALLOW_REMOTE=1` is set.
 - Model calls retry on HTTP 429, 5xx and network errors with exponential backoff and jitter, honour `Retry-After`, and never retry other 4xx responses.
 - One running analysis per repository (409), a global cap on concurrent analyses (429), a bounded in-memory job list, a whole-analysis timeout, and stale worktree cleanup at startup.
+- API keys: requests from this machine are trusted. Every other `/api` request needs `Authorization: Bearer rm_live_…`, except `GET /api/health`. Only a SHA-256 hash of each key is stored. Keys have the scope `admin` or `analyze`, are created, listed and revoked from the UI's API Keys page or with `server keys create|list|revoke`, and are limited to `RATE_LIMIT_PER_HOUR` analyses per hour. See `docs/API_CONTRACT.md`.
+- Deployment: `deploy/` holds a hardened Docker image and a Traefik compose file. See `deploy/README.md`.
 - With `DATA_DIR`, analyses are saved as JSON files (atomic writes, mode 0600) and survive restarts. `GET /api/analyses` lists them.
 - `WEB_DIR` lets the Go binary serve the built UI, so production is one process. Graceful shutdown on SIGINT/SIGTERM.
 - GitHub Actions CI runs the Go and web suites on Ubuntu and Windows.
@@ -63,11 +65,13 @@ Server environment:
 | --- | --- | --- |
 | `WORKSPACE_ROOT` | (required) | Must be an existing directory. Repositories are its direct children. |
 | `ADDR` | `127.0.0.1:8787` | Must be a loopback address (`127.x`, `::1`, `localhost`). Otherwise the server refuses to start. |
-| `REGRESSIONMAP_ALLOW_REMOTE` | unset | Only `1` allows a non-loopback `ADDR`. A warning is logged, because the API has no authentication. |
+| `REGRESSIONMAP_ALLOW_REMOTE` | unset | Only `1` allows a non-loopback `ADDR`. It also requires `DATA_DIR` with at least one active `admin` API key, or the server refuses to start. |
+| `ALLOWED_HOSTS` | unset | Comma-separated extra hostnames accepted in the Host and Origin headers, for example `regressionmap.glenox.net`. |
+| `RATE_LIMIT_PER_HOUR` | `20` | Analyses per API key per hour. Local requests are not limited. |
 | `MODEL_API_KEY` / `MODEL_API_KEY_FILE` | unset | Model key, or a file that contains only the key. It is never logged. |
 | `MODEL_ID`, `MODEL_BASE_URL` | `muse-spark-1.3`, `https://api.meta.ai/v1` | |
 | `WEB_DIR` | unset | Built UI (`web/dist`, must contain `index.html`), served at `/`. See "Production build". |
-| `DATA_DIR` | unset | Reserved for persisted state. |
+| `DATA_DIR` | unset | Persisted analyses (`analyses/*.json`) and API keys (`keys.json`, hashes only). |
 | `LOG_FORMAT` | `text` | `text` or `json` (log/slog on stderr). |
 
 The server stops cleanly on Ctrl+C or SIGTERM: in-flight requests get up to 10 s to finish.

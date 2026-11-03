@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"regressionmap/internal/apikeys"
 )
 
 func TestLoadKeyPrefersEnvThenFile(t *testing.T) {
@@ -87,10 +89,28 @@ func TestLoadConfigAddrLoopbackOnly(t *testing.T) {
 	}
 }
 
+// dataDirWithKey returns a DATA_DIR holding one key of the given scope.
+func dataDirWithKey(t *testing.T, scope string, revoked bool) string {
+	t.Helper()
+	dir := t.TempDir()
+	s := apikeys.NewStore(dir)
+	k, _, err := s.Create("boot", scope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if revoked {
+		if err := s.Revoke(k.ID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return dir
+}
+
 func TestLoadConfigRemoteAllowedWithOverrideWarns(t *testing.T) {
 	root := t.TempDir()
 	cfg, warns, err := loadConfig(envOf(map[string]string{
 		"WORKSPACE_ROOT": root, "ADDR": "0.0.0.0:8787", "REGRESSIONMAP_ALLOW_REMOTE": "1",
+		"DATA_DIR": dataDirWithKey(t, apikeys.ScopeAdmin, false),
 	}))
 	if err != nil {
 		t.Fatal(err)
@@ -165,5 +185,104 @@ func TestStartupLogNeverPrintsKey(t *testing.T) {
 	}
 	if _, err := newLogger(&bytes.Buffer{}, "xml"); err == nil {
 		t.Fatal("unknown format must error")
+	}
+}
+
+func TestLoadConfigRemoteRequiresActiveAdminKey(t *testing.T) {
+	root := t.TempDir()
+	base := map[string]string{"WORKSPACE_ROOT": root, "ADDR": "0.0.0.0:8787", "REGRESSIONMAP_ALLOW_REMOTE": "1"}
+	with := func(extra map[string]string) map[string]string {
+		m := map[string]string{}
+		for k, v := range base {
+			m[k] = v
+		}
+		for k, v := range extra {
+			m[k] = v
+		}
+		return m
+	}
+	cases := map[string]struct {
+		env  map[string]string
+		want string
+	}{
+		"no DATA_DIR":       {with(nil), "DATA_DIR"},
+		"empty DATA_DIR":    {with(map[string]string{"DATA_DIR": t.TempDir()}), "admin key"},
+		"only analyze key":  {with(map[string]string{"DATA_DIR": dataDirWithKey(t, apikeys.ScopeAnalyze, false)}), "admin key"},
+		"revoked admin key": {with(map[string]string{"DATA_DIR": dataDirWithKey(t, apikeys.ScopeAdmin, true)}), "admin key"},
+		"loopback addr too": {map[string]string{"WORKSPACE_ROOT": root, "REGRESSIONMAP_ALLOW_REMOTE": "1"}, "DATA_DIR"},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			_, _, err := loadConfig(envOf(tc.env))
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("want error mentioning %q, got %v", tc.want, err)
+			}
+			if !strings.Contains(err.Error(), "keys create") && tc.want == "admin key" {
+				t.Fatalf("error must say how to create a key: %v", err)
+			}
+		})
+	}
+	// A corrupt keys.json refuses to start too.
+	bad := t.TempDir()
+	os.WriteFile(filepath.Join(bad, "keys.json"), []byte("{"), 0o600)
+	if _, _, err := loadConfig(envOf(with(map[string]string{"DATA_DIR": bad}))); err == nil {
+		t.Fatal("corrupt keys.json must refuse to start")
+	}
+	_, warns, err := loadConfig(envOf(with(map[string]string{"DATA_DIR": dataDirWithKey(t, apikeys.ScopeAdmin, false)})))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(strings.Join(warns, " "), "no authentication") {
+		t.Fatalf("warning still claims the API has no authentication: %v", warns)
+	}
+}
+
+func TestLoadConfigAllowedHosts(t *testing.T) {
+	root := t.TempDir()
+	cfg, _, err := loadConfig(envOf(map[string]string{"WORKSPACE_ROOT": root,
+		"ALLOWED_HOSTS": " RegressionMap.Glenox.NET , ,foo.example,10.0.0.5,::1"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(cfg.AllowedHosts, ","); got != "regressionmap.glenox.net,foo.example,10.0.0.5,::1" {
+		t.Fatalf("AllowedHosts = %q", got)
+	}
+	cfg, _, _ = loadConfig(envOf(map[string]string{"WORKSPACE_ROOT": root}))
+	if len(cfg.AllowedHosts) != 0 {
+		t.Fatalf("default AllowedHosts = %v", cfg.AllowedHosts)
+	}
+	for _, bad := range []string{"https://x.example", "x.example:443", "*.example", "a b.example", "-bad.example",
+		"bad-.example", "bad..example", "x.example/path", "user@x.example", strings.Repeat("a", 64) + ".example", "ex\x00ample"} {
+		_, _, err := loadConfig(envOf(map[string]string{"WORKSPACE_ROOT": root, "ALLOWED_HOSTS": "ok.example," + bad}))
+		if err == nil || !strings.Contains(err.Error(), "ALLOWED_HOSTS") {
+			t.Errorf("%q: want ALLOWED_HOSTS error, got %v", bad, err)
+		}
+	}
+}
+
+func TestLoadConfigRateLimit(t *testing.T) {
+	root := t.TempDir()
+	cfg, _, err := loadConfig(envOf(map[string]string{"WORKSPACE_ROOT": root}))
+	if err != nil || cfg.RateLimitPerHour != 20 {
+		t.Fatalf("default = %d, %v", cfg.RateLimitPerHour, err)
+	}
+	cfg, _, err = loadConfig(envOf(map[string]string{"WORKSPACE_ROOT": root, "RATE_LIMIT_PER_HOUR": " 5 "}))
+	if err != nil || cfg.RateLimitPerHour != 5 {
+		t.Fatalf("5 = %d, %v", cfg.RateLimitPerHour, err)
+	}
+	for _, bad := range []string{"0", "-1", "abc", "1.5", "99999999999999999999"} {
+		if _, _, err := loadConfig(envOf(map[string]string{"WORKSPACE_ROOT": root, "RATE_LIMIT_PER_HOUR": bad})); err == nil || !strings.Contains(err.Error(), "RATE_LIMIT_PER_HOUR") {
+			t.Errorf("%q: want RATE_LIMIT_PER_HOUR error, got %v", bad, err)
+		}
+	}
+}
+
+func TestStartupLogShowsAuthSettings(t *testing.T) {
+	var buf bytes.Buffer
+	lg, _ := newLogger(&buf, "json")
+	logStartup(lg, config{Addr: "127.0.0.1:8787", AllowedHosts: []string{"regressionmap.glenox.net"}, RateLimitPerHour: 7}, nil)
+	out := buf.String()
+	if !strings.Contains(out, "regressionmap.glenox.net") || !strings.Contains(out, `"rate_limit_per_hour":7`) {
+		t.Fatalf("startup log lacks auth settings: %s", out)
 	}
 }

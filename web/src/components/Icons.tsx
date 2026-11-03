@@ -75,3 +75,18 @@ export const ShieldIcon = (p: P) => (
     <path d="M9 12l2 2 4-4" />
   </Svg>
 );
+export const KeyIcon = (p: P) => (
+  <Svg {...p}>
+    <circle cx="7.5" cy="15.5" r="4.5" />
+    <path d="M10.7 12.3L21 2" />
+    <path d="M16 7l3 3" />
+    <path d="M18.5 4.5l2 2" />
+  </Svg>
+);
+export const LogOutIcon = (p: P) => (
+  <Svg {...p}>
+    <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" />
+    <path d="M16 17l5-5-5-5" />
+    <path d="M21 12H9" />
+  </Svg>
+);

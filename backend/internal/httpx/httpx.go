@@ -80,6 +80,21 @@ func hostname(hostport string) (string, bool) {
 	return normHost(hostport), true
 }
 
+// HostName is hostname for other packages: the lower-cased host name of a
+// Host header value, without port or IPv6 brackets. ok is false when the
+// value is malformed.
+func HostName(hostport string) (string, bool) { return hostname(hostport) }
+
+// WithDefaultHosts returns DefaultAllowedHosts followed by extra, as a new
+// slice. LocalOnly replaces the defaults with a non-empty list, so a public
+// deployment (ALLOWED_HOSTS) passes this to keep loopback access working.
+// Origins are checked against the same list, for http and https.
+func WithDefaultHosts(extra []string) []string {
+	out := make([]string, 0, len(DefaultAllowedHosts)+len(extra))
+	out = append(out, DefaultAllowedHosts...)
+	return append(out, extra...)
+}
+
 func safeMethod(m string) bool {
 	return m == http.MethodGet || m == http.MethodHead || m == http.MethodOptions
 }

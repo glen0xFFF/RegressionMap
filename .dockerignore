@@ -1,0 +1,18 @@
+# Build context is the repository root (deploy/Dockerfile).
+.git
+.github
+.data
+demo-workspace
+node_modules
+**/node_modules
+web/node_modules
+web/dist
+backend/bin
+*.exe
+**/*.exe
+*.log
+.env
+**/.env
+deploy/.env
+*KEY*.txt
+**/*KEY*.txt

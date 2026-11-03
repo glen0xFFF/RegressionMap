@@ -1,9 +1,34 @@
-// Types mirror docs/API_CONTRACT.md (v1). Keep in sync with the frozen contract.
+// Types mirror docs/API_CONTRACT.md (v1 + v2 auth). Keep in sync with the frozen contract.
 
 export interface Health {
   ok: boolean;
   model_configured: boolean;
   model_id: string;
+  /** v2: true when the caller is not local and must send an API key. */
+  auth_required?: boolean;
+}
+
+export type KeyScope = "analyze" | "admin";
+
+/** Public view of an API key. The secret is never part of it. */
+export interface ApiKey {
+  id: string;
+  name: string;
+  scope: KeyScope;
+  prefix: string;
+  created_at: string;
+  last_used_at: string | null;
+  revoked: boolean;
+}
+
+export type Me =
+  | { mode: "local" }
+  | { mode: "key"; key: Pick<ApiKey, "id" | "name" | "scope" | "prefix"> };
+
+export interface CreatedKey {
+  key: ApiKey;
+  /** Shown once, never stored by the UI. */
+  secret: string;
 }
 
 export interface Repo {

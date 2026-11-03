@@ -356,3 +356,57 @@ details.group[open] > summary::before { transform: rotate(90deg); }
 .run-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 4px; }
 details > summary { cursor: pointer; color: var(--muted); font-size: 12px; }
 .files { list-style: none; padding: 0; margin: 0; }
+
+/* ---------- auth: sign-in, identity, API keys (v2) ---------- */
+.middle.wide { grid-column: 2 / -1; }
+@media (max-width: 1100px) { .middle.wide { grid-column: auto; } }
+input[type="text"], input[type="password"] {
+  font: inherit; color: var(--text); background: var(--bg);
+  border: 1px solid var(--border-strong); border-radius: 8px; padding: 7px 10px; width: 100%; min-width: 0;
+}
+input[type="text"]:focus, input[type="password"]:focus { border-color: var(--accent); outline: none; box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 22%, transparent); }
+input:disabled { opacity: 0.6; }
+.field { display: flex; flex-direction: column; gap: 4px; margin: 8px 0; min-width: 0; }
+.field > span:first-child { color: var(--muted); font-size: 12px; font-weight: 500; }
+.btn-danger { background: var(--fail); border-color: var(--fail); color: #fff; font-weight: 600; }
+.btn-danger:hover:not(:disabled) { background: color-mix(in srgb, var(--fail) 85%, #000); }
+
+.signin-wrap { display: flex; justify-content: center; align-items: flex-start; padding-top: 48px; }
+.signin-card { width: 100%; max-width: 440px; display: flex; flex-direction: column; gap: 6px; box-shadow: inset 3px 0 0 var(--accent); }
+.signin-card .btn-primary { align-self: flex-start; margin-top: 4px; }
+
+.whoami { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
+.whoami-id { display: inline-flex; align-items: center; gap: 4px; min-width: 0; color: var(--text-2); }
+.whoami-name { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 90px; }
+
+.keys-content { display: flex; flex-direction: column; gap: 14px; max-width: 1100px; }
+.keys-create-row { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.4fr) auto; gap: 12px; align-items: end; }
+.keys-create-row .field { margin: 8px 0 0; }
+.keys-create-row select { width: 100%; }
+.keys-create-row .btn-primary { margin-bottom: 0; height: 36px; }
+@media (max-width: 700px) { .keys-create-row { grid-template-columns: minmax(0, 1fr); } }
+.keys-banner { margin: 0; }
+.keys-table-card { padding: 4px 8px; overflow-x: auto; }
+.keys-table td { word-break: normal; vertical-align: middle; }
+.keys-table code { white-space: nowrap; }
+.key-name { font-weight: 600; margin-right: 6px; }
+.key-own { color: var(--accent-text); border-color: var(--accent); }
+.key-revoked td { color: var(--muted); }
+.key-revoked .key-name { text-decoration: line-through; }
+.key-status { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; font-weight: 600; white-space: nowrap; }
+.key-status-active { color: var(--pass); }
+.key-status-revoked { color: var(--muted); }
+.key-actions { text-align: right; white-space: nowrap; }
+.revoke-confirm { display: inline-flex; align-items: center; gap: 6px; flex-wrap: wrap; justify-content: flex-end; white-space: normal; }
+.scope-pill { border: 1px solid var(--border); background: var(--bg-muted); color: var(--text-2); font-family: var(--mono); font-weight: 600; }
+.scope-admin { background: var(--accent-soft); color: var(--accent-text); border-color: color-mix(in srgb, var(--accent) 45%, transparent); }
+
+.secret-card { border-color: var(--accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 22%, transparent); background: var(--accent-soft); }
+.secret-card .card-title .pill { margin-left: auto; }
+.secret-warn { margin: 4px 0 8px; font-weight: 600; color: var(--accent-text); }
+.secret-box {
+  display: flex; align-items: center; gap: 8px; background: var(--bg); border: 1px dashed var(--accent);
+  border-radius: 8px; padding: 8px 8px 8px 12px;
+}
+.secret-text { flex: 1; background: transparent; padding: 0; word-break: break-all; font-size: 13px; user-select: all; }
+pre.curl { white-space: pre-wrap; word-break: break-all; margin-bottom: 10px; background: var(--bg); }

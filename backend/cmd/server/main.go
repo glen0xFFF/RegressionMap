@@ -8,10 +8,23 @@
 //	MODEL_BASE_URL             default https://api.meta.ai/v1
 //	MODEL_ID                   default muse-spark-1.3
 //	ADDR                       default 127.0.0.1:8787; must be loopback unless
-//	REGRESSIONMAP_ALLOW_REMOTE=1 is set (the API has no authentication)
-//	DATA_DIR                   optional directory for persisted state
+//	REGRESSIONMAP_ALLOW_REMOTE=1 is set, which also requires DATA_DIR with at
+//	                           least one active admin key
+//	DATA_DIR                   optional directory for persisted state and keys.json
 //	WEB_DIR                    optional path to the built UI (web/dist); served at /
 //	LOG_FORMAT                 text (default) or json
+//	ALLOWED_HOSTS              comma-separated extra Host/Origin names (e.g. regressionmap.example.com)
+//	RATE_LIMIT_PER_HOUR        per-key POST /api/analyses limit (default 20)
+//
+// Requests that are not local (loopback peer, loopback Host, no
+// X-Forwarded-For/Forwarded) need "Authorization: Bearer <key>" on /api/*,
+// except GET /api/health. The UI files are served without a key.
+//
+// Subcommands manage the keys in DATA_DIR (the server may be running):
+//
+//	server keys create --name NAME --scope admin|analyze
+//	server keys list
+//	server keys revoke ID
 //
 // SIGINT/SIGTERM trigger a graceful shutdown (10s).
 package main
@@ -27,20 +40,26 @@ import (
 	"syscall"
 
 	"regressionmap/internal/api"
+	"regressionmap/internal/apikeys"
 	"regressionmap/internal/httpx"
 	"regressionmap/internal/model"
 )
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "keys" {
+		os.Exit(runKeys(os.Args[2:], os.Getenv, os.Stdout, os.Stderr))
+	}
 	if err := run(); err != nil {
 		fmt.Fprintln(os.Stderr, "regressionmap:", err)
 		os.Exit(1)
 	}
 }
 
-// buildHandler assembles the API, the optional static UI and the security
-// middleware chain (outermost first: access log, panic recovery, security
-// headers, Host/Origin checks).
+// buildHandler assembles the API, the optional static UI and the middleware
+// chain (outermost first): access log, panic recovery, security headers,
+// Host/Origin checks (loopback names plus ALLOWED_HOSTS), API-key auth.
+// Rejections by the inner layers are therefore logged and carry the
+// security headers.
 func buildHandler(cfg config, lg *slog.Logger) (http.Handler, *api.Server, error) {
 	mc := &model.Client{BaseURL: cfg.ModelBaseURL, APIKey: cfg.Key, Model: cfg.ModelID}
 	apiSrv := api.New(api.Config{Root: cfg.Root, Model: mc, DataDir: cfg.DataDir})
@@ -48,7 +67,17 @@ func buildHandler(cfg config, lg *slog.Logger) (http.Handler, *api.Server, error
 	if err != nil {
 		return nil, nil, err
 	}
-	return httpx.Chain(h, httpx.AccessLog(lg), httpx.Recover(lg), httpx.SecurityHeaders, httpx.LocalOnlyFor(nil)), apiSrv, nil
+	var keys *apikeys.Store
+	if cfg.DataDir != "" {
+		keys = apikeys.NewStore(cfg.DataDir)
+	}
+	return httpx.Chain(h,
+		httpx.AccessLog(lg),
+		httpx.Recover(lg),
+		httpx.SecurityHeaders,
+		httpx.LocalOnlyFor(httpx.WithDefaultHosts(cfg.AllowedHosts)),
+		apikeys.Middleware(apikeys.Options{Store: keys, RateLimitPerHour: cfg.RateLimitPerHour}),
+	), apiSrv, nil
 }
 
 func run() error {

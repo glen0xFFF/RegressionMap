@@ -51,7 +51,10 @@ RegressionMap is not a chatbot. The tools collect the evidence deterministically
 ## New work completed during the hackathon
 The work was built from an empty repository on 2026-11-04, inside the Oct 26 – Nov 4, 2026 window.
 - `95a14f5` — Go API, evidence collection, Meta model integration with schema validation, approval-gated verification, demo fixture generator, API contract, README, MIT licence. `go test ./...` passes for all 7 packages.
-- **TODO:** commit hash for the React UI (`web/`). The UI is built and has its own tests, but it is not committed yet.
+- `b5a95c4` — React UI: three-pane layout, pull-request style diff with each hypothesis shown as an inline comment, walkthrough and changes table, approval-gated verification card. 76 vitest tests pass.
+- `fadabf2` — Production hardening: Host/Origin checks against DNS rebinding and cross-site requests, security headers, model retries with backoff, per-repository and global job limits, persisted analyses, single-binary serving of the UI, graceful shutdown, GitHub Actions CI.
+- `397c193` — Frozen API contract for API keys, remote mode and rate limits.
+- **TODO:** commit hash for API keys, remote mode and deployment files (in progress).
 
 ## Demo flow
 1. Run `go run ./cmd/mkfixture ../demo-workspace` to create `pagination-demo`. Commit 1 passes. Commit 2 makes an unrelated formatting change. Commit 3 introduces an off-by-one bug.
@@ -67,6 +70,11 @@ The work was built from an empty repository on 2026-11-04, inside the Oct 26 –
 - Only `node --test` is on the command allowlist in this version.
 - Analyses are kept in memory and are lost when the server restarts.
 
+## Live demo
+https://regressionmap.glenox.net
+
+**TODO — not live yet.** The DNS record exists (Cloudflare, proxied to the server), but the app is not deployed. Before submitting, check that the URL loads over HTTPS, that `/api/health` returns `"ok": true`, and that one analysis completes. Visitors need an API key: the hosted instance runs in remote mode, where every `/api` call except the health check requires `Authorization: Bearer`. Create a judges' key with the `analyze` scope and give it to them through the submission form, never in this file.
+
 ## Public repository
 https://github.com/glen0xFFF/RegressionMap
 
@@ -79,7 +87,8 @@ https://github.com/glen0xFFF/RegressionMap
 ## Final pre-submit checklist
 - [x] The repository is public. Anonymous HTTP 200 on 2026-11-04.
 - [x] The Meta model integration is real and has been run live.
-- [ ] The UI commit is pushed and its hash is added above.
+- [x] The UI commit is pushed and its hash is added above.
+- [ ] The live demo URL loads over HTTPS, and a judges' API key works on it.
 - [ ] The demo video is uploaded, and the link opens without requesting access.
 - [ ] All claims still match the code at the final commit.
 - [ ] All team members are added.

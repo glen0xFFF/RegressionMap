@@ -1,0 +1,79 @@
+# RegressionMap on glenox-server, behind Coolify's Traefik (coolify-proxy).
+# Run from the repository root:
+#
+#   docker compose -f deploy/docker-compose.yml build
+#   docker compose -f deploy/docker-compose.yml up -d
+#
+# No ports are published on the host. Traefik reaches the container over the
+# external "coolify" network on port 8080. See deploy/README.md.
+
+name: regressionmap
+
+services:
+  regressionmap:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: regressionmap:local
+    container_name: regressionmap
+    restart: unless-stopped
+
+    # deploy/.env holds MODEL_API_KEY only (chmod 600, never committed, never
+    # in the image). Compose refuses to start if it is missing.
+    env_file:
+      - .env
+    environment:
+      - ALLOWED_HOSTS=regressionmap.glenox.net
+      - RATE_LIMIT_PER_HOUR=20
+
+    networks:
+      - coolify
+
+    volumes:
+      - regressionmap-data:/data
+      - regressionmap-workspace:/workspace
+
+    # Hardening. The root filesystem is read-only; git worktrees and test
+    # runs use os.TempDir(), so /tmp is a writable tmpfs.
+    read_only: true
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,noexec,size=256m,mode=1777
+    user: "10001:10001"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 256
+    mem_limit: 1g
+    cpus: 1.0
+    stop_grace_period: 15s
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=coolify"
+      - "traefik.http.middlewares.regressionmap-redirect.redirectscheme.scheme=https"
+      - "traefik.http.routers.regressionmap-http.entryPoints=http"
+      - "traefik.http.routers.regressionmap-http.middlewares=regressionmap-redirect"
+      - "traefik.http.routers.regressionmap-http.rule=Host(`regressionmap.glenox.net`)"
+      - "traefik.http.routers.regressionmap-https.entryPoints=https"
+      - "traefik.http.routers.regressionmap-https.rule=Host(`regressionmap.glenox.net`)"
+      - "traefik.http.routers.regressionmap-https.tls=true"
+      - "traefik.http.routers.regressionmap-https.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.regressionmap-https.service=regressionmap"
+      - "traefik.http.services.regressionmap.loadbalancer.server.port=8080"
+
+networks:
+  coolify:
+    external: true
+
+volumes:
+  regressionmap-data:
+    name: regressionmap-data
+  regressionmap-workspace:
+    name: regressionmap-workspace

@@ -423,3 +423,100 @@ func TestFullChainPanicLoggedAs500(t *testing.T) {
 		t.Fatalf("log leaks Authorization: %s", logs)
 	}
 }
+
+// A public deployment passes defaults + ALLOWED_HOSTS; the browser then
+// sends Host and Origin with the public name over https.
+func TestLocalOnlyPublicHost(t *testing.T) {
+	allowed := WithDefaultHosts([]string{"regressionmap.glenox.net"})
+	tests := []struct {
+		name     string
+		method   string
+		host     string
+		origin   string
+		site     string
+		wantCode int
+		wantErr  string
+	}{
+		{name: "public same-origin POST", method: "POST", host: "regressionmap.glenox.net",
+			origin: "https://regressionmap.glenox.net", site: "same-origin", wantCode: 200},
+		{name: "public host with port", method: "POST", host: "regressionmap.glenox.net:443",
+			origin: "https://regressionmap.glenox.net:443", site: "same-origin", wantCode: 200},
+		{name: "public host upper case", method: "GET", host: "RegressionMap.Glenox.NET", wantCode: 200},
+		{name: "defaults still accepted", method: "POST", host: "127.0.0.1:8787",
+			origin: "http://127.0.0.1:8787", site: "same-origin", wantCode: 200},
+		{name: "evil host", method: "POST", host: "evil.example",
+			origin: "https://evil.example", site: "same-origin", wantCode: 403, wantErr: "forbidden_host"},
+		{name: "evil origin to public host", method: "POST", host: "regressionmap.glenox.net",
+			origin: "https://evil.example", site: "cross-site", wantCode: 403, wantErr: "forbidden_origin"},
+		{name: "evil origin without fetch-site", method: "POST", host: "regressionmap.glenox.net",
+			origin: "https://evil.example", wantCode: 403, wantErr: "forbidden_origin"},
+		{name: "suffix trick origin", method: "POST", host: "regressionmap.glenox.net",
+			origin: "https://regressionmap.glenox.net.evil.example", site: "same-origin", wantCode: 403, wantErr: "forbidden_origin"},
+		{name: "subdomain host not allowed", method: "GET", host: "x.regressionmap.glenox.net", wantCode: 403, wantErr: "forbidden_host"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			called := false
+			h := LocalOnly(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { called = true }), allowed)
+			req := httptest.NewRequest(tc.method, "/api/analyses", strings.NewReader(`{}`))
+			req.Host = tc.host
+			req.Header.Set("Content-Type", "application/json")
+			if tc.origin != "" {
+				req.Header.Set("Origin", tc.origin)
+			}
+			if tc.site != "" {
+				req.Header.Set("Sec-Fetch-Site", tc.site)
+			}
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+			if rec.Code != tc.wantCode {
+				t.Fatalf("status = %d, want %d; body=%q", rec.Code, tc.wantCode, rec.Body.String())
+			}
+			if tc.wantErr == "" {
+				if !called {
+					t.Fatal("next not called")
+				}
+				return
+			}
+			if called {
+				t.Fatal("next called for rejected request")
+			}
+			if got := decodeErr(t, rec).Error.Code; got != tc.wantErr {
+				t.Fatalf("code = %q, want %q", got, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestWithDefaultHosts(t *testing.T) {
+	got := WithDefaultHosts([]string{"a.example", "B.Example"})
+	want := []string{"127.0.0.1", "localhost", "[::1]", "a.example", "B.Example"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+	if strings.Join(WithDefaultHosts(nil), ",") != strings.Join(DefaultAllowedHosts, ",") {
+		t.Fatal("nil extras must give the defaults")
+	}
+	// The result must not alias DefaultAllowedHosts.
+	got[0] = "changed"
+	if DefaultAllowedHosts[0] != "127.0.0.1" {
+		t.Fatal("WithDefaultHosts mutated DefaultAllowedHosts")
+	}
+}
+
+func TestHostName(t *testing.T) {
+	cases := map[string]string{
+		"127.0.0.1:8787": "127.0.0.1", "LOCALHOST": "localhost", "[::1]:80": "::1", "[::1]": "::1",
+		"regressionmap.glenox.net": "regressionmap.glenox.net",
+	}
+	for in, want := range cases {
+		if got, ok := HostName(in); !ok || got != want {
+			t.Errorf("HostName(%q) = %q, %v; want %q", in, got, ok, want)
+		}
+	}
+	for _, bad := range []string{"", "::1", "[::1", "a:b:c"} {
+		if _, ok := HostName(bad); ok {
+			t.Errorf("HostName(%q) must fail", bad)
+		}
+	}
+}

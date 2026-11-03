@@ -1,8 +1,14 @@
-import { HistoryIcon, SearchIcon, SparkleIcon } from "./Icons";
+import { HistoryIcon, KeyIcon, LogOutIcon, SearchIcon, SparkleIcon } from "./Icons";
 import type { RecentEntry } from "../layout";
-import type { Health, Loadable } from "../types";
+import type { Health, Loadable, Me } from "../types";
 
-export type View = "analyze" | "history";
+export type View = "analyze" | "history" | "keys";
+
+/** Key management is offered to local callers and to admin-scope keys only. */
+export function canManageKeys(me: Me | null | undefined): boolean {
+  if (!me) return false;
+  return me.mode === "local" || me.key.scope === "admin";
+}
 
 function fmtDate(iso: string): string {
   const d = new Date(iso);
@@ -18,6 +24,8 @@ export function Sidebar({
   onOpenRecent,
   health,
   activeId,
+  me,
+  onSignOut,
 }: {
   view: View;
   onView: (v: View) => void;
@@ -26,6 +34,9 @@ export function Sidebar({
   onOpenRecent: (id: string) => void;
   health: Loadable<Health> | null;
   activeId?: string | null;
+  me?: Me | null;
+  /** Present only while an API key is stored. */
+  onSignOut?: () => void;
 }) {
   return (
     <aside className="sidebar">
@@ -47,6 +58,11 @@ export function Sidebar({
         <button type="button" className={view === "history" ? "nav-item active" : "nav-item"} onClick={() => onView("history")}>
           <HistoryIcon /> History
         </button>
+        {canManageKeys(me) && (
+          <button type="button" className={view === "keys" ? "nav-item active" : "nav-item"} onClick={() => onView("keys")}>
+            <KeyIcon /> API Keys
+          </button>
+        )}
       </nav>
 
       <div className="section-label">RECENT</div>
@@ -87,6 +103,21 @@ export function Sidebar({
             <span className="dot dot-pass" aria-hidden="true" /> backend ok ·{" "}
             <span className="warn">model not configured</span>
           </span>
+        )}
+        {(me?.mode === "key" || onSignOut) && (
+          <div className="whoami">
+            {me?.mode === "key" && (
+              <span className="whoami-id" title={`API key ${me.key.name} (${me.key.scope})`}>
+                <KeyIcon size={13} /> <span className="whoami-name">{me.key.name}</span>{" "}
+                <code>{`${me.key.prefix}…`}</code>
+              </span>
+            )}
+            {onSignOut && (
+              <button type="button" className="btn-outline btn-sm" onClick={onSignOut}>
+                <LogOutIcon size={13} /> Sign out
+              </button>
+            )}
+          </div>
         )}
       </div>
     </aside>

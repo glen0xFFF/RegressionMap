@@ -43,6 +43,7 @@ func TestBuildHandlerAppliesSecurityChain(t *testing.T) {
 
 	req = httptest.NewRequest("GET", "/api/analyses", nil)
 	req.Host = "localhost"
+	req.RemoteAddr = "127.0.0.1:50000" // v2: only a loopback peer is local (httptest defaults to 192.0.2.1)
 	rec = httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	if rec.Code != 200 {

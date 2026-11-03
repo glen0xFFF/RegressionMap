@@ -1,11 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { api, errorMessage } from "./api";
+import { api, clearStoredKey, errorMessage, getStoredKey, onUnauthorized, setStoredKey } from "./api";
 import { formatElapsed, upsertRecent, type RecentEntry } from "./layout";
 import { shouldPoll } from "./logic";
 import { MiddlePanel } from "./components/MiddlePanel";
 import { RightPanel } from "./components/RightPanel";
-import { Sidebar, type View } from "./components/Sidebar";
-import type { Analysis, Command, Commit, Health, Loadable, Repo, Verification } from "./types";
+import { Sidebar, canManageKeys, type View } from "./components/Sidebar";
+import { SignIn } from "./components/SignIn";
+import { KeysPage } from "./components/KeysPage";
+import type { Analysis, Command, Commit, Health, Loadable, Me, Repo, Verification } from "./types";
 
 function useLoad<T>(fn: (() => Promise<T>) | null, deps: unknown[]): [Loadable<T> | null, () => void] {
   const [val, setVal] = useState<Loadable<T> | null>(null);
@@ -51,14 +53,58 @@ function saveRecent(list: RecentEntry[]) {
 }
 
 export default function App() {
-  const [health, reloadHealth] = useLoad<Health>(api.health, []);
-  const [repos, reloadRepos] = useLoad<Repo[]>(() => api.repos().then((r) => r.repos ?? []), []);
-  const [commands, reloadCommands] = useLoad<Command[]>(() => api.commands().then((r) => r.commands ?? []), []);
+  // Bumped on sign-in and sign-out so every load runs again with the new key.
+  const [authEpoch, setAuthEpoch] = useState(0);
+  const [authNeeded, setAuthNeeded] = useState(false);
+  const [hasKey, setHasKey] = useState(() => getStoredKey() !== null);
+  const [me, setMe] = useState<Me | null>(null);
+
+  // Any 401 for the key we currently hold (or for no key) means: sign in.
+  // A late 401 for a request sent before the current key was stored is ignored.
+  useEffect(
+    () =>
+      onUnauthorized((sent) => {
+        if (sent !== getStoredKey()) return;
+        clearStoredKey();
+        setHasKey(false);
+        setMe(null);
+        setAuthNeeded(true);
+      }),
+    [],
+  );
+
+  const [health, reloadHealth] = useLoad<Health>(api.health, [authEpoch]);
+  const [repos, reloadRepos] = useLoad<Repo[]>(() => api.repos().then((r) => r.repos ?? []), [authEpoch]);
+  const [commands, reloadCommands] = useLoad<Command[]>(() => api.commands().then((r) => r.commands ?? []), [authEpoch]);
+
+  // Who am I? Decides the sign-in card and the API Keys nav item.
+  useEffect(() => {
+    if (health?.state !== "ok") return;
+    if (health.data.auth_required && !getStoredKey()) {
+      setMe(null);
+      setAuthNeeded(true);
+      return;
+    }
+    let cancelled = false;
+    api.me().then(
+      (m) => {
+        if (cancelled) return;
+        setMe(m);
+        setAuthNeeded(false);
+      },
+      () => {
+        /* 401 is handled by onUnauthorized; an older backend without /api/me just has no identity */
+      },
+    );
+    return () => {
+      cancelled = true;
+    };
+  }, [health]);
 
   const [repo, setRepo] = useState("");
   const [baseline, setBaseline] = useState("");
   const [commandId, setCommandId] = useState("");
-  const [commits] = useLoad<Commit[]>(repo ? () => api.commits(repo).then((r) => r.commits ?? []) : null, [repo]);
+  const [commits] = useLoad<Commit[]>(repo ? () => api.commits(repo).then((r) => r.commits ?? []) : null, [repo, authEpoch]);
 
   useEffect(() => {
     if (repos?.state === "ok" && !repo && repos.data.length > 0) setRepo(repos.data[0].name);
@@ -173,6 +219,23 @@ export default function App() {
     }
   }
 
+  function signedIn(m: Me, key: string) {
+    setStoredKey(key);
+    setHasKey(true);
+    setMe(m);
+    setAuthNeeded(false);
+    setAuthEpoch((n) => n + 1);
+  }
+
+  function signOut() {
+    clearStoredKey();
+    setHasKey(false);
+    setMe(null);
+    clear();
+    setView("analyze");
+    setAuthEpoch((n) => n + 1);
+  }
+
   const selectEvidence = useCallback((id: string) => {
     setHighlight(id);
     setHighlightSeq((n) => n + 1);
@@ -280,9 +343,20 @@ export default function App() {
         onOpenRecent={openRecent}
         health={health}
         activeId={analysis?.id ?? null}
+        me={me}
+        onSignOut={hasKey ? signOut : undefined}
       />
 
-      {view === "history" ? (
+      {authNeeded ? (
+        <section className="middle wide" data-testid="signin">
+          <div className="topbar">
+            <h2 className="topbar-title">Sign in</h2>
+          </div>
+          <SignIn onSignedIn={signedIn} />
+        </section>
+      ) : view === "keys" && canManageKeys(me) ? (
+        <KeysPage me={me} />
+      ) : view === "history" ? (
         <section className="middle">
           <div className="topbar">
             <h2 className="topbar-title">History</h2>
@@ -333,13 +407,15 @@ export default function App() {
         />
       )}
 
-      <RightPanel
-        analysis={analysis}
-        elapsed={analysis ? (elapsed[analysis.id] ?? null) : null}
-        commands={commandList}
-        onSelectEvidence={selectEvidence}
-        onVerified={onVerified}
-      />
+      {!authNeeded && !(view === "keys" && canManageKeys(me)) && (
+        <RightPanel
+          analysis={analysis}
+          elapsed={analysis ? (elapsed[analysis.id] ?? null) : null}
+          commands={commandList}
+          onSelectEvidence={selectEvidence}
+          onVerified={onVerified}
+        />
+      )}
     </div>
   );
 }

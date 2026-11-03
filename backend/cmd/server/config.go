@@ -6,10 +6,13 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"net/netip"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
+	"regressionmap/internal/apikeys"
 	"regressionmap/internal/model"
 )
 
@@ -27,6 +30,80 @@ type config struct {
 	Key          string // MODEL_API_KEY or MODEL_API_KEY_FILE
 	ModelBaseURL string // MODEL_BASE_URL
 	ModelID      string // MODEL_ID
+
+	AllowedHosts     []string // ALLOWED_HOSTS, extra Host/Origin names (lower-cased)
+	RateLimitPerHour int      // RATE_LIMIT_PER_HOUR, per-key POST /api/analyses limit, default 20
+}
+
+// parseAllowedHosts splits ALLOWED_HOSTS on commas, trims and lower-cases
+// each entry, skips empty ones, and accepts only bare host names or IP
+// addresses (no scheme, port, path or wildcard).
+func parseAllowedHosts(v string) ([]string, error) {
+	var out []string
+	for _, h := range strings.Split(v, ",") {
+		h = strings.ToLower(strings.TrimSpace(h))
+		if h == "" {
+			continue
+		}
+		if !validHostname(h) {
+			return nil, fmt.Errorf("ALLOWED_HOSTS entry %q is not a host name (use names like regressionmap.example.com, without scheme or port)", h)
+		}
+		out = append(out, h)
+	}
+	return out, nil
+}
+
+// validHostname accepts an IP address or a DNS name of letters, digits and
+// hyphens in labels of 1-63 characters, at most 253 characters in all.
+func validHostname(h string) bool {
+	if _, err := netip.ParseAddr(h); err == nil {
+		return !strings.Contains(h, "%")
+	}
+	if len(h) > 253 {
+		return false
+	}
+	for _, label := range strings.Split(h, ".") {
+		if len(label) == 0 || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+		for i := 0; i < len(label); i++ {
+			c := label[i]
+			if !(c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || c == '-') {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func parseRateLimit(v string) (int, error) {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return apikeys.DefaultRateLimitPerHour, nil
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		return 0, fmt.Errorf("RATE_LIMIT_PER_HOUR %q must be a positive integer", v)
+	}
+	return n, nil
+}
+
+// checkRemoteKeys enforces that REGRESSIONMAP_ALLOW_REMOTE=1 only starts
+// with DATA_DIR set and at least one active admin key in it, so a remote
+// deployment is never reachable without someone able to manage keys.
+func checkRemoteKeys(dataDir string) error {
+	const how = "create one first with: server keys create --name admin --scope admin (with DATA_DIR set)"
+	if dataDir == "" {
+		return errors.New("REGRESSIONMAP_ALLOW_REMOTE=1 requires DATA_DIR (it holds keys.json with the API keys); " + how)
+	}
+	ok, err := apikeys.NewStore(dataDir).HasActiveAdmin()
+	if err != nil {
+		return fmt.Errorf("REGRESSIONMAP_ALLOW_REMOTE=1: cannot read the API keys in DATA_DIR: %v", err)
+	}
+	if !ok {
+		return fmt.Errorf("REGRESSIONMAP_ALLOW_REMOTE=1 requires at least one active admin key in DATA_DIR %q; %s", dataDir, how)
+	}
+	return nil
 }
 
 func loadKey(getenv func(string) string) (string, error) {
@@ -81,7 +158,18 @@ func loadConfig(getenv func(string) string) (config, []string, error) {
 		if !cfg.AllowRemote {
 			return config{}, nil, fmt.Errorf("ADDR %q is not a loopback address; refusing to expose the API (it runs git and test commands). Set REGRESSIONMAP_ALLOW_REMOTE=1 to override", cfg.Addr)
 		}
-		warns = append(warns, fmt.Sprintf("WARNING: REGRESSIONMAP_ALLOW_REMOTE=1 - listening on non-loopback %s. The API has no authentication and can run allowlisted test commands; anyone who can reach this address can use it.", cfg.Addr))
+		warns = append(warns, fmt.Sprintf("WARNING: REGRESSIONMAP_ALLOW_REMOTE=1 - listening on non-loopback %s. Non-local /api requests need an API key (Authorization: Bearer); the UI files and GET /api/health are public. Anyone holding a key can run allowlisted test commands.", cfg.Addr))
+	}
+	if cfg.AllowRemote {
+		if err := checkRemoteKeys(cfg.DataDir); err != nil {
+			return config{}, nil, err
+		}
+	}
+	if cfg.AllowedHosts, err = parseAllowedHosts(getenv("ALLOWED_HOSTS")); err != nil {
+		return config{}, nil, err
+	}
+	if cfg.RateLimitPerHour, err = parseRateLimit(getenv("RATE_LIMIT_PER_HOUR")); err != nil {
+		return config{}, nil, err
 	}
 
 	if cfg.WebDir != "" {
@@ -143,5 +231,7 @@ func logStartup(lg *slog.Logger, cfg config, warns []string) {
 		"model_configured", cfg.Key != "",
 		"web_dir", cfg.WebDir,
 		"data_dir", cfg.DataDir,
+		"allowed_hosts", strings.Join(cfg.AllowedHosts, ","),
+		"rate_limit_per_hour", cfg.RateLimitPerHour,
 	)
 }
