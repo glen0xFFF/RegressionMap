@@ -54,7 +54,7 @@ The work was built from an empty repository on 2026-11-04, inside the Oct 26 –
 - `b5a95c4` — React UI: three-pane layout, pull-request style diff with each hypothesis shown as an inline comment, walkthrough and changes table, approval-gated verification card. 76 vitest tests pass.
 - `fadabf2` — Production hardening: Host/Origin checks against DNS rebinding and cross-site requests, security headers, model retries with backoff, per-repository and global job limits, persisted analyses, single-binary serving of the UI, graceful shutdown, GitHub Actions CI.
 - `397c193` — Frozen API contract for API keys, remote mode and rate limits.
-- **TODO:** commit hash for API keys, remote mode and deployment files (in progress).
+- `bf73db2` — API keys (hashed, admin/analyze scopes, per-key rate limit, UI page and CLI), remote mode, hardened Docker image and Traefik deployment.
 
 ## Demo flow
 1. Run `go run ./cmd/mkfixture ../demo-workspace` to create `pagination-demo`. Commit 1 passes. Commit 2 makes an unrelated formatting change. Commit 3 introduces an off-by-one bug.
@@ -73,7 +73,21 @@ The work was built from an empty repository on 2026-11-04, inside the Oct 26 –
 ## Live demo
 https://regressionmap.glenox.net
 
-**TODO — not live yet.** The DNS record exists (Cloudflare, proxied to the server), but the app is not deployed. Before submitting, check that the URL loads over HTTPS, that `/api/health` returns `"ok": true`, and that one analysis completes. Visitors need an API key: the hosted instance runs in remote mode, where every `/api` call except the health check requires `Authorization: Bearer`. Create a judges' key with the `analyze` scope and give it to them through the submission form, never in this file.
+Live since 2026-11-04. It runs on the author's server as a hardened Docker container behind Traefik, with a Let's Encrypt certificate, through Cloudflare. Checks measured on 2026-11-04 against the public URL:
+
+- `https://regressionmap.glenox.net/` returns 200. Plain HTTP redirects to HTTPS (301).
+- `GET /api/health` returns `{"auth_required":true,"model_configured":true,"model_id":"muse-spark-1.3","ok":true}`.
+- `GET /api/repos` without a key returns 401. With an invalid key it also returns 401.
+- One analysis with an admin key completed:
+  - the baseline passed and HEAD exited with code 1;
+  - 9 evidence items were collected;
+  - the model returned `ok` with 0 rejected hypotheses;
+  - rank 1, high confidence: "Off-by-one in paginate slice end index in src/pagination.ts" (lines 7–13), citing E1–E4, E6 and E9;
+  - the unrelated `format.ts` change and the test edit were ranked low.
+
+Visitors need an API key, because every `/api` call except the health check requires `Authorization: Bearer`. **TODO:** create a judges' key with the `analyze` scope (`docker compose -f deploy/docker-compose.yml exec regressionmap /app/regressionmap keys create --name judges --scope analyze` on the server) and give it to the judges through the submission form, never in this file.
+
+On the hosted instance, the verification step runs the tests on the demo repository as it is. Visitors cannot apply the fix there, so verification shows FAIL. The full fix-then-PASS flow is in the demo video and works locally.
 
 ## Public repository
 https://github.com/glen0xFFF/RegressionMap
@@ -88,7 +102,8 @@ https://github.com/glen0xFFF/RegressionMap
 - [x] The repository is public. Anonymous HTTP 200 on 2026-11-04.
 - [x] The Meta model integration is real and has been run live.
 - [x] The UI commit is pushed and its hash is added above.
-- [ ] The live demo URL loads over HTTPS, and a judges' API key works on it.
+- [x] The live demo URL loads over HTTPS. The admin key works (measured 2026-11-04).
+- [ ] A judges' `analyze` key is created and given through the submission form.
 - [ ] The demo video is uploaded, and the link opens without requesting access.
 - [ ] All claims still match the code at the final commit.
 - [ ] All team members are added.
