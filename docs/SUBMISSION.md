@@ -1,0 +1,86 @@
+# Hackathon Submission — RegressionMap
+
+> Draft. Every statement below was checked against the code or a real run on 2026-11-04 unless it is marked **TODO**. Fill the TODO items before submitting.
+
+## Project name
+RegressionMap
+
+## Track
+Build for Your World
+
+## Short tagline
+Evidence-driven regression investigation for developers.
+
+## Problem
+A test passed last week and fails today. To find out why, a developer has to read the test output, follow the stack trace, look through the diff, and decide which change is responsible. They do this by hand, and an unrelated change in the same range can hide the real one.
+
+## Solution
+RegressionMap takes a local Git repository, a known-good baseline commit, and an allowed test command. It then does the following:
+
+1. Runs the tests at the baseline and at HEAD, each in a temporary `git worktree`, and records the real exit codes and output.
+2. Collects evidence and gives each item a stable ID (E1, E2, …): failing assertions with actual and expected values, stack frames with the real source lines, diff hunks, and the current source of changed files.
+3. Sends this bounded, redacted evidence bundle to a Meta model and asks for ranked root-cause hypotheses as strict JSON. Each hypothesis must cite evidence IDs and may list counter-evidence.
+4. Validates every hypothesis. Any hypothesis that cites an unknown ID, names a file outside the evidence, uses an unsafe path, or gives an invalid line range is rejected and shown as rejected.
+5. Lets the developer apply a fix and approve a verification rerun. The test runner's exit code decides PASS or FAIL. The model never does.
+
+## What makes it different
+RegressionMap is not a chatbot. The tools collect the evidence deterministically, and the model only ranks and explains it. Every AI claim points to evidence the user can inspect. The UI labels the output "AI-generated hypotheses — not verified". The model's suggested verification is shown as text and is never executed.
+
+## Meta technology
+- **Model:** `muse-spark-1.3`
+- **Access method:** OpenAI-compatible Chat Completions, `POST https://api.meta.ai/v1/chat/completions`, with `Authorization: Bearer $MODEL_API_KEY`. Source: https://dev.meta.ai/docs/protocols/chat-completions
+- **Structured output:** `response_format` of type `json_schema` with `strict: true`. Source: https://dev.meta.ai/docs/structured-output
+- **What the model does:** ranks plausible causes, explains each hypothesis using the cited evidence, lists counter-evidence, and states its limitations.
+- **What stays deterministic:** git diff extraction, test execution, evidence collection and IDs, secret redaction, output validation, and the PASS/FAIL result of verification.
+- **Live result observed on 2026-11-04 with the demo fixture:**
+  - The baseline test passed and HEAD failed with exit code 1.
+  - RegressionMap collected 9 evidence items.
+  - The model ranked "Off-by-one in paginate slice end" in `src/pagination.ts` first, with high confidence, citing E1–E4, E6 and E9.
+  - It ranked the unrelated `format.ts` change and the test edit as low and cited counter-evidence against both.
+  - No hypotheses were rejected.
+  - After the fix, the approved verification run exited with code 0.
+
+## Safety
+- No shell is involved. Git and test processes are started from argument arrays. Revisions must be `HEAD` or hex, and are resolved to a full SHA before use.
+- Test commands come from an allowlist and are selected by ID. Each run has a timeout and an output cap.
+- A verification run requires `"approved": true`. The Run button stays disabled until the user ticks the approval box.
+- Repositories must be direct children of the configured workspace root.
+- The API key is kept on the backend only. It is never returned to the browser, it is scrubbed from error messages, and it is removed from the environment of test processes.
+- Likely secrets in the evidence are redacted before the model request.
+
+## New work completed during the hackathon
+The work was built from an empty repository on 2026-11-04, inside the Oct 26 – Nov 4, 2026 window.
+- `95a14f5` — Go API, evidence collection, Meta model integration with schema validation, approval-gated verification, demo fixture generator, API contract, README, MIT licence. `go test ./...` passes for all 7 packages.
+- **TODO:** commit hash for the React UI (`web/`). The UI is built and has its own tests, but it is not committed yet.
+
+## Demo flow
+1. Run `go run ./cmd/mkfixture ../demo-workspace` to create `pagination-demo`. Commit 1 passes. Commit 2 makes an unrelated formatting change. Commit 3 introduces an off-by-one bug.
+2. In the UI, pick `pagination-demo` and the first commit as the baseline, then start the analysis.
+3. Show the baseline PASS (exit 0) and the HEAD FAIL (exit 1) with the real assertion: `actual: [ 1, 2 ]`, `expected: [ 1, 2, 3 ]`.
+4. Show the evidence list and the ranked hypotheses with their evidence citations. Point out that the unrelated change is ranked low and has counter-evidence.
+5. Run `go run ./cmd/mkfixture -fix ../demo-workspace`, tick the approval box, and run the verification. Show the real PASS with exit code 0.
+
+## Limitations
+- The hypotheses rank plausible causes. They do not prove causation.
+- The confidence label is a qualitative estimate, not a calibrated probability.
+- Evidence parsing is built for `node --test` output. Other runners would produce a failure summary without parsed stack frames.
+- Only `node --test` is on the command allowlist in this version.
+- Analyses are kept in memory and are lost when the server restarts.
+
+## Public repository
+https://github.com/glen0xFFF/RegressionMap
+
+## Three-minute demo video
+**TODO:** paste the public or unlisted video URL once it has been uploaded.
+
+## Team
+**TODO:** list every team member. The repository owner is glen0xFFF (Dev Glenox).
+
+## Final pre-submit checklist
+- [x] The repository is public. Anonymous HTTP 200 on 2026-11-04.
+- [x] The Meta model integration is real and has been run live.
+- [ ] The UI commit is pushed and its hash is added above.
+- [ ] The demo video is uploaded, and the link opens without requesting access.
+- [ ] All claims still match the code at the final commit.
+- [ ] All team members are added.
+- [ ] The official form confirms that the submission went through.
