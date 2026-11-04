@@ -12,7 +12,11 @@
 #     The REPO value below is the name of that directory on the server.
 #   - The server tests the HEAD of that clone. Keep the clone up to date (for
 #     example a `git fetch && git checkout <sha>` on the server) or the analysis
-#     looks at an older commit than the one that failed here.
+#     looks at an older commit than the one that failed here. The script then
+#     adds a warning to the summary: it compares the analysed HEAD with
+#     GITHUB_SHA. On pull_request events GITHUB_SHA is the merge commit GitHub
+#     made, which the server's clone does not have, so the warning shows there
+#     unless the clone holds that commit. The exit code does not change.
 #   - So you need a SELF-HOSTED RegressionMap server with your repository in
 #     WORKSPACE_ROOT. The hosted demo contains only `pagination-demo`; for any
 #     other repository it answers `400 invalid_repo`, and the script exits 4.
@@ -86,8 +90,9 @@ jobs:
         env:
           SCRIPT_URL: https://raw.githubusercontent.com/glen0xFFF/RegressionMap/<PINNED_SHA>/scripts/ci-analyze.sh
           SCRIPT_SHA256: <SCRIPT_SHA256>
+        # -q first: curl reads no .curlrc, which could add options to this call.
         run: |
-          curl -fsSL --proto '=https' --tlsv1.2 "$SCRIPT_URL" -o "$RUNNER_TEMP/ci-analyze.sh"
+          curl -q -fsSL --proto '=https' --tlsv1.2 "$SCRIPT_URL" -o "$RUNNER_TEMP/ci-analyze.sh"
           echo "$SCRIPT_SHA256  $RUNNER_TEMP/ci-analyze.sh" | sha256sum -c -
 
       - name: Analyze the regression
@@ -117,5 +122,7 @@ jobs:
               echo "::notice::No baseline commit (first push of a new branch?). Skipping."
               exit 0 ;;
           esac
-          # Exit codes: 0 done, 2 analysis error, 3 timeout, 4 HTTP/auth error.
+          # Exit codes: 0 done, 1 usage error, 2 analysis error, 3 timeout,
+          # 4 HTTP/auth error. Server text in this step's log is fenced with a
+          # random ::stop-commands:: token, so it cannot run workflow commands.
           sh "$RUNNER_TEMP/ci-analyze.sh"
