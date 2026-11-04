@@ -27,6 +27,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	"unicode"
+	"unicode/utf8"
 )
 
 const (
@@ -46,8 +48,10 @@ const (
 // backoff[i] is the wait before attempt i+2.
 var backoff = [MaxAttempts - 1]time.Duration{1 * time.Second, 4 * time.Second}
 
-// ErrBlockedAddress means the host resolved to at least one non-public address.
-var ErrBlockedAddress = errors.New("host resolves to a non-public address")
+// ErrBlockedAddress means the host resolved to at least one non-public
+// address, or to none at all. Its text never names an address, so the
+// result of a delivery cannot be used to map internal DNS names.
+var ErrBlockedAddress = errors.New("host does not resolve to a public address")
 
 // Resolver looks up a host's addresses. *net.Resolver satisfies it.
 type Resolver interface {
@@ -64,7 +68,7 @@ func Validate(raw string) (*url.URL, error) {
 	if raw == "" {
 		return nil, errors.New("notify_url is empty")
 	}
-	if len(raw) > MaxURLLength {
+	if utf8.RuneCountInString(raw) > MaxURLLength {
 		return nil, fmt.Errorf("notify_url is longer than %d characters", MaxURLLength)
 	}
 	u, err := url.Parse(raw)
@@ -98,10 +102,21 @@ var blockedPrefixes = []netip.Prefix{
 	netip.MustParsePrefix("64:ff9b:1::/48"), // local-use NAT64
 	netip.MustParsePrefix("100::/64"),       // discard-only
 	netip.MustParsePrefix("fec0::/10"),      // deprecated site-local
+
+	// IPv6 that embeds an IPv4 address (v3 addendum).
+	netip.MustParsePrefix("2002::/16"),       // 6to4
+	netip.MustParsePrefix("2001::/32"),       // Teredo
+	netip.MustParsePrefix("::ffff:0:0:0/96"), // IPv4-translated (SIIT)
+
+	// Documentation ranges (v3 addendum).
+	netip.MustParsePrefix("192.0.2.0/24"),    // TEST-NET-1
+	netip.MustParsePrefix("198.51.100.0/24"), // TEST-NET-2
+	netip.MustParsePrefix("203.0.113.0/24"),  // TEST-NET-3
+	netip.MustParsePrefix("2001:db8::/32"),   // IPv6 documentation
 }
 
-// IsPublic reports whether ip is a public unicast address. IPv4-mapped IPv6
-// addresses are judged by their IPv4 address.
+// IsPublic reports whether ip is a public unicast address. An IPv4-mapped
+// address (::ffff:a.b.c.d) is judged by the IPv4 address it carries.
 func IsPublic(ip netip.Addr) bool {
 	if !ip.IsValid() || ip.Zone() != "" {
 		return false
@@ -252,23 +267,45 @@ func (s *Sender) vettedDial(ctx context.Context, network, addr string) (net.Conn
 	if err != nil {
 		return nil, err
 	}
+	ips, err := s.vet(ctx, host)
+	if err != nil {
+		return nil, err
+	}
+	return s.dialVetted(ctx, network, ips, port)
+}
+
+// vet resolves host and returns its addresses only if every one is public.
+// A refusal is the bare ErrBlockedAddress: it never names an address, and a
+// name that does not exist or has no address gives the same answer as one
+// that resolves to a private address.
+func (s *Sender) vet(ctx context.Context, host string) ([]netip.Addr, error) {
 	var ips []netip.Addr
 	if ip, err := netip.ParseAddr(host); err == nil {
 		ips = []netip.Addr{ip}
 	} else {
 		ips, err = s.resolver().LookupNetIP(ctx, "ip", host)
+		var de *net.DNSError
+		if errors.As(err, &de) && de.IsNotFound {
+			return nil, ErrBlockedAddress
+		}
 		if err != nil {
 			return nil, fmt.Errorf("resolve %s: %w", host, scrubDNS(err))
 		}
 	}
 	if len(ips) == 0 {
-		return nil, fmt.Errorf("resolve %s: no addresses", host)
+		return nil, ErrBlockedAddress
 	}
 	for _, ip := range ips {
 		if !IsPublic(ip) {
-			return nil, fmt.Errorf("%w (%s)", ErrBlockedAddress, ip.Unmap())
+			return nil, ErrBlockedAddress
 		}
 	}
+	return ips, nil
+}
+
+// dialVetted dials the vetted ips in order. Without the DialContext seam it
+// uses a net.Dialer whose Control re-checks every address at connect time.
+func (s *Sender) dialVetted(ctx context.Context, network string, ips []netip.Addr, port string) (net.Conn, error) {
 	dial := s.DialContext
 	if dial == nil {
 		d := &net.Dialer{Timeout: DefaultTimeout, Control: publicOnlyControl}
@@ -359,11 +396,13 @@ func (s *Sender) Send(ctx context.Context, raw, format string, p Payload) Result
 		code, err := s.attempt(ctx, c, u, body, sig, timeout)
 		res.StatusCode = code
 		switch {
+		case errors.Is(err, ErrBlockedAddress):
+			// The fixed text only: a dial error from the connect-time
+			// check would otherwise name the address.
+			res.Err = ErrBlockedAddress.Error()
+			return res
 		case err != nil:
 			res.Err = clean(err, u)
-			if errors.Is(err, ErrBlockedAddress) {
-				return res
-			}
 		case code >= 200 && code < 300:
 			res.Delivered, res.Err = true, ""
 			return res
@@ -403,13 +442,15 @@ func (s *Sender) attempt(ctx context.Context, c *http.Client, u *url.URL, body [
 }
 
 // clean renders err without the URL: *url.Error is unwrapped (its message
-// embeds the full URL) and any remaining path or query text is removed.
+// embeds the full URL), control characters are removed (the text can come
+// from the receiver, for example a certificate name) and any remaining path
+// or query text is removed.
 func clean(err error, u *url.URL) string {
 	var ue *url.Error
 	if errors.As(err, &ue) {
 		err = ue.Err
 	}
-	msg := err.Error()
+	msg := StripControl(err.Error())
 	for _, part := range []string{u.String(), u.RawQuery, u.Query().Encode(), u.EscapedPath(), u.Path, u.Fragment} {
 		if len(part) > 1 {
 			msg = strings.ReplaceAll(msg, part, "")
@@ -419,4 +460,16 @@ func clean(err error, u *url.URL) string {
 		msg = "delivery failed"
 	}
 	return msg
+}
+
+// StripControl removes the C0 and C1 control characters (U+0000 to U+001F
+// and U+007F to U+009F) from s, so text that came from outside cannot break
+// a log line or forge a record.
+func StripControl(s string) string {
+	return strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) {
+			return -1
+		}
+		return r
+	}, s)
 }

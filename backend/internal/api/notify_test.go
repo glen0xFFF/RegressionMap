@@ -350,8 +350,9 @@ func TestNotifyAfterErrorStatusExactlyOnce(t *testing.T) {
 
 // tlsReceiver is a TLS webhook receiver plus a real notify.Sender whose
 // resolver maps the receiver's certificate host (example.com) to a public
-// TEST-NET-3 address. The injected dialer is called only with an address
-// that passed the public-IP check, and routes it to the local receiver.
+// address. The injected dialer is called only with an address that passed
+// the public-IP check, and routes it to the local receiver. (The TEST-NET
+// ranges are not public under the v3 addendum, so they cannot stand in.)
 type tlsReceiver struct {
 	srv    *httptest.Server
 	sender *notify.Sender
@@ -372,12 +373,12 @@ func newTLSReceiver(t *testing.T) *tlsReceiver {
 		w.WriteHeader(200)
 	}))
 	t.Cleanup(r.srv.Close)
-	vetted := netip.MustParseAddr("203.0.113.7")
+	vetted := netip.MustParseAddr("93.184.216.34")
 	r.sender = &notify.Sender{
 		Secret:   []byte(testWebhookSecret),
 		Resolver: staticResolver{"example.com": {vetted}},
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			if addr != "203.0.113.7:443" {
+			if addr != "93.184.216.34:443" {
 				t.Errorf("dial to unexpected address %s", addr)
 			}
 			var d net.Dialer
