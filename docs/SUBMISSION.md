@@ -47,7 +47,7 @@ RegressionMap is not a chatbot. The tools collect the evidence deterministically
 - Repositories must be direct children of the configured workspace root.
 - The API key is kept on the backend only. It is never returned to the browser and it is scrubbed from error messages.
 - Test runs, verification runs and git never receive the model key, the webhook secret, or any variable whose name ends in `_KEY`, `_SECRET`, `_TOKEN` or `_PASSWORD`. An operator can let named variables through to test and verification runs with `TEST_ENV_ALLOW`, never to git and never the server's own secrets. The startup log lists the names, never the values, of the variables that test runs do not get.
-- Completion webhooks are off unless the operator sets `WEBHOOK_SECRET` (at least 32 characters). `json` deliveries are signed with HMAC-SHA256. The server sends them only over `https://` to hosts whose every address is public, checks the address again at connect time, follows no redirects, and never logs, returns or stores the full notify URL.
+- Completion webhooks are off unless the operator sets `WEBHOOK_SECRET` (at least 32 characters, counted as Unicode characters, not bytes). `json` deliveries are signed with HMAC-SHA256. The server sends them only over `https://` to hosts whose every address is public, checks the address again at connect time, follows no redirects, and never logs, returns or stores the full notify URL.
 - Likely secrets in the evidence are redacted before the model request.
 
 ## New work completed during the hackathon

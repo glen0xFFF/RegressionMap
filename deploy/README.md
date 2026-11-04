@@ -51,7 +51,7 @@ printf 'MODEL_API_KEY=%s\n' "$(tr -d '\r\n' < /path/to/your-model-key.txt)" > re
 
 **Enable webhooks (optional).** Without `WEBHOOK_SECRET` the server answers every `notify_url` with `400 webhooks_disabled`. To enable completion webhooks, add a second line to the same file before you copy it.
 
-- The secret must be at least 32 characters. A shorter one stops the server at startup with `WEBHOOK_SECRET must be at least 32 characters (it is the HMAC key of webhook signatures); unset it to disable webhooks`. With `restart: unless-stopped` the container then restarts in a loop, and the UI and API are down.
+- The secret must be at least 32 characters (Unicode characters, not bytes). A shorter one stops the server at startup with `WEBHOOK_SECRET must be at least 32 characters (it is the HMAC key of webhook signatures); unset it to disable webhooks`. With `restart: unless-stopped` the container then restarts in a loop, and the UI and API are down.
 - It is used exactly as written: no quotes, no spaces. `openssl rand -hex 32` gives 64 hex characters.
 - Receivers need the same value to check signatures. It is one secret for the whole server, so give it only to receivers you trust (see "CI and notifications" in the root `README.md`).
 - Keep `webhook-secret.txt` where you keep the model key file. Every later replacement of `deploy/.env` needs it again.
@@ -228,6 +228,8 @@ Every line the server logs is JSON. The exceptions are these plain-text lines:
 - `regressionmap: <error>`, which the server prints when it cannot start (for example after a too-short `WEBHOOK_SECRET`) or exits with an error;
 - the entrypoint's own `entrypoint: …` lines;
 - on a start where `/workspace/pagination-demo` does not exist yet (the first start with a new volume), the four lines of the demo fixture builder that the entrypoint runs: `created /workspace/pagination-demo`, `baseline <sha>`, `refactor <sha>` and `bug      <sha>`. If the builder fails, it prints its error as plain text instead and the container exits.
+
+In the JSON lines, every string value (the message, string fields and error values) has each character from U+0080 to U+009F, each Unicode format character (category Cf, for example U+202E) and U+2028/U+2029 written as the six-character escape `\uXXXX` (four lowercase hex digits); the JSON encoder already escapes U+0000 to U+001F.
 
 A failed webhook delivery is a `WARN` line with the message `notification failed` and the fields `analysis`, `host`, `attempts`, `status_code` and `error`. It never holds the URL path or query.
 
