@@ -66,8 +66,13 @@ func TestRedactPathParity(t *testing.T) {
 
 	// Invisible characters must stay visible in review: the file holds only
 	// printable ASCII and line breaks (CRLF is allowed, as Windows checkouts use it).
-	for i, ch := range strings.ReplaceAll(string(raw), "\r\n", "\n") {
-		if ch != '\n' && (ch < 0x20 || ch > 0x7e) {
+	// i is the byte offset in the file as read, CRs included.
+	text := string(raw)
+	for i, ch := range text {
+		if ch == '\n' || (ch == '\r' && strings.HasPrefix(text[i+1:], "\n")) {
+			continue
+		}
+		if ch < 0x20 || ch > 0x7e {
 			t.Fatalf("%s holds the raw character %+q at byte %d; every non-ASCII and control character must be written as a \\u escape. Regenerate with:\n  %s", parityFile, ch, i, parityRegen)
 		}
 	}
