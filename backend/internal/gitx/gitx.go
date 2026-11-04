@@ -13,6 +13,7 @@ import (
 	"regexp"
 	"strings"
 	"time"
+	"unicode"
 
 	"regressionmap/internal/proc"
 )
@@ -178,6 +179,44 @@ func Commits(ctx context.Context, dir string, n int) ([]Commit, error) {
 		cs = append(cs, Commit{SHA: parts[0], Short: parts[0][:7], Subject: parts[1]})
 	}
 	return cs, nil
+}
+
+// CommitMessage is one commit with its full message.
+type CommitMessage struct {
+	SHA     string // 40 hex characters
+	Message string // the raw message (%B) without trailing white space
+}
+
+// CommitMessages returns up to n commits that cur has and base has not
+// (git log base..cur), newest first. truncated reports that git's output
+// was over the read cap; the commit that the cap cut is left out.
+//
+// git ends every record with a NUL, so the text after the last NUL is never
+// a whole record: it is empty, or the record the cap cut. The output is read
+// through run, not gitPartial: cutting it at a line break could drop the NUL
+// of a whole record and lose that commit too.
+func CommitMessages(ctx context.Context, dir, base, cur string, n int) ([]CommitMessage, bool, error) {
+	if err := requireSHA(base, cur); err != nil {
+		return nil, false, err
+	}
+	out, err := run(ctx, dir, outputCap, "log", "-z", "--no-color", "--no-show-signature",
+		"--format=%H%n%B", fmt.Sprintf("-n%d", n), base+".."+cur, "--")
+	var le *LimitError
+	truncated := errors.As(err, &le)
+	if err != nil && !truncated {
+		return nil, false, err
+	}
+	recs := strings.Split(out, "\x00")
+	recs = recs[:len(recs)-1]
+	cs := []CommitMessage{}
+	for _, r := range recs {
+		sha, msg, _ := strings.Cut(r, "\n")
+		if !shaRe.MatchString(sha) {
+			continue
+		}
+		cs = append(cs, CommitMessage{SHA: sha, Message: strings.TrimRightFunc(msg, unicode.IsSpace)})
+	}
+	return cs, truncated, nil
 }
 
 func requireSHA(shas ...string) error {
