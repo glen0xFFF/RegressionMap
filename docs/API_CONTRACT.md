@@ -361,3 +361,57 @@ The complete validation, in the order applied:
 ### Not in this addendum
 
 Per-key webhook secrets and a signed timestamp header need a later contract version. The Slack text still shows URLs from model-written titles as links.
+
+## Corrections of record to the v3 addendum (2026-11-04)
+
+These entries correct or complete the addendum above after the final review of the v3 build. No line above is changed. The code already behaves as described here; for entries 3, 4 and 5 it does so from the same release as this section.
+
+### 1. Model validation (corrects item 2 of "The complete validation")
+
+Item 2 of the list in "Model input and output" reads in full:
+
+2. A hypothesis is rejected, with its reason in `rejected`, when it cites no supporting evidence id, cites an unknown id, names an unsafe file or one that is not in the evidence, has a line range that starts below 1 or ends before it starts (`0`–`0` means unknown and is allowed), has a range that is not within 3 lines of an evidence span for the same file when the evidence has a known line range for that file, has an unknown confidence label, has a rank below 1, or repeats the rank of an earlier hypothesis (the first one is kept).
+
+The evidence has a known line range for a file when at least one evidence item for that file has `line_start` above 0. Without one, the 3-line rule does not apply to that file. The two range reasons read `invalid line range <start>-<end>` and `line range <start>-<end> does not overlap any evidence for <file> (within 3 lines)`.
+
+### 2. Plain-text log lines (completes "`last_error` and logs")
+
+"With `LOG_FORMAT=json` every log line is JSON" means every line written through the server's logger. These lines stay plain text:
+
+- `regressionmap: <error>`, printed on stderr when the server cannot start or exits with an error. Configuration errors are found before the logger exists, so this line cannot be JSON.
+- In the Docker image, the container entrypoint's own `entrypoint: …` lines and, on a start where `/workspace/pagination-demo` does not exist yet, the lines the demo fixture builder prints: `created /workspace/pagination-demo`, `baseline <sha>`, `refactor <sha>` and `bug      <sha>`, or its error text if it fails.
+
+### 3. Escaping in JSON log lines (new log rule)
+
+With `LOG_FORMAT=json`, every string value the logger writes has each character from U+0080 to U+009F, each Unicode format character (general category Cf) and U+2028 and U+2029 written as the six-character escape `\uXXXX`, with four lowercase hex digits. This covers the message, attribute values of kind string, and error values, which are written as their error text. U+0000 to U+001F are escaped by the JSON encoder, as before. The `text` format does not change; it already quotes these characters.
+
+### 4. Characters in the `notify_url` host (addition to the URL rules)
+
+A `notify_url` whose host contains a control character (U+0000 to U+001F or U+007F to U+009F), a Unicode format character (category Cf), a white-space character, a space, line or paragraph separator (categories Zs, Zl and Zp), or invalid UTF-8 is refused with `400 invalid_notify_url` and the message `notify_url is not a valid URL`.
+
+- The host is checked after percent-decoding, so the raw form (for example U+0085 in the JSON string) and the percent-encoded form (`%C2%85`) are both refused.
+- Other non-ASCII letters stay allowed: an internationalised host such as `bücher.example` is accepted.
+- The check runs right after the URL is parsed and before the `https://` check. The order of the request checks in "Notification request checks" does not change.
+
+### 5. `WEBHOOK_SECRET` length (no rule change)
+
+The minimum of 32 characters in "Server configuration (v3)" counts Unicode characters, not bytes, as the 2048-character limit of `notify_url` does. The error text stays `WEBHOOK_SECRET must be at least 32 characters (it is the HMAC key of webhook signatures); unset it to disable webhooks`. A release before this one counted bytes, so it accepted a shorter secret made of multibyte characters.
+
+### 6. Analysis fields, evidence and warnings (completes the addendum)
+
+- **`finished_at`:** `GET /api/analyses/{id}` carries `finished_at` (RFC 3339, UTC) once the analysis has finished. It is set in the same update that moves the status from `running` to `done` or `error`, and is omitted while the analysis runs. An analysis that a previous process left `running`, and that is read back from `DATA_DIR` as `error`, has no `finished_at`. Rows of `GET /api/analyses` do not carry it.
+- **Evidence `file`:** each path segment goes through the evidence secret redaction on its own, so the part of a segment that looks like a secret becomes `[REDACTED]` and the rest of the path stays, for example `config/token=[REDACTED]/app.ts`.
+- **Evidence `title`:** goes through the same secret redaction, and a copy of the item's path inside the title shows the redacted path. The title is then capped at 200 bytes, cut on a character boundary, and ends with `…[truncated]` when it was cut. The mark is added after the cut and is not counted in the 200 bytes.
+- **Warnings:** each size limit that cuts the input adds one sentence, at most one per limit, in this order:
+  - `changed-file list larger than 1 MiB: only the files that fit were analysed`
+  - `diff larger than 8 MiB: only the first 8 MiB were analysed`
+  - `<N> file(s) larger than 1 MiB were read only in part`: one sentence for all files read in part together, where N counts distinct paths.
+
+  Warnings never name a file.
+
+### 7. Deliveries cut off by a stop (completes "Shutdown")
+
+A delivery still running when the 25 s drain ends is not finished by this process: the process exits without recording an outcome.
+
+- With `DATA_DIR`, the stored analysis keeps the notification as it was when the analysis finished: `status` `pending`, `attempts` 0, `last_status_code` 0 and `last_error` `""`. The next process shows it as `failed` with `last_error` `delivery interrupted: the server stopped before it finished`. `attempts` and `last_status_code` stay 0, also when attempts were made before the stop. The next process never retries the delivery, because the URL was held in memory only.
+- Without `DATA_DIR`, nothing of the analysis remains after the restart.
