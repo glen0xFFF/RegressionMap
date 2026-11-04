@@ -68,11 +68,57 @@ export interface ChangeRow extends DiffCounts {
   hunks: number;
 }
 
+// Go's \s in RE2 is ASCII whitespace only; JS's \s is wider, so it is spelt out.
+const WS = "[\\t\\n\\f\\r ]";
+
+/**
+ * A copy of secretRes in backend/internal/evidence/evidence.go, in the same order.
+ * Element [1] and the last one keep their first group ("${1}[REDACTED]" in Go).
+ * The case-insensitive ones use the u flag, as Go folds case by Unicode simple
+ * folding and counts runes, not UTF-16 units.
+ */
+const SECRET_RES: readonly [RegExp, string][] = [
+  [/-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g, "[REDACTED]"],
+  [new RegExp(`(bearer${WS}+)[A-Za-z0-9._\\-]{8,}`, "giu"), "$1[REDACTED]"],
+  [/\bsk-[A-Za-z0-9_-]{16,}/g, "[REDACTED]"],
+  [/\bAKIA[0-9A-Z]{16}\b/g, "[REDACTED]"],
+  [/\bgh[pousr]_[A-Za-z0-9]{20,}/g, "[REDACTED]"],
+  [new RegExp(`((?:api[_-]?key|secret|token|password|passwd)${WS}*[:=]${WS}*["']?)[^\\t\\n\\f\\r "']{4,}`, "giu"), "$1[REDACTED]"],
+];
+
+function redact(s: string): string {
+  return SECRET_RES.reduce((acc, [re, by]) => acc.replace(re, by), s);
+}
+
+/**
+ * The client copy of the server's RedactPath: each "/" segment is redacted on its
+ * own, and Redact replaces the secret-looking part of a segment, which can be the
+ * whole segment ("[REDACTED]") or only part of it ("token=[REDACTED]", "[REDACTED].ts").
+ */
+export function redactPath(p: string): string {
+  return p.split("/").map(redact).join("/");
+}
+
+/**
+ * Find the changed file an evidence path belongs to. The server redacts evidence
+ * paths with RedactPath but keeps changed_files paths raw. An exact match wins;
+ * otherwise the changed file whose redacted path equals the evidence path is used,
+ * and only when exactly one changed file redacts to it.
+ */
+export function changedFileFor(evidencePath: string, changedPaths: readonly string[]): string | null {
+  if (changedPaths.includes(evidencePath)) return evidencePath;
+  if (!evidencePath.includes("[REDACTED]")) return null;
+  const fits = changedPaths.filter((p) => redactPath(p) === evidencePath);
+  return fits.length === 1 ? fits[0] : null;
+}
+
 /** Walkthrough "Changes" table: one row per changed file; counts come only from diff_hunk evidence. */
 export function changesTable(files: ChangedFile[] | null | undefined, evidence: Evidence[] | null | undefined): ChangeRow[] {
   const hunks = diffHunks(evidence);
+  const paths = (files ?? []).map((f) => f.path);
+  const owner = hunks.map((h) => changedFileFor(h.file, paths));
   return (files ?? []).map((f) => {
-    const mine = hunks.filter((h) => h.file === f.path);
+    const mine = hunks.filter((_, i) => owner[i] === f.path);
     const c = mine.reduce(
       (acc, h) => {
         const n = countDiffLines(h.excerpt);

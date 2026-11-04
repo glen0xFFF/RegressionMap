@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { anchorHypotheses, changesTable, countDiffLines, groupDiffsByFile, parseHunk } from "./diff";
+import { anchorHypotheses, changesTable, countDiffLines, groupDiffsByFile, parseHunk, redactPath } from "./diff";
 import type { Evidence, Hypothesis } from "./types";
 
 const HUNK = [
@@ -64,6 +64,91 @@ describe("changesTable", () => {
   });
   it("handles missing inputs", () => {
     expect(changesTable(null, null)).toEqual([]);
+  });
+  it("joins a hunk whose path has a [REDACTED] segment to the one changed file it fits", () => {
+    const rows = changesTable(
+      [{ path: "packages/sk-components-library/src/button.ts", status: "M" }, { path: "src/p.js", status: "M" }],
+      [ev("E1", "packages/[REDACTED]/src/button.ts", HUNK), ev("E2", "src/p.js", "-q")],
+    );
+    expect(rows).toEqual([
+      { path: "packages/sk-components-library/src/button.ts", status: "M", add: 2, del: 1, hunks: 1 },
+      { path: "src/p.js", status: "M", add: 0, del: 1, hunks: 1 },
+    ]);
+  });
+  it("joins a path with two redacted segments only to the changed file that redacts to it", () => {
+    const rows = changesTable(
+      [
+        { path: "a/AKIAABCDEFGHIJKLMNOP/b/ghp_abcdefghijklmnopqrstuvwxyz0123/c.ts", status: "M" },
+        { path: "a/AKIAABCDEFGHIJKLMNOP/b/c.ts", status: "M" },
+        { path: "a/AKIAABCDEFGHIJKLMNOP/b/ghp_abcdefghijklmnopqrstuvwxyz0123/extra/c.ts", status: "A" },
+      ],
+      [ev("E1", "a/[REDACTED]/b/[REDACTED]/c.ts", "+x\n+y")],
+    );
+    expect(rows.map((r) => r.hunks)).toEqual([1, 0, 0]);
+    expect(rows[0]).toMatchObject({ add: 2, del: 0 });
+  });
+  it("joins a hunk whose path segment was redacted only in part", () => {
+    const files = [
+      { path: "config/token=supersecretvalue123/app.ts", status: "M" },
+      { path: "sk-abcdefghijklmnopqrstuv.ts", status: "A" },
+      { path: "lib/api_key=abcdef/x.ts", status: "M" },
+      { path: "src/other.ts", status: "M" },
+    ];
+    const rows = changesTable(files, [
+      ev("E1", "config/token=[REDACTED]/app.ts", "+x"),
+      ev("E2", "[REDACTED].ts", "+y"),
+      ev("E3", "lib/api_key=[REDACTED]/x.ts", "-z"),
+    ]);
+    expect(rows.map((r) => r.hunks)).toEqual([1, 1, 1, 0]);
+  });
+  it("redacts each segment on its own, so a redacted path keeps the changed path's segments", () => {
+    const rows = changesTable(
+      [{ path: "cfg/token=abcd/efgh/x.ts", status: "M" }, { path: "src/sk-abcdefghijklmnopqrstuv/a.ts", status: "M" }],
+      [ev("E1", "cfg/token=[REDACTED]", "+x"), ev("E2", "src/[REDACTED]", "+y"), ev("E3", "cfg/token=[REDACTED]/efgh/x.ts", "-z")],
+    );
+    expect(rows).toEqual([
+      { path: "cfg/token=abcd/efgh/x.ts", status: "M", add: 0, del: 1, hunks: 1 },
+      { path: "src/sk-abcdefghijklmnopqrstuv/a.ts", status: "M", add: 0, del: 0, hunks: 0 },
+    ]);
+  });
+  it("does not give a redacted hunk to a changed file whose segment the server would not redact", () => {
+    const rows = changesTable([{ path: "src/lib/a.ts", status: "M" }], [ev("E1", "src/[REDACTED]/a.ts", "+x")]);
+    expect(rows[0].hunks).toBe(0);
+  });
+  it("gives the hunk to no file when the redacted path fits more than one changed file", () => {
+    const rows = changesTable(
+      [{ path: "keys/AKIAAAAAAAAAAAAAAAAA/x.ts", status: "M" }, { path: "keys/AKIABBBBBBBBBBBBBBBB/x.ts", status: "M" }],
+      [ev("E1", "keys/[REDACTED]/x.ts", "+x")],
+    );
+    expect(rows.map((r) => r.hunks)).toEqual([0, 0]);
+  });
+  it("prefers an exact path match over a redacted match", () => {
+    const rows = changesTable(
+      [{ path: "docs/[REDACTED]/a.md", status: "M" }, { path: "docs/secret/a.md", status: "M" }],
+      [ev("E1", "docs/[REDACTED]/a.md", "+x"), ev("E2", "docs/secret/a.md", "-y")],
+    );
+    expect(rows).toEqual([
+      { path: "docs/[REDACTED]/a.md", status: "M", add: 1, del: 0, hunks: 1 },
+      { path: "docs/secret/a.md", status: "M", add: 0, del: 1, hunks: 1 },
+    ]);
+  });
+});
+
+describe("redactPath", () => {
+  // The cases of TestRedactPathMatchesBuildFile in backend/internal/evidence/evidence_test.go,
+  // plus the sk- package name and the bearer rule.
+  it("redacts a path the way the server's RedactPath does", () => {
+    const cases: Record<string, string> = {
+      "src/app.ts": "src/app.ts",
+      "config/token=supersecretvalue123/app.ts": "config/token=[REDACTED]/app.ts",
+      "AKIAABCDEFGHIJKLMNOP/x.ts": "[REDACTED]/x.ts",
+      "keys/ghp_abcdefghijklmnopqrstuvwxyz0123/k.ts": "keys/[REDACTED]/k.ts",
+      "sk-abcdefghijklmnopqrstuv.ts": "[REDACTED].ts",
+      "packages/sk-components-library/src/button.ts": "packages/[REDACTED]/src/button.ts",
+      "lib/Bearer abcdefgh.ts/x": "lib/Bearer [REDACTED]/x",
+      "": "",
+    };
+    for (const [raw, want] of Object.entries(cases)) expect(redactPath(raw), raw).toBe(want);
   });
 });
 
