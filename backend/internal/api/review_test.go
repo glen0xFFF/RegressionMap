@@ -632,6 +632,40 @@ func TestCommitItemsReachEvidenceAndModels(t *testing.T) {
 	}
 }
 
+// Every request of the review path, the check request included, carries
+// the changed files with the path redaction of the hypothesis request
+// (contract, "Security notes"). TestPipelineRedactsChangedFilesSentToModel
+// sees no check request: its review ends invalid.
+func TestReviewRequestsAreRedacted(t *testing.T) {
+	const secretPath = "config/token=supersecretvalue123/app.ts"
+	const redacted = "config/token=[REDACTED]/app.ts"
+	m := newChainModel(t)
+	_, srv, root, shas := newServer(t, []string{"r1"}, func(c *Config) {
+		c.Commands = []Command{slowCmd(50)}
+		c.Model = m.client()
+	})
+	plCommit(t, filepath.Join(root, "r1"), map[string]string{secretPath: "export const x = 1;\n"})
+	a := plAnalyse(t, srv.URL, "r1", shas["r1"].Baseline, "slow")
+	if a.Status != "done" || a.Review == nil || a.Review.CheckStatus != "ok" {
+		t.Fatalf("status %q review %+v, want done with a checked review", a.Status, a.Review)
+	}
+	if got := strings.Join(m.Names(), ","); got != "RegressionHypotheses,ChangeReview,FindingChecks" {
+		t.Fatalf("model calls %s, want RegressionHypotheses,ChangeReview,FindingChecks", got)
+	}
+	m.mu.Lock()
+	bodies := append([]string{}, m.bodies...)
+	m.mu.Unlock()
+	for _, b := range bodies {
+		name, user, _ := chainRequest([]byte(b))
+		if strings.Contains(b, "supersecretvalue123") {
+			t.Errorf("the %s request carries the secret path segment", name)
+		}
+		if !strings.Contains(user, `"`+redacted+`"`) {
+			t.Errorf("the %s request lacks the redacted changed file", name)
+		}
+	}
+}
+
 // git failing to list the commit messages adds a warning and no commit
 // item; output over the cap adds the other warning.
 func TestUnreadableCommitsAddAWarning(t *testing.T) {
