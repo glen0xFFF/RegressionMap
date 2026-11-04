@@ -265,9 +265,109 @@ export function analysis(over = {}) {
     },
     verifications: [],
     notification: null,
+    review: null,
     ...over,
   };
 }
+
+// One finding of the Muse review, as GET /api/analyses/{id} sends it.
+export function finding(over = {}) {
+  return {
+    id: 'R1',
+    lens: 'security',
+    severity: 'high',
+    title: 'Token compared with ==',
+    detail: 'Timing leak in the token check.',
+    suggestion: 'Compare the tokens in constant time.',
+    file: 'src/auth.ts',
+    line_start: 12,
+    line_end: 12,
+    evidence_ids: ['E3'],
+    check: { verdict: 'confirmed', reason: 'E3 shows a plain == comparison.', evidence_ids: ['E3'] },
+    ...over,
+  };
+}
+
+// The check of a finding without a valid check.
+export const unchecked = () => ({ verdict: 'unchecked', reason: '', evidence_ids: [] });
+
+// A review with one finding per verdict. The refuted one (R2) is only counted.
+export function review(over = {}) {
+  return {
+    status: 'ok',
+    model_id: 'test-model',
+    message: '',
+    check_status: 'ok',
+    check_message: '',
+    summary: 'One timing leak.',
+    counts: { confirmed: 1, disputed: 1, refuted: 1, unchecked: 1 },
+    findings: [
+      finding(),
+      finding({
+        id: 'R2',
+        lens: 'code',
+        severity: 'medium',
+        title: 'Cache never cleared',
+        detail: 'The map grows with every call.',
+        suggestion: '',
+        file: 'src/cache.ts',
+        line_start: 3,
+        line_end: 5,
+        evidence_ids: ['E4'],
+        check: { verdict: 'refuted', reason: 'E4 clears the map on every call.', evidence_ids: ['E4'] },
+      }),
+      finding({
+        id: 'R3',
+        lens: 'feature',
+        severity: 'low',
+        title: 'Empty page not handled',
+        detail: '',
+        suggestion: '',
+        file: '',
+        line_start: 0,
+        line_end: 0,
+        evidence_ids: ['E2'],
+        check: unchecked(),
+      }),
+      finding({
+        id: 'R4',
+        lens: 'code',
+        severity: 'low',
+        title: 'Possible overflow',
+        detail: '',
+        suggestion: '',
+        file: 'src/pagination.ts',
+        line_start: 7,
+        line_end: 13,
+        evidence_ids: ['E2'],
+        check: { verdict: 'disputed', reason: 'Unlikely with page sizes under 1000.', evidence_ids: ['E2'] },
+      }),
+    ],
+    rejected: ['finding 5 ("Rename x"): cites unknown evidence id E99'],
+    ...over,
+  };
+}
+
+export const REVIEW_DISCLAIMER = 'AI review: Muse wrote these findings and a second Muse pass checked them. Not verified by tests.';
+
+// The review section as the scripts append it to the summary: `body` is the
+// lines between the heading and the disclaimer.
+export const reviewSection = (body) => ['', '', '### Muse review', '', ...body, '', REVIEW_DISCLAIMER].join('\n');
+
+// The review section for review() with no overrides.
+export const REVIEW_SECTION = reviewSection([
+  'Lenses: security 1, code 2, feature 1. Verdicts: 1 confirmed, 1 unchecked, 1 disputed, 1 refuted.',
+  '',
+  '- R1 [security · high · confirmed] **Token compared with ==** — `src/auth.ts:12` — evidence: E3',
+  '  Timing leak in the token check.',
+  '  Muse check: E3 shows a plain == comparison.',
+  '- R3 [feature · low · unchecked] **Empty page not handled** — evidence: E2',
+  '- R4 [code · low · disputed] **Possible overflow** — `src/pagination.ts:7-13` — evidence: E2',
+  '  Muse check: Unlikely with page sizes under 1000.',
+  '',
+  'Refuted by Muse check (not shown): 1',
+  'Rejected by validation: 1',
+]);
 
 export const notification = (over = {}) => ({
   host: 'hooks.example.com',
@@ -423,6 +523,48 @@ export const HOSTILE_TYPES_SUMMARY = [
   '',
   'Rejected by validation: 0',
 ].join('\n');
+
+// Review text that tries the injections the review section must neutralise:
+// workflow commands, a Markdown link and image, HTML, a backtick, a newline.
+const HOSTILE_REVIEW_TEXT =
+  '::error::pwned ##[group]x [a](http://evil.example) ![i](http://evil.example/i.png) <script> `b`\nnext';
+
+export function hostileReviewAnalysis() {
+  return analysis({
+    review: review({
+      counts: { confirmed: 1, disputed: 0, refuted: 0, unchecked: 0 },
+      findings: [
+        finding({
+          title: HOSTILE_REVIEW_TEXT,
+          detail: HOSTILE_REVIEW_TEXT,
+          file: 'src/' + HOSTILE_REVIEW_TEXT + '.ts',
+          check: { verdict: 'confirmed', reason: HOSTILE_REVIEW_TEXT, evidence_ids: ['E3'] },
+        }),
+      ],
+      rejected: [],
+    }),
+  });
+}
+
+// HOSTILE_REVIEW_TEXT as inline Markdown (md) and inside a code span (code).
+const HOSTILE_REVIEW_MD =
+  ':' + ZW + ':error:' + ZW + ':pwned #' + ZW +
+  "#\\[group\\]x \\[a\\](http://evil.example) !\\[i\\](http://evil.example/i.png) &lt;script&gt; 'b' next";
+const HOSTILE_REVIEW_CODE =
+  ':' + ZW + ':error:' + ZW + ':pwned #' + ZW + "#[group]x [a](http://evil.example) ![i](http://evil.example/i.png) <script> 'b' next";
+
+export const HOSTILE_REVIEW_SUMMARY =
+  BASE_SUMMARY +
+  reviewSection([
+    'Lenses: security 1, code 0, feature 0. Verdicts: 1 confirmed, 0 unchecked, 0 disputed, 0 refuted.',
+    '',
+    '- R1 [security · high · confirmed] **' + HOSTILE_REVIEW_MD + '** — `src/' + HOSTILE_REVIEW_CODE + '.ts:12` — evidence: E3',
+    '  ' + HOSTILE_REVIEW_MD,
+    '  Muse check: ' + HOSTILE_REVIEW_MD,
+    '',
+    'Refuted by Muse check (not shown): 0',
+    'Rejected by validation: 0',
+  ]);
 
 // The summary as the script printed it: stdout without the stop-commands
 // lines, with CRLF folded to LF and the trailing newline removed.
