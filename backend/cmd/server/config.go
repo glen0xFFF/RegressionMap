@@ -9,11 +9,13 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 
 	"regressionmap/internal/apikeys"
 	"regressionmap/internal/model"
+	"regressionmap/internal/proc"
 )
 
 const defaultAddr = "127.0.0.1:8787"
@@ -37,6 +39,11 @@ type config struct {
 	// WebhookSecret is WEBHOOK_SECRET: the HMAC key of completion
 	// notifications. "" disables them. It must never be logged.
 	WebhookSecret string
+
+	// TestEnvAllow is TEST_ENV_ALLOW: variable names that test and
+	// verification runs receive although their names end in _KEY, _SECRET,
+	// _TOKEN or _PASSWORD. Git never receives them.
+	TestEnvAllow []string
 }
 
 // parseAllowedHosts splits ALLOWED_HOSTS on commas, trims and lower-cases
@@ -137,6 +144,30 @@ func loadWebhookSecret(getenv func(string) string) (string, error) {
 	return v, nil
 }
 
+var envNameRe = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+
+// parseTestEnvAllow splits TEST_ENV_ALLOW on commas, trims each entry and
+// skips empty ones. Every entry must be a variable name, and none may name
+// one of the server's own secrets. Errors give an entry's position, never
+// its text: a mistaken NAME=value entry would otherwise print the value.
+func parseTestEnvAllow(v string) ([]string, error) {
+	var out []string
+	for i, n := range strings.Split(v, ",") {
+		n = strings.TrimSpace(n)
+		if n == "" {
+			continue
+		}
+		if !envNameRe.MatchString(n) {
+			return nil, fmt.Errorf("TEST_ENV_ALLOW entry %d is not a variable name: use letters, digits and underscores, not starting with a digit, and never a value", i+1)
+		}
+		if proc.AlwaysWithheld(n) {
+			return nil, fmt.Errorf("TEST_ENV_ALLOW must not name %s: the server's own secrets are never passed to test runs", strings.ToUpper(n))
+		}
+		out = append(out, n)
+	}
+	return out, nil
+}
+
 func or(v, d string) string {
 	if v == "" {
 		return d
@@ -209,6 +240,9 @@ func loadConfig(getenv func(string) string) (config, []string, error) {
 	if cfg.WebhookSecret, err = loadWebhookSecret(getenv); err != nil {
 		return config{}, nil, err
 	}
+	if cfg.TestEnvAllow, err = parseTestEnvAllow(getenv("TEST_ENV_ALLOW")); err != nil {
+		return config{}, nil, err
+	}
 	return cfg, warns, nil
 }
 
@@ -237,7 +271,8 @@ func newLogger(w io.Writer, format string) (*slog.Logger, error) {
 }
 
 // logStartup logs where the server listens. It logs whether a key and a
-// webhook secret are configured, never their values.
+// webhook secret are configured, never their values, and the names (never
+// the values) of the variables test runs do not receive.
 func logStartup(lg *slog.Logger, cfg config, warns []string) {
 	for _, w := range warns {
 		lg.Warn(w)
@@ -253,5 +288,7 @@ func logStartup(lg *slog.Logger, cfg config, warns []string) {
 		"allowed_hosts", strings.Join(cfg.AllowedHosts, ","),
 		"rate_limit_per_hour", cfg.RateLimitPerHour,
 		"webhooks_enabled", cfg.WebhookSecret != "",
+		"test_env_withheld", strings.Join(proc.WithheldNames(cfg.TestEnvAllow), ","),
+		"test_env_allow", strings.Join(cfg.TestEnvAllow, ","),
 	)
 }

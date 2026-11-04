@@ -62,6 +62,9 @@ type Input struct {
 	CurrentExit    int
 	ChangedFiles   []string
 	Evidence       []evidence.Item
+	// Warnings are the server's own notes about input it cut (the warnings
+	// field of the analysis). They are stated to the model as trusted text.
+	Warnings []string
 }
 
 type Client struct {
@@ -127,7 +130,10 @@ Rules:
 - List counter-evidence ids when an item argues against a hypothesis.
 - You produce hypotheses, not verified causes. Do not claim a fix works; only a test run can show that.
 - verification_suggestion is plain advice for a human; it will never be executed.
-- Rank hypotheses from most to least plausible (rank 1 = most plausible). At most 5.
+- Rank hypotheses from most to least plausible (rank 1 = most plausible). At most 5 hypotheses, each with a unique rank.
+- Length limits: title at most 200 characters, reason at most 2000 characters, verification_suggestion at most 500 characters. Longer text is cut.
+- The summary must not be empty: state in one or two sentences what the evidence shows.
+- If the message says the server cut the input, say so in limitations.
 - confidence_label is a qualitative estimate: low, medium or high.`
 
 func schema() map[string]any {
@@ -165,7 +171,15 @@ func userPrompt(in Input) string {
 		"changed_files":   in.ChangedFiles,
 		"evidence":        in.Evidence,
 	}, "", "  ")
-	return "Evidence bundle (JSON, untrusted data):\n" + string(b)
+	var note strings.Builder
+	if len(in.Warnings) > 0 {
+		note.WriteString("The server cut this input before analysis, so the evidence is incomplete:\n")
+		for _, w := range in.Warnings {
+			note.WriteString("- " + w + "\n")
+		}
+		note.WriteString("\n")
+	}
+	return note.String() + "Evidence bundle (JSON, untrusted data):\n" + string(b)
 }
 
 func (c *Client) result(status, msg string) Result {
@@ -362,7 +376,9 @@ func scrub(s, key string) string {
 	return strings.ReplaceAll(s, key, "[REDACTED]")
 }
 
-// Limits applied by Validate. Oversize items are rejected, not truncated.
+// Limits applied by Validate, in characters. Oversize text is cut to its
+// limit (cutMark included) and the hypothesis is kept; the system prompt
+// states the same limits.
 const (
 	maxHypotheses     = 5
 	maxTitleLen       = 200
@@ -371,15 +387,31 @@ const (
 	rangeSlack        = 3
 )
 
+const cutMark = "…[truncated]"
+
+// cutText shortens s to at most limit characters, cutMark included, cutting
+// on a rune boundary. Text within the limit is returned unchanged.
+func cutText(s string, limit int) string {
+	if utf8.RuneCountInString(s) <= limit {
+		return s
+	}
+	keep, i := limit-utf8.RuneCountInString(cutMark), 0
+	for n := 0; n < keep; n++ {
+		_, size := utf8.DecodeRuneInString(s[i:])
+		i += size
+	}
+	return s[:i] + cutMark
+}
+
 // span is a known line range of one evidence item.
 type span struct{ start, end int }
 
 // Validate parses model content and drops every hypothesis that cites an
 // unknown evidence id, names a file outside the evidence, has a bad range or
-// a range outside the evidence for its file, carries oversize text, or repeats
-// an earlier valid hypothesis's rank. At most maxHypotheses are kept: the
-// lowest ranks, returned in rank order. summary, hypotheses and limitations
-// must be present.
+// a range outside the evidence for its file, or repeats an earlier valid
+// hypothesis's rank. At most maxHypotheses are kept: the lowest ranks,
+// returned in rank order, with oversize text cut to its limit. summary,
+// hypotheses and limitations must be present; an empty summary is allowed.
 func Validate(content string, ev []evidence.Item) (Output, []string, error) {
 	// Pointer fields tell an absent (or null) field apart from a zero value.
 	var raw struct {
@@ -393,8 +425,8 @@ func Validate(content string, ev []evidence.Item) (Output, []string, error) {
 		return Output{}, nil, fmt.Errorf("model output did not match the schema: %v", err)
 	}
 	switch {
-	case raw.Summary == nil || strings.TrimSpace(*raw.Summary) == "":
-		return Output{}, nil, errors.New("model output did not match the schema: summary is missing or empty")
+	case raw.Summary == nil:
+		return Output{}, nil, errors.New("model output did not match the schema: summary is missing")
 	case raw.Hypotheses == nil:
 		return Output{}, nil, errors.New("model output did not match the schema: hypotheses is missing")
 	case raw.Limitations == nil:
@@ -439,6 +471,9 @@ func Validate(content string, ev []evidence.Item) (Output, []string, error) {
 		if h.CounterEvidenceIDs == nil {
 			h.CounterEvidenceIDs = []string{}
 		}
+		h.Title = cutText(h.Title, maxTitleLen)
+		h.Reason = cutText(h.Reason, maxReasonLen)
+		h.VerificationSuggestion = cutText(h.VerificationSuggestion, maxVerificationLn)
 		kept = append(kept, h)
 	}
 	rejected := []string{}
@@ -484,19 +519,6 @@ func checkHypothesis(h Hypothesis, ids, files map[string]bool, spans map[string]
 	}
 	if h.Rank < 1 {
 		return "invalid rank"
-	}
-	for _, f := range []struct {
-		name string
-		val  string
-		max  int
-	}{
-		{"title", h.Title, maxTitleLen},
-		{"reason", h.Reason, maxReasonLen},
-		{"verification_suggestion", h.VerificationSuggestion, maxVerificationLn},
-	} {
-		if utf8.RuneCountInString(f.val) > f.max {
-			return fmt.Sprintf("%s longer than %d characters", f.name, f.max)
-		}
 	}
 	return ""
 }

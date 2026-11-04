@@ -45,6 +45,7 @@ var (
 	diffCap   = MaxDiffBytes
 	outputCap = MaxOutputBytes
 	stderrCap = 64 << 10
+	waitDelay = 2 * time.Second
 )
 
 // LimitError reports that git wrote more than Limit bytes to stdout.
@@ -105,6 +106,10 @@ func run(ctx context.Context, dir string, limit int, args ...string) (string, er
 	out := &capBuf{max: limit, stop: true, onOver: cancel}
 	errb := &capBuf{max: stderrCap}
 	cmd.Stdout, cmd.Stderr = out, errb
+	// A process a hook leaves in the background inherits the pipes; without
+	// a bound, Wait would read them until it exits. Past WaitDelay the call
+	// fails instead (exec.ErrWaitDelay), as in proc.Run.
+	cmd.WaitDelay = waitDelay
 	err := cmd.Run()
 	if out.over {
 		return out.String(), &LimitError{Cmd: args[0], Limit: limit}
@@ -126,6 +131,21 @@ func git(ctx context.Context, dir string, args ...string) (string, error) {
 		return "", err
 	}
 	return out, nil
+}
+
+// gitPartial is git for callers that can use the start of the output: over
+// limit it returns the output cut after its last complete line, truncated
+// set and a nil error.
+func gitPartial(ctx context.Context, dir string, limit int, args ...string) (string, bool, error) {
+	out, err := run(ctx, dir, limit, args...)
+	var le *LimitError
+	if errors.As(err, &le) {
+		return wholeLines(out), true, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	return out, false, nil
 }
 
 // ResolveCommit turns HEAD or a hex sha prefix into a full commit id.
@@ -169,13 +189,15 @@ func requireSHA(shas ...string) error {
 	return nil
 }
 
-func ChangedFiles(ctx context.Context, dir, base, cur string) ([]ChangedFile, error) {
+// ChangedFiles lists the files changed from base to cur. A list over
+// outputCap (1 MiB) keeps the entries that fit whole and reports truncated.
+func ChangedFiles(ctx context.Context, dir, base, cur string) ([]ChangedFile, bool, error) {
 	if err := requireSHA(base, cur); err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	out, err := git(ctx, dir, "diff", "--name-status", "--no-renames", base, cur)
+	out, truncated, err := gitPartial(ctx, dir, outputCap, "diff", "--name-status", "--no-renames", base, cur)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	fs := []ChangedFile{}
 	for _, l := range strings.Split(strings.TrimSpace(out), "\n") {
@@ -184,7 +206,7 @@ func ChangedFiles(ctx context.Context, dir, base, cur string) ([]ChangedFile, er
 			fs = append(fs, ChangedFile{Status: parts[0], Path: parts[1]})
 		}
 	}
-	return fs, nil
+	return fs, truncated, nil
 }
 
 // Diff returns the patch from base to cur. If it exceeds MaxDiffBytes it
@@ -221,15 +243,17 @@ func wholeLines(s string) string {
 	return ""
 }
 
-// ShowFile reads a repo-relative file at a commit.
-func ShowFile(ctx context.Context, dir, sha, p string) (string, error) {
+// ShowFile reads a repo-relative file at a commit. A file over outputCap
+// (1 MiB) comes back as its first outputCap bytes cut after the last
+// complete line, with truncated set.
+func ShowFile(ctx context.Context, dir, sha, p string) (string, bool, error) {
 	if err := requireSHA(sha); err != nil {
-		return "", err
+		return "", false, err
 	}
 	if c := path.Clean(p); c != p || strings.HasPrefix(c, "../") || strings.HasPrefix(c, "/") || strings.Contains(c, ":") {
-		return "", fmt.Errorf("invalid path %q", p)
+		return "", false, fmt.Errorf("invalid path %q", p)
 	}
-	return git(ctx, dir, "show", sha+":"+p)
+	return gitPartial(ctx, dir, outputCap, "show", sha+":"+p)
 }
 
 // Worktree checks out sha into a fresh temporary directory, detached.

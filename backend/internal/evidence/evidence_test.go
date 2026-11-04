@@ -69,12 +69,12 @@ func TestRedactSecrets(t *testing.T) {
 	}
 }
 
-func fakeRead(files map[string]string) func(string) (string, error) {
-	return func(p string) (string, error) {
+func fakeRead(files map[string]string) ReadFunc {
+	return func(p string) (string, bool, error) {
 		if s, ok := files[p]; ok {
-			return s, nil
+			return s, false, nil
 		}
-		return "", os.ErrNotExist
+		return "", false, os.ErrNotExist
 	}
 }
 
@@ -203,11 +203,22 @@ func TestBuildRedactsSecretSegmentInFileButKeepsItemUsable(t *testing.T) {
 	if ev[3].Type != "source" || ev[3].Excerpt != "x\ny\nz" {
 		t.Errorf("source must still be read via the original path: %+v", ev[3])
 	}
+	// The path inside a title is swapped for its redacted form whole, so the
+	// segments after the secret survive and the title matches File.
+	wantTitles := []string{"Failing test: t", "config/token=[REDACTED]/app.ts:2",
+		"Change in config/token=[REDACTED]/app.ts", "Current source of config/token=[REDACTED]/app.ts"}
+	for i, w := range wantTitles {
+		if ev[i].Title != w {
+			t.Errorf("%s title = %q, want %q", ev[i].Type, ev[i].Title, w)
+		}
+	}
 }
 
 func TestBuildCapsTitleLength(t *testing.T) {
 	const mark = "…[truncated]"
-	for _, name := range []string{strings.Repeat("x", 10000), strings.Repeat("é", 5000)} {
+	// "Failing test: " is 14 bytes, so with "é" (2 bytes) alone byte 200 is
+	// always a rune start; the leading "x" puts the cut inside a rune.
+	for _, name := range []string{strings.Repeat("x", 10000), strings.Repeat("é", 5000), "x" + strings.Repeat("é", 5000)} {
 		ev := Build([]Failure{{Name: name, File: "test/a.test.ts", Line: 1}}, nil, fakeRead(nil), Limits{MaxExcerpt: 100, MaxTotal: 50000})
 		if len(ev) != 1 {
 			t.Fatalf("want 1 item, got %d", len(ev))
@@ -222,6 +233,12 @@ func TestBuildCapsTitleLength(t *testing.T) {
 		if !utf8.ValidString(title) {
 			t.Errorf("title truncated mid-rune: %q", title)
 		}
+	}
+	// A title of exactly 200 bytes is within the cap and keeps every byte.
+	exact := "Failing test: " + strings.Repeat("y", 200-len("Failing test: "))
+	ev := Build([]Failure{{Name: exact[len("Failing test: "):], File: "test/a.test.ts", Line: 1}}, nil, fakeRead(nil), Limits{MaxExcerpt: 300, MaxTotal: 50000})
+	if len(ev) != 1 || ev[0].Title != exact {
+		t.Errorf("200-byte title changed: got %d bytes %q", len(ev[0].Title), ev[0].Title)
 	}
 }
 
@@ -244,6 +261,61 @@ func TestBuildRedactedTitlesStillRespectTotalCap(t *testing.T) {
 	}
 	if total > 3000 || len(ev) == 0 || len(ev) == 50 {
 		t.Fatalf("cap not applied: total=%d n=%d", total, len(ev))
+	}
+}
+
+// A file over the read cap comes back in part. Frames inside the part keep
+// their real lines, a frame past the cut says the file was too large (not
+// that it is unreadable), and the changed file keeps its source item, marked
+// as cut.
+func TestBuildUsesFilesReadInPart(t *testing.T) {
+	const notRead = "(source larger than 1 MiB, not read)"
+	var b strings.Builder
+	for i := 1; i <= 10; i++ {
+		b.WriteString("l" + itoa(i) + "\n")
+	}
+	part := b.String() // lines 1-10 complete; line 11 onwards was cut
+	read := func(p string) (string, bool, error) {
+		switch p {
+		case "src/big.ts":
+			return part, true, nil
+		case "src/huge-line.ts":
+			return "", true, nil // not one complete line fits
+		}
+		return "", false, os.ErrNotExist
+	}
+	fs := []Failure{{Name: "t", File: "test/a.test.ts", Line: 1, Frames: []Frame{
+		{File: "src/big.ts", Line: 5}, {File: "src/big.ts", Line: 11}, {File: "src/big.ts", Line: 900},
+		{File: "src/huge-line.ts", Line: 1},
+	}}}
+	hs := []Hunk{{File: "src/big.ts", NewStart: 2, NewCount: 1, Text: "@@ -2 +2 @@"},
+		{File: "src/huge-line.ts", NewStart: 1, NewCount: 1, Text: "@@ -1 +1 @@"}}
+	ev := Build(fs, hs, read, Limits{MaxExcerpt: 2000, MaxTotal: 50000})
+	byTitle := map[string]Item{}
+	for _, e := range ev {
+		byTitle[e.Title] = e
+	}
+	if f := byTitle["src/big.ts:5"]; f.Excerpt != "l3\nl4\nl5\nl6\nl7" || f.LineStart != 3 || f.LineEnd != 7 {
+		t.Errorf("frame inside the part: %+v", f)
+	}
+	for _, key := range []string{"src/big.ts:11", "src/big.ts:900", "src/huge-line.ts:1"} {
+		f := byTitle[key]
+		if f.Excerpt != notRead || f.LineStart != f.LineEnd || f.LineStart == 0 {
+			t.Errorf("frame past the cut %s: %+v, want excerpt %q on its own line", key, f, notRead)
+		}
+	}
+	src, ok := byTitle["Current source of src/big.ts"]
+	if !ok || src.LineStart != 1 || src.LineEnd != 10 || src.Excerpt != strings.TrimSuffix(part, "\n")+truncMark {
+		t.Errorf("source item of a file read in part: found=%v %+v", ok, src)
+	}
+	src, ok = byTitle["Current source of src/huge-line.ts"]
+	if !ok || src.LineStart != 0 || src.LineEnd != 0 || src.Excerpt != notRead {
+		t.Errorf("source item of a file with no complete line read: found=%v %+v", ok, src)
+	}
+	// A cut source longer than MaxExcerpt carries one mark, not two.
+	ev = Build(nil, hs[:1], read, Limits{MaxExcerpt: 8, MaxTotal: 50000})
+	if len(ev) != 2 || ev[1].Excerpt != part[:8]+truncMark {
+		t.Errorf("cut source over MaxExcerpt: %+v", ev)
 	}
 }
 

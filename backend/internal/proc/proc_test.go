@@ -3,6 +3,7 @@ package proc
 import (
 	"context"
 	"os"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -120,6 +121,76 @@ func TestRunStripsSecretsFromChildEnv(t *testing.T) {
 	}
 	if got["PROC_HELPER"] != "env" {
 		t.Error("Spec.Env extras not appended")
+	}
+}
+
+// Spec.Allow (TEST_ENV_ALLOW) passes names the suffix rule would withhold,
+// in any letter case, but never the server's own secrets.
+func TestRunPassesAllowedNamesButNeverServerSecrets(t *testing.T) {
+	for _, k := range []string{"DB_PASSWORD", "STRIPE_TEST_KEY", "GH_TOKEN", "MODEL_API_KEY", "MODEL_API_KEY_FILE", "WEBHOOK_SECRET"} {
+		t.Setenv(k, "v-"+k)
+	}
+	s := helper("env")
+	s.Allow = []string{"DB_PASSWORD", "stripe_test_key", "MODEL_API_KEY", "model_api_key_file", "WEBHOOK_SECRET"}
+	r := Run(context.Background(), s)
+	if !r.Passed {
+		t.Fatalf("env helper failed: %+v", r)
+	}
+	got := map[string]string{}
+	for _, l := range strings.Split(r.Stdout, "\n") {
+		if i := strings.Index(l[min(1, len(l)):], "="); i >= 0 {
+			got[strings.ToUpper(l[:i+1])] = l[i+2:]
+		}
+	}
+	if got["DB_PASSWORD"] != "v-DB_PASSWORD" || got["STRIPE_TEST_KEY"] != "v-STRIPE_TEST_KEY" {
+		t.Errorf("allowed names not passed: DB_PASSWORD=%q STRIPE_TEST_KEY=%q", got["DB_PASSWORD"], got["STRIPE_TEST_KEY"])
+	}
+	for _, k := range []string{"GH_TOKEN", "MODEL_API_KEY", "MODEL_API_KEY_FILE", "WEBHOOK_SECRET"} {
+		if v, ok := got[k]; ok {
+			t.Errorf("child saw %s=%q", k, v)
+		}
+	}
+	// SafeEnv (git) takes no allow list: the allowed name stays withheld.
+	for _, kv := range SafeEnv() {
+		if strings.HasPrefix(strings.ToUpper(kv), "DB_PASSWORD=") {
+			t.Errorf("SafeEnv passed %s", kv)
+		}
+	}
+}
+
+// WithheldNames lists, sorted, the names of the variables set in this
+// process that test runs do not receive.
+func TestWithheldNames(t *testing.T) {
+	for _, k := range []string{"RMTEST_B_TOKEN", "RMTEST_A_PASSWORD", "RMTEST_C_KEY", "RMTEST_PLAIN"} {
+		t.Setenv(k, "value-must-not-appear")
+	}
+	t.Setenv("MODEL_API_KEY", "value-must-not-appear")
+	got := WithheldNames([]string{"rmtest_c_key", "MODEL_API_KEY"})
+	var mine []string
+	for _, n := range got {
+		if strings.Contains(n, "value-must-not-appear") || strings.Contains(n, "=") {
+			t.Fatalf("WithheldNames returned a value: %q", n)
+		}
+		if strings.HasPrefix(strings.ToUpper(n), "RMTEST_") || strings.EqualFold(n, "MODEL_API_KEY") {
+			mine = append(mine, strings.ToUpper(n))
+		}
+	}
+	if strings.Join(mine, ",") != "MODEL_API_KEY,RMTEST_A_PASSWORD,RMTEST_B_TOKEN" {
+		t.Fatalf("withheld %v (all %v)", mine, got)
+	}
+	if !sort.StringsAreSorted(got) {
+		t.Fatalf("not sorted: %v", got)
+	}
+}
+
+func TestAlwaysWithheld(t *testing.T) {
+	for name, want := range map[string]bool{
+		"MODEL_API_KEY": true, "model_api_key": true, "Model_Api_Key_File": true, "webhook_secret": true,
+		"DB_PASSWORD": false, "MODEL_API_KEYS": false, "PATH": false,
+	} {
+		if got := AlwaysWithheld(name); got != want {
+			t.Errorf("AlwaysWithheld(%q) = %v, want %v", name, got, want)
+		}
 	}
 }
 

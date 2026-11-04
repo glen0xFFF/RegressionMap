@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"regressionmap/internal/fixture"
 )
@@ -55,9 +56,9 @@ func TestCommitsNewestFirst(t *testing.T) {
 func TestDiffAndChangedFiles(t *testing.T) {
 	dir, s := repo(t)
 	ctx := context.Background()
-	files, err := ChangedFiles(ctx, dir, s.Baseline, s.Bug)
-	if err != nil {
-		t.Fatal(err)
+	files, truncated, err := ChangedFiles(ctx, dir, s.Baseline, s.Bug)
+	if err != nil || truncated {
+		t.Fatalf("truncated=%v err=%v", truncated, err)
 	}
 	if len(files) != 3 || files[1].Path != "src/pagination.ts" || files[1].Status != "M" {
 		t.Fatalf("%+v", files)
@@ -70,11 +71,11 @@ func TestDiffAndChangedFiles(t *testing.T) {
 
 func TestShowFile(t *testing.T) {
 	dir, s := repo(t)
-	src, err := ShowFile(context.Background(), dir, s.Baseline, "src/pagination.ts")
-	if err != nil || strings.Contains(src, "- 1;") || !strings.Contains(src, "start + pageSize;") {
-		t.Fatalf("%v\n%s", err, src)
+	src, truncated, err := ShowFile(context.Background(), dir, s.Baseline, "src/pagination.ts")
+	if err != nil || truncated || strings.Contains(src, "- 1;") || !strings.Contains(src, "start + pageSize;") {
+		t.Fatalf("truncated=%v err=%v\n%s", truncated, err, src)
 	}
-	if _, err := ShowFile(context.Background(), dir, s.Baseline, "../x"); err == nil {
+	if _, _, err := ShowFile(context.Background(), dir, s.Baseline, "../x"); err == nil {
 		t.Fatal("accepted traversal")
 	}
 }
@@ -190,15 +191,46 @@ func TestDiffLimitedUnderCapIsComplete(t *testing.T) {
 	}
 }
 
-func TestShowFileOverCapIsError(t *testing.T) {
+// A file over the cap is read in part: the first MaxOutputBytes, cut after
+// the last complete line, with truncated set and no error. Memory stays
+// bounded and the lines that fit are still usable as evidence.
+func TestShowFileOverCapReturnsFirstLines(t *testing.T) {
 	dir, _, cur := bigRepo(t, MaxOutputBytes+1024)
-	out, err := ShowFile(context.Background(), dir, cur, "big.txt")
-	var le *LimitError
-	if !errors.As(err, &le) || le.Limit != MaxOutputBytes || out != "" {
-		t.Fatalf("ShowFile len=%d err=%v, want empty and *LimitError(%d)", len(out), err, MaxOutputBytes)
+	out, truncated, err := ShowFile(context.Background(), dir, cur, "big.txt")
+	if err != nil || !truncated {
+		t.Fatalf("ShowFile truncated=%v err=%v, want true and nil", truncated, err)
 	}
-	if !strings.Contains(err.Error(), fmt.Sprintf("git output exceeds %d bytes", MaxOutputBytes)) {
-		t.Fatalf("unclear error %q", err)
+	line := strings.Repeat("abcdefghij", 9) + "\n"
+	if want := MaxOutputBytes / len(line) * len(line); len(out) != want || !strings.HasSuffix(out, "\n") {
+		t.Fatalf("ShowFile returned %d bytes, want %d (whole lines within %d)", len(out), want, MaxOutputBytes)
+	}
+	if strings.Count(out, line) != len(out)/len(line) {
+		t.Fatal("ShowFile content is not the start of the file")
+	}
+}
+
+// A file of exactly the cap is complete, not cut.
+func TestShowFileAtExactCapIsComplete(t *testing.T) {
+	dir := t.TempDir()
+	g := func(args ...string) string {
+		t.Helper()
+		cmd := exec.Command("git", append([]string{"-C", dir, "-c", "user.name=t", "-c", "user.email=t@example.com", "-c", "commit.gpgsign=false"}, args...)...)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+		return strings.TrimSpace(string(out))
+	}
+	g("init", "--quiet")
+	body := strings.Repeat("x", MaxOutputBytes-1) + "\n"
+	if err := os.WriteFile(filepath.Join(dir, "exact.txt"), []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	g("add", ".")
+	g("commit", "--quiet", "-m", "exact")
+	out, truncated, err := ShowFile(context.Background(), dir, g("rev-parse", "HEAD"), "exact.txt")
+	if err != nil || truncated || out != body {
+		t.Fatalf("ShowFile len=%d truncated=%v err=%v, want the whole %d bytes", len(out), truncated, err, len(body))
 	}
 }
 
@@ -211,14 +243,36 @@ func lowerCap(t *testing.T, n int) {
 	t.Cleanup(func() { outputCap = old })
 }
 
-func TestChangedFilesAndCommitsOverCapAreErrors(t *testing.T) {
+// A changed-file list over the cap keeps the entries that fit whole and
+// reports truncated; a list of exactly the cap is complete.
+func TestChangedFilesOverCapKeepsEntriesThatFit(t *testing.T) {
 	dir, s := repo(t)
+	ctx := context.Background()
+	all, truncated, err := ChangedFiles(ctx, dir, s.Baseline, s.Bug)
+	if err != nil || truncated || len(all) != 3 {
+		t.Fatalf("uncapped: %v truncated=%v err=%v", all, truncated, err)
+	}
+	size := 0
+	for _, f := range all {
+		size += len(f.Status) + 1 + len(f.Path) + 1 // "<status>\t<path>\n"
+	}
+	lowerCap(t, size)
+	if fs, truncated, err := ChangedFiles(ctx, dir, s.Baseline, s.Bug); err != nil || truncated || len(fs) != 3 {
+		t.Fatalf("exact cap: %v truncated=%v err=%v, want all 3 and false", fs, truncated, err)
+	}
+	first := len(all[0].Status) + 1 + len(all[0].Path) + 1
+	lowerCap(t, first+3) // the first entry plus part of the second
+	fs, truncated, err := ChangedFiles(ctx, dir, s.Baseline, s.Bug)
+	if err != nil || !truncated || len(fs) != 1 || fs[0] != all[0] {
+		t.Fatalf("over cap: %v truncated=%v err=%v, want [%v] true nil", fs, truncated, err, all[0])
+	}
+}
+
+func TestCommitsOverCapIsError(t *testing.T) {
+	dir, _ := repo(t)
 	ctx := context.Background()
 	lowerCap(t, 16)
 	var le *LimitError
-	if fs, err := ChangedFiles(ctx, dir, s.Baseline, s.Bug); !errors.As(err, &le) || fs != nil {
-		t.Fatalf("ChangedFiles = %v, %v; want nil and *LimitError", fs, err)
-	}
 	if cs, err := Commits(ctx, dir, 50); !errors.As(err, &le) || cs != nil {
 		t.Fatalf("Commits = %v, %v; want nil and *LimitError", cs, err)
 	}
@@ -238,6 +292,47 @@ func TestCappedBufferBoundsStderr(t *testing.T) {
 	}
 	if stderrCap <= 0 || stderrCap > 1<<20 {
 		t.Fatalf("stderrCap = %d, want a small positive cap", stderrCap)
+	}
+}
+
+// Output of exactly the cap is complete, not over: only the byte after it
+// overflows. An off-by-one here would turn a file of exactly 1 MiB into a
+// cut one.
+func TestCappedBufferExactCapIsNotOver(t *testing.T) {
+	stopped := 0
+	b := &capBuf{max: 8, stop: true, onOver: func() { stopped++ }}
+	if n, err := b.Write([]byte("01234567")); n != 8 || err != nil || b.over || stopped != 0 {
+		t.Fatalf("exact-cap write: n=%d err=%v over=%v stopped=%d", n, err, b.over, stopped)
+	}
+	if n, err := b.Write(nil); n != 0 || err != nil || b.over {
+		t.Fatalf("empty write after exact cap: n=%d err=%v over=%v", n, err, b.over)
+	}
+	n, err := b.Write([]byte("8"))
+	if n != 0 || !errors.Is(err, errCapReached) || !b.over || stopped != 1 || b.String() != "01234567" {
+		t.Fatalf("ninth byte: n=%d err=%v over=%v stopped=%d buf=%q", n, err, b.over, stopped, b.String())
+	}
+}
+
+// A hook that leaves a background process holding git's stdout and stderr
+// open must not hold the call: run waits at most WaitDelay for the pipes
+// after git exits, as proc.Run does. Hooks run through sh on every
+// platform git supports (Git for Windows ships it), so this runs everywhere.
+func TestOrphanedHookChildDoesNotHoldGit(t *testing.T) {
+	dir, s := repo(t)
+	// cd / first, so the orphan does not keep a temp directory busy.
+	hook := "#!/bin/sh\ncd /\nsleep 20 &\nexit 0\n"
+	if err := os.WriteFile(filepath.Join(dir, ".git", "hooks", "post-checkout"), []byte(hook), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	_, cleanup, err := Worktree(context.Background(), dir, s.Baseline)
+	took := time.Since(start)
+	t.Logf("Worktree returned after %v err=%v", took.Round(100*time.Millisecond), err)
+	if cleanup != nil {
+		cleanup()
+	}
+	if took > 10*time.Second {
+		t.Fatalf("Worktree returned after %v (err=%v): the orphan held the pipes", took.Round(100*time.Millisecond), err)
 	}
 }
 

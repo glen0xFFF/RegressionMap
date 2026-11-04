@@ -42,6 +42,10 @@ type Config struct {
 	Model    *model.Client
 	Commands []Command
 	Timeout  time.Duration // per test process
+	// TestEnvAllow (TEST_ENV_ALLOW) names variables that test runs and
+	// verification runs receive although their names end in _KEY, _SECRET,
+	// _TOKEN or _PASSWORD. Git never receives them.
+	TestEnvAllow []string
 
 	MaxConcurrent int           // running analyses across all repos (default 2)
 	MaxJobs       int           // analyses kept in memory (default 100)
@@ -95,6 +99,7 @@ type Analysis struct {
 	CurrentRun    *proc.Result       `json:"current_run"`
 	ChangedFiles  []gitx.ChangedFile `json:"changed_files"`
 	Evidence      []evidence.Item    `json:"evidence"`
+	Warnings      []string           `json:"warnings,omitempty"` // one sentence per input the server cut
 	Model         *model.Result      `json:"model"`
 	Verifications []Verification     `json:"verifications"`
 	CreatedAt     string             `json:"created_at"`
@@ -861,7 +866,7 @@ func (s *Server) runAt(ctx context.Context, dir, sha string, cmd Command) (proc.
 	if real, err := filepath.EvalSymlinks(wt); err == nil {
 		wt = real
 	}
-	res := proc.Run(ctx, proc.Spec{Argv: cmd.Argv, Dir: wt, Timeout: s.cfg.Timeout, MaxOutput: maxOutput})
+	res := proc.Run(ctx, proc.Spec{Argv: cmd.Argv, Dir: wt, Timeout: s.cfg.Timeout, MaxOutput: maxOutput, Allow: s.cfg.TestEnvAllow})
 	return res, wt, cleanup, nil
 }
 
@@ -879,47 +884,79 @@ func (s *Server) run(ctx context.Context, id, dir string, cmd Command, base, cur
 		return true
 	}
 
+	// step names the git step that failed, so the analysis error says which.
+	step := func(name string, err error) error {
+		if err == nil {
+			return nil
+		}
+		return fmt.Errorf("%s failed: %w", name, err)
+	}
+
+	// Each test run is saved as soon as it has finished, so a later git
+	// failure keeps it.
 	baseRun, _, cleanBase, err := s.runAt(ctx, dir, base, cmd)
-	if stop(err) {
+	if stop(step("baseline worktree", err)) {
 		if cleanBase != nil {
 			cleanBase()
 		}
 		return
 	}
 	cleanBase()
+	s.progress(id, func(a *Analysis) { a.BaselineRun = &baseRun })
 	curRun, curWT, cleanCur, err := s.runAt(ctx, dir, cur, cmd)
-	if stop(err) {
+	if stop(step("HEAD worktree", err)) {
 		if cleanCur != nil {
 			cleanCur()
 		}
 		return
 	}
 	cleanCur()
+	s.progress(id, func(a *Analysis) { a.CurrentRun = &curRun })
 
-	files, err := gitx.ChangedFiles(ctx, dir, base, cur)
-	if stop(err) {
+	// Input over a size limit is cut, never fatal; each cut adds a warning
+	// (no paths: they could hold secrets) that the model is told too.
+	var warnings []string
+	files, cut, err := gitx.ChangedFiles(ctx, dir, base, cur)
+	if stop(step("changed-file list", err)) {
 		return
 	}
-	diff, err := gitx.Diff(ctx, dir, base, cur)
-	if stop(err) {
+	if cut {
+		warnings = append(warnings, "changed-file list larger than 1 MiB: only the files that fit were analysed")
+	}
+	diff, cut, err := gitx.DiffLimited(ctx, dir, base, cur)
+	if stop(step("diff", err)) {
 		return
 	}
+	if cut {
+		warnings = append(warnings, "diff larger than 8 MiB: only the first 8 MiB were analysed")
+	}
+	partial := map[string]bool{} // files read only in part
 	failures := evidence.ParseNodeTest(curRun.Stdout, curWT)
-	ev := evidence.Build(failures, evidence.ParseDiff(diff), func(p string) (string, error) {
-		return gitx.ShowFile(ctx, dir, cur, p)
+	ev := evidence.Build(failures, evidence.ParseDiff(diff), func(p string) (string, bool, error) {
+		src, cut, err := gitx.ShowFile(ctx, dir, cur, p)
+		if cut {
+			partial[p] = true
+		}
+		return src, cut, err
 	}, evidence.Limits{MaxExcerpt: 3000, MaxTotal: 40000})
+	if len(partial) > 0 {
+		warnings = append(warnings, fmt.Sprintf("%d file(s) larger than 1 MiB were read only in part", len(partial)))
+	}
 
 	s.progress(id, func(a *Analysis) {
-		a.BaselineRun, a.CurrentRun, a.ChangedFiles, a.Evidence = &baseRun, &curRun, files, ev
+		a.ChangedFiles, a.Evidence, a.Warnings = files, ev, warnings
 	})
 
+	// The model gets the same path redaction as the evidence, so no secret
+	// in a path leaves the server and cited paths match Item.File. The API's
+	// changed_files keeps the real paths.
 	paths := make([]string, len(files))
 	for i, f := range files {
-		paths[i] = f.Path
+		paths[i] = evidence.RedactPath(f.Path)
 	}
 	mr := s.cfg.Model.Analyze(ctx, model.Input{
 		Command: strings.Join(cmd.Argv, " "), BaselinePassed: baseRun.Passed, CurrentPassed: curRun.Passed,
-		CurrentExit: curRun.ExitCode, ChangedFiles: paths, Evidence: ev,
+		CurrentExit: curRun.ExitCode, ChangedFiles: paths, Evidence: ev, Warnings: warnings,
 	})
 	if stop(nil) {
 		return
@@ -1017,7 +1054,7 @@ func (s *Server) verify(w http.ResponseWriter, r *http.Request) {
 		s.mu.Unlock()
 	}()
 
-	res := proc.Run(r.Context(), proc.Spec{Argv: cmd.Argv, Dir: dir, Timeout: s.cfg.Timeout, MaxOutput: maxOutput})
+	res := proc.Run(r.Context(), proc.Spec{Argv: cmd.Argv, Dir: dir, Timeout: s.cfg.Timeout, MaxOutput: maxOutput, Allow: s.cfg.TestEnvAllow})
 	v := Verification{CommandID: cmd.ID, Argv: cmd.Argv, At: time.Now().UTC().Format(time.RFC3339), Run: res}
 	s.mutate(a.ID, &a, func(j *Analysis) bool {
 		j.Verifications = append(j.Verifications, v)

@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"regressionmap/internal/evidence"
 )
@@ -443,8 +444,6 @@ func TestValidateRequiresTopLevelFields(t *testing.T) {
 	h := `{"rank":1,"title":"t","file":"src/pagination.ts","line_start":10,"line_end":10,"reason":"r","supporting_evidence_ids":["E2"],"counter_evidence_ids":[],"verification_suggestion":"v","confidence_label":"medium"}`
 	cases := map[string]string{
 		"no summary":        `{"hypotheses":[` + h + `],"limitations":["l"]}`,
-		"empty summary":     `{"summary":"","hypotheses":[` + h + `],"limitations":["l"]}`,
-		"blank summary":     `{"summary":"   ","hypotheses":[` + h + `],"limitations":["l"]}`,
 		"null summary":      `{"summary":null,"hypotheses":[` + h + `],"limitations":["l"]}`,
 		"no hypotheses":     `{"summary":"s","limitations":["l"]}`,
 		"null hypotheses":   `{"summary":"s","hypotheses":null,"limitations":["l"]}`,
@@ -461,6 +460,13 @@ func TestValidateRequiresTopLevelFields(t *testing.T) {
 	if _, _, err := Validate(`{"summary":"s","hypotheses":[],"limitations":[]}`, ev); err != nil {
 		t.Fatalf("empty arrays rejected: %v", err)
 	}
+	// a present but empty or blank summary is fine too: the field exists
+	for _, sum := range []string{`""`, `"   "`} {
+		out, rejected, err := Validate(`{"summary":`+sum+`,"hypotheses":[`+h+`],"limitations":["l"]}`, ev)
+		if err != nil || len(out.Hypotheses) != 1 || len(rejected) != 0 {
+			t.Errorf("summary %s: err=%v kept=%d rejected=%v", sum, err, len(out.Hypotheses), rejected)
+		}
+	}
 }
 
 func TestMissingSummaryIsInvalidStatus(t *testing.T) {
@@ -468,7 +474,19 @@ func TestMissingSummaryIsInvalidStatus(t *testing.T) {
 	s := server(t, 200, raw, nil, nil)
 	defer s.Close()
 	r := (&Client{BaseURL: s.URL, APIKey: "k", Model: "m"}).Analyze(context.Background(), Input{Evidence: ev})
-	if r.Status != "invalid" || r.Result != nil || !strings.Contains(r.Message, "summary") {
+	if r.Status != "invalid" || r.Result != nil || !strings.Contains(r.Message, "summary is missing") {
+		t.Fatalf("got %+v", r)
+	}
+}
+
+// An empty summary conforms to the schema sent to the model, so it must not
+// throw away hypotheses whose evidence checks passed.
+func TestEmptySummaryKeepsHypotheses(t *testing.T) {
+	raw := `{"summary":"","limitations":[],"hypotheses":[{"rank":1,"title":"t","file":"src/pagination.ts","line_start":10,"line_end":10,"reason":"r","supporting_evidence_ids":["E2"],"counter_evidence_ids":[],"verification_suggestion":"v","confidence_label":"medium"}]}`
+	s := server(t, 200, raw, nil, nil)
+	defer s.Close()
+	r := (&Client{BaseURL: s.URL, APIKey: "k", Model: "m"}).Analyze(context.Background(), Input{Evidence: ev})
+	if r.Status != "ok" || r.Result == nil || len(r.Result.Hypotheses) != 1 {
 		t.Fatalf("got %+v", r)
 	}
 }
@@ -483,12 +501,13 @@ func TestValidateRangeMustOverlapEvidence(t *testing.T) {
 		hyp(4, "src/pagination.ts", 3, 4, "E2"),     // 3 lines before 7: within slack
 		hyp(5, "src/pagination.ts", 17, 20, "E2"),   // 4 lines after 13: outside slack
 		hyp(1, "src/pagination.ts", 0, 0, "E2"),     // unknown range still fine
+		hyp(6, "src/pagination.ts", 16, 16, "E2"),   // 3 lines after 13: the upper edge, within slack
 	)
 	res, rejected, err := Validate(raw, ev)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(res.Hypotheses) != 4 {
+	if len(res.Hypotheses) != 5 {
 		t.Fatalf("kept %+v rejected %v", res.Hypotheses, rejected)
 	}
 	if len(rejected) != 2 || !strings.Contains(rejected[0], "900-999") || !strings.Contains(rejected[0], "does not overlap") ||
@@ -524,27 +543,104 @@ func TestValidateKeepsAtMostFiveHypotheses(t *testing.T) {
 	}
 }
 
-func TestValidateRejectsOversizeText(t *testing.T) {
+// Oversize text is cut to its limit, mark included, and the hypothesis is
+// kept: its evidence checks passed, only its wording is too long.
+func TestValidateCutsOversizeText(t *testing.T) {
+	const mark = "…[truncated]"
 	long := func(n int) string { return strings.Repeat("é", n) } // multi-byte: limits count characters
 	ok := hyp(1, "src/pagination.ts", 10, 10, "E2")
 	ok["title"], ok["reason"], ok["verification_suggestion"] = long(200), long(2000), long(500)
 	title := hyp(2, "src/pagination.ts", 10, 10, "E2")
-	title["title"] = long(201)
+	title["title"] = "x" + long(200) // odd byte offset: a byte cut would land inside a rune
 	reason := hyp(3, "src/pagination.ts", 10, 10, "E2")
 	reason["reason"] = long(2001)
 	verif := hyp(4, "src/pagination.ts", 10, 10, "E2")
-	verif["verification_suggestion"] = long(501)
+	verif["verification_suggestion"] = strings.Repeat("a", 561)
 	res, rejected, err := Validate(content(ok, title, reason, verif), ev)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(res.Hypotheses) != 1 || res.Hypotheses[0].Rank != 1 {
+	if len(res.Hypotheses) != 4 || len(rejected) != 0 {
 		t.Fatalf("kept %d hypotheses, rejected %v", len(res.Hypotheses), rejected)
 	}
-	if len(rejected) != 3 || !strings.Contains(rejected[0], "title longer than 200") ||
-		!strings.Contains(rejected[1], "reason longer than 2000") ||
-		!strings.Contains(rejected[2], "verification_suggestion longer than 500") {
-		t.Fatalf("rejected %v", rejected)
+	h := res.Hypotheses
+	if h[0].Title != long(200) || h[0].Reason != long(2000) || h[0].VerificationSuggestion != long(500) {
+		t.Errorf("text at exactly the limit was changed: %d/%d/%d characters",
+			utf8.RuneCountInString(h[0].Title), utf8.RuneCountInString(h[0].Reason), utf8.RuneCountInString(h[0].VerificationSuggestion))
+	}
+	for _, c := range []struct {
+		field, got, keep string
+		max              int
+	}{
+		{"title", h[1].Title, "x" + long(200-utf8.RuneCountInString(mark)-1), 200},
+		{"reason", h[2].Reason, long(2000 - utf8.RuneCountInString(mark)), 2000},
+		{"verification_suggestion", h[3].VerificationSuggestion, strings.Repeat("a", 500-utf8.RuneCountInString(mark)), 500},
+	} {
+		if !utf8.ValidString(c.got) || utf8.RuneCountInString(c.got) != c.max || c.got != c.keep+mark {
+			t.Errorf("%s: got %d characters (valid UTF-8 %v), ends %q; want the first %d characters plus %q",
+				c.field, utf8.RuneCountInString(c.got), utf8.ValidString(c.got), c.got[max(0, len(c.got)-20):], c.max-utf8.RuneCountInString(mark), mark)
+		}
+	}
+	if h[1].Reason != "r" || h[2].Title != "t" || h[3].Title != "t" {
+		t.Errorf("fields within their limits were changed: %+v", h)
+	}
+}
+
+func TestOversizeHypothesisKeepsAnalysisOK(t *testing.T) {
+	h := hyp(1, "src/pagination.ts", 10, 10, "E2")
+	h["verification_suggestion"] = strings.Repeat("v", 561)
+	s := server(t, 200, content(h), nil, nil)
+	defer s.Close()
+	r := (&Client{BaseURL: s.URL, APIKey: "k", Model: "m"}).Analyze(context.Background(), Input{Evidence: ev})
+	if r.Status != "ok" || r.Result == nil || len(r.Result.Hypotheses) != 1 || len(r.Rejected) != 0 {
+		t.Fatalf("got %+v", r)
+	}
+	if n := utf8.RuneCountInString(r.Result.Hypotheses[0].VerificationSuggestion); n != 500 {
+		t.Fatalf("verification_suggestion has %d characters, want 500", n)
+	}
+}
+
+// The model can only keep to limits it is told about.
+func TestSystemPromptStatesOutputLimits(t *testing.T) {
+	var req map[string]any
+	s := server(t, 200, content(hyp(1, "src/pagination.ts", 10, 10, "E2")), &req, nil)
+	defer s.Close()
+	(&Client{BaseURL: s.URL, APIKey: "k", Model: "m"}).Analyze(context.Background(), Input{Evidence: ev})
+	msgs, _ := req["messages"].([]any)
+	if len(msgs) == 0 {
+		t.Fatalf("no messages in request %v", req)
+	}
+	sys, _ := msgs[0].(map[string]any)["content"].(string)
+	for _, want := range []string{
+		"title at most 200 characters", "reason at most 2000 characters",
+		"verification_suggestion at most 500 characters", "At most 5 hypotheses",
+		"unique rank", "summary must not be empty",
+	} {
+		if !strings.Contains(sys, want) {
+			t.Errorf("system prompt does not state %q:\n%s", want, sys)
+		}
+	}
+}
+
+// The server's own notes about cut input reach the model, outside the
+// untrusted evidence bundle.
+func TestUserPromptStatesInputCuts(t *testing.T) {
+	warn := []string{"diff larger than 8 MiB: only the first 8 MiB were analysed", "2 file(s) larger than 1 MiB were read only in part"}
+	p := userPrompt(Input{Evidence: ev, Warnings: warn})
+	head, _, found := strings.Cut(p, "Evidence bundle (JSON, untrusted data):")
+	if !found {
+		t.Fatalf("prompt lost the bundle header:\n%s", p)
+	}
+	for _, w := range warn {
+		if !strings.Contains(head, "- "+w+"\n") {
+			t.Errorf("prompt does not state %q before the bundle:\n%s", w, head)
+		}
+	}
+	if !strings.Contains(head, "cut") {
+		t.Errorf("prompt does not say the input was cut:\n%s", head)
+	}
+	if p := userPrompt(Input{Evidence: ev}); !strings.HasPrefix(p, "Evidence bundle (JSON, untrusted data):") {
+		t.Errorf("uncut input must not carry a note:\n%s", p)
 	}
 }
 
