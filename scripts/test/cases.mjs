@@ -26,6 +26,13 @@ import {
   HOSTILE_TEXT_SUMMARY,
   hostileTypesAnalysis,
   HOSTILE_TYPES_SUMMARY,
+  finding,
+  unchecked,
+  review,
+  reviewSection,
+  REVIEW_SECTION,
+  hostileReviewAnalysis,
+  HOSTILE_REVIEW_SUMMARY,
 } from './harness.mjs';
 
 const done = (over) => ({ status: 200, json: analysis(over) });
@@ -430,6 +437,237 @@ export function defineCases(runner) {
           r.debug,
         );
       });
+    });
+
+    // ---- Muse review -------------------------------------------------------
+    // Runs the script on one done answer and checks stdout and the job summary.
+    async function expectSummary(json, expected, code = 0) {
+      await withServer({ gets: [{ status: 200, json }] }, async (srv) => {
+        const r = await runner.run({ url: srv.url });
+        eq(r.code, code, r.debug);
+        eq(printedSummary(r.stdout), expected, `stdout differs: ${r.debug}`);
+        eq(r.summary, 'PRE-EXISTING LINE\n' + expected + '\n', `summary file differs: ${q(r.summary)}`);
+      });
+    }
+    const zero = { confirmed: 0, disputed: 0, refuted: 0, unchecked: 0 };
+    const tail = (refuted, rejected) => ['', 'Refuted by Muse check (not shown): ' + refuted, 'Rejected by validation: ' + rejected];
+
+    test('no review section when review is null', async () => {
+      // A v4 server sends null; a v3 server sends no review key at all.
+      // Anything else that is not an object is treated the same way.
+      const absent = analysis();
+      delete absent.review;
+      for (const a of [analysis(), absent, analysis({ review: [review()] }), analysis({ review: 'ok' })]) {
+        await expectSummary(a, BASE_SUMMARY);
+      }
+    });
+
+    test('review section lists confirmed, unchecked and disputed findings', async () => {
+      await withServer({ gets: [done({ review: review() })] }, async (srv) => {
+        const r = await runner.run({ url: srv.url });
+        eq(r.code, 0, r.debug);
+        eq(printedSummary(r.stdout), BASE_SUMMARY + REVIEW_SECTION, `stdout differs: ${r.debug}`);
+        eq(r.summary, 'PRE-EXISTING LINE\n' + BASE_SUMMARY + REVIEW_SECTION + '\n', `summary file differs: ${q(r.summary)}`);
+        lacks(r.stdout, 'Cache never cleared', r.debug);
+      });
+    });
+
+    test('review section when the review is not available', async () => {
+      const skipped = { check_status: 'skipped', check_message: 'no review to check', counts: zero, findings: [], rejected: [] };
+      await expectSummary(
+        analysis({ review: review({ ...skipped, status: 'error', message: 'review stopped at the analysis deadline' }) }),
+        BASE_SUMMARY + reviewSection(['Muse review not available: error — review stopped at the analysis deadline']),
+      );
+      // Without a message there is no dash; findings and rejections sent with
+      // a status other than ok are not printed.
+      await expectSummary(
+        analysis({ review: review({ status: 'invalid', message: '' }) }),
+        BASE_SUMMARY + reviewSection(['Muse review not available: invalid']),
+      );
+    });
+
+    test('review section is printed when the analysis has no model result', async () => {
+      const a = analysis({
+        status: 'error',
+        error: 'baseline run failed',
+        model: null,
+        current_run: null,
+        review: review({
+          status: 'skipped',
+          message: 'the analysis ended before the change could be reviewed',
+          check_status: 'skipped',
+          check_message: 'no review to check',
+          summary: '',
+          counts: zero,
+          findings: [],
+          rejected: [],
+        }),
+      });
+      const expected = [
+        ...lines(BASE_SUMMARY).slice(0, 4),
+        '- Status: **error**',
+        '- Error: baseline run failed',
+        '- Baseline `1111111`: PASS (exit 0)',
+        '- HEAD `2222222`: not run',
+      ].join('\n');
+      await expectSummary(
+        a,
+        expected + reviewSection(['Muse review not available: skipped — the analysis ended before the change could be reviewed']),
+        2,
+      );
+    });
+
+    test('review section names a failed check', async () => {
+      const findings = [
+        finding({ check: unchecked() }),
+        finding({ id: 'R2', lens: 'feature', severity: 'low', title: 'Empty page not handled', detail: '', file: '', line_start: 0, line_end: 0, evidence_ids: [], check: unchecked() }),
+      ];
+      const body = (checkLine) => [
+        'Lenses: security 1, code 0, feature 1. Verdicts: 0 confirmed, 2 unchecked, 0 disputed, 0 refuted.',
+        checkLine,
+        '',
+        '- R1 [security · high · unchecked] **Token compared with ==** — `src/auth.ts:12` — evidence: E3',
+        '  Timing leak in the token check.',
+        '- R2 [feature · low · unchecked] **Empty page not handled** — evidence: none',
+        ...tail(0, 0),
+      ];
+      const counts = { ...zero, unchecked: 2 };
+      await expectSummary(
+        analysis({ review: review({ check_status: 'error', check_message: 'check stopped at the analysis deadline', counts, findings, rejected: [] }) }),
+        BASE_SUMMARY + reviewSection(body('Muse check not available: error — check stopped at the analysis deadline')),
+      );
+      await expectSummary(
+        analysis({ review: review({ check_status: 'invalid', check_message: '', counts, findings, rejected: [] }) }),
+        BASE_SUMMARY + reviewSection(body('Muse check not available: invalid')),
+      );
+    });
+
+    test('review with no findings', async () => {
+      await expectSummary(
+        analysis({ review: review({ check_status: 'skipped', check_message: 'no finding to check', summary: 'clean', counts: zero, findings: [], rejected: [] }) }),
+        BASE_SUMMARY +
+          reviewSection([
+            'Lenses: security 0, code 0, feature 0. Verdicts: 0 confirmed, 0 unchecked, 0 disputed, 0 refuted.',
+            '',
+            'No confirmed, unchecked or disputed findings.',
+            ...tail(0, 0),
+          ]),
+      );
+      // Refuted findings are only counted, so a review of refuted findings
+      // shows no finding line either.
+      const refuted = { verdict: 'refuted', reason: 'E3 shows a constant-time compare.', evidence_ids: ['E3'] };
+      await expectSummary(
+        analysis({
+          review: review({
+            counts: { ...zero, refuted: 2 },
+            findings: [finding({ check: refuted }), finding({ id: 'R2', lens: 'code', check: refuted })],
+            rejected: [],
+          }),
+        }),
+        BASE_SUMMARY +
+          reviewSection([
+            'Lenses: security 1, code 1, feature 0. Verdicts: 0 confirmed, 0 unchecked, 0 disputed, 2 refuted.',
+            '',
+            'No confirmed, unchecked or disputed findings.',
+            ...tail(2, 0),
+          ]),
+      );
+    });
+
+    test('review findings follow the display order: confirmed, unchecked, disputed', async () => {
+      const v = (id, verdict) => finding({ id, title: 't' + id, detail: '', check: { verdict, reason: '', evidence_ids: [] } });
+      const rv = review({ findings: [v('R1', 'refuted'), v('R2', 'disputed'), v('R3', 'unchecked'), v('R4', 'confirmed'), v('R5', 'unchecked')] });
+      await withServer({ gets: [done({ review: rv })] }, async (srv) => {
+        const r = await runner.run({ url: srv.url });
+        eq(r.code, 0, r.debug);
+        const shown = lines(printedSummary(r.stdout)).filter((l) => /^- R[0-9]+ \[/.test(l));
+        deq(
+          shown.map((l) => l.slice(0, l.indexOf(' ', 2))),
+          ['- R4', '- R3', '- R5', '- R2'],
+          r.debug,
+        );
+      });
+    });
+
+    test('review text cannot inject markdown or workflow commands', async () => {
+      await withServer({ gets: [{ status: 200, json: hostileReviewAnalysis() }] }, async (srv) => {
+        const r = await runner.run({ url: srv.url, env: { GITHUB_ACTIONS: 'true' } });
+        eq(r.code, 0, r.debug);
+        eq(printedSummary(r.stdout), HOSTILE_REVIEW_SUMMARY, `stdout differs: ${r.debug}`);
+        // The job summary is Markdown, not a log: no stop-commands lines there.
+        eq(r.summary, 'PRE-EXISTING LINE\n' + HOSTILE_REVIEW_SUMMARY + '\n', `summary file differs: ${q(r.summary)}`);
+        // The only workflow markers are the script's own fence lines.
+        for (const text of [r.stdout, r.stderr]) {
+          const f = fenced(text, r.debug);
+          deq(workflowMarkers(text, r.debug), ['::stop-commands::' + f.token, `::${f.token}::`]);
+        }
+        deq(workflowMarkers(r.summary, r.debug), []);
+        for (const text of [r.stdout, r.stderr, r.summary]) assertNoControlChars(text, r.debug);
+      });
+    });
+
+    test('review findings that are not objects are skipped', async () => {
+      await expectSummary(
+        analysis({ review: review({ findings: [null, 3, 'x', [finding()], finding()], rejected: [] }) }),
+        BASE_SUMMARY +
+          reviewSection([
+            'Lenses: security 1, code 0, feature 0. Verdicts: 1 confirmed, 0 unchecked, 0 disputed, 0 refuted.',
+            '',
+            '- R1 [security · high · confirmed] **Token compared with ==** — `src/auth.ts:12` — evidence: E3',
+            '  Timing leak in the token check.',
+            '  Muse check: E3 shows a plain == comparison.',
+            ...tail(0, 0),
+          ]),
+      );
+    });
+
+    test('review lens, verdict and status values count only as exact strings', async () => {
+      // A soft hyphen is ignored by a culture-aware comparison (PowerShell's
+      // -ceq), so 'con<U+00AD>firmed' would pass for 'confirmed' there.
+      const shy = '\u00ad';
+      const check = (verdict) => ({ verdict, reason: '', evidence_ids: [] });
+      await expectSummary(
+        analysis({
+          review: review({
+            findings: [
+              finding({ lens: 'Security', check: check('Confirmed') }),
+              finding({ lens: 'se' + shy + 'curity', check: check('con' + shy + 'firmed') }),
+              finding({ lens: ['code'], check: check(['confirmed']) }),
+              finding({ lens: 'feature', check: 'confirmed' }),
+            ],
+            rejected: [],
+          }),
+        }),
+        BASE_SUMMARY +
+          reviewSection([
+            'Lenses: security 0, code 0, feature 1. Verdicts: 0 confirmed, 0 unchecked, 0 disputed, 0 refuted.',
+            '',
+            'No confirmed, unchecked or disputed findings.',
+            ...tail(0, 0),
+          ]),
+      );
+      await expectSummary(
+        analysis({ review: review({ status: 'o' + shy + 'k' }) }),
+        BASE_SUMMARY + reviewSection(['Muse review not available: o' + shy + 'k']),
+      );
+      await expectSummary(
+        analysis({ review: review({ check_status: 'er' + shy + 'ror', check_message: 'x' }) }),
+        BASE_SUMMARY + REVIEW_SECTION,
+      );
+    });
+
+    test('exit codes do not depend on findings', async () => {
+      const rv = review({ findings: [finding()] });
+      for (const [over, code] of [
+        [{}, 0],
+        [{ status: 'error', error: 'boom' }, 2],
+      ]) {
+        await withServer({ gets: [done({ ...over, review: rv })] }, async (srv) => {
+          const r = await runner.run({ url: srv.url });
+          eq(r.code, code, r.debug);
+          has(r.stdout, '\n- R1 [security · high · confirmed] **Token compared with ==** — `src/auth.ts:12` — evidence: E3\n', r.debug);
+        });
+      }
     });
   });
 }

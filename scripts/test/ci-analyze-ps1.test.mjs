@@ -17,6 +17,8 @@ import {
   notification,
   hostileTextAnalysis,
   hostileTypesAnalysis,
+  review,
+  hostileReviewAnalysis,
   printedSummary,
 } from './harness.mjs';
 
@@ -38,6 +40,8 @@ const fixtures = [
   ['a plain analysis', () => analysis({ notification: notification({ status: 'delivered', attempts: 1 }) })],
   ['hostile model text', hostileTextAnalysis],
   ['fields of the wrong type', hostileTypesAnalysis],
+  ['a Muse review', () => analysis({ review: review() })],
+  ['hostile review text', hostileReviewAnalysis],
 ];
 
 describe('parity: ci-analyze.sh and ci-analyze.ps1', ps.available ? { concurrency: 3 } : { skip: ps.skipReason }, () => {

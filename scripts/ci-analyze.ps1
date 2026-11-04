@@ -39,6 +39,7 @@ $ProgressPreference = 'SilentlyContinue'
 Set-StrictMode -Version 2
 
 $Dash = [string][char]0x2014
+$Dot = [string][char]0x00B7
 $Ellipsis = [string][char]0x2026
 $Zwsp = [string][char]0x200B
 $Utf8 = New-Object System.Text.UTF8Encoding $false
@@ -335,6 +336,21 @@ function Loc($h) {
   if ([long]$le -gt [long]$ls) { return '`' + $f + ':' + $ls + '-' + $le + '`' }
   return '`' + $f + ':' + $ls + '`'
 }
+# True only when $v is exactly the string $want. -ceq compares by culture and
+# ignores characters such as U+00AD, so the review values are not compared
+# with it: the sh script compares them with ===.
+function Is-Exactly($v, [string]$want) {
+  return ($v -is [string] -and [string]::Equals($v, $want, [StringComparison]::Ordinal))
+}
+# The review findings in $fs whose check verdict is exactly $v, in order.
+function With-Verdict($fs, [string]$v) {
+  return , @(foreach ($f in $fs) { if (Is-Exactly (P (O (P $f 'check')) 'verdict') $v) { $f } })
+}
+function Count-Lens($fs, [string]$x) {
+  $c = 0
+  foreach ($f in $fs) { if (Is-Exactly (P $f 'lens') $x) { $c++ } }
+  return $c
+}
 
 $o = New-Object System.Collections.Generic.List[string]
 $o.Add('## RegressionMap analysis'); $o.Add('')
@@ -397,6 +413,59 @@ if ($m) {
   $rejected = P $m 'rejected'
   $count = if ($rejected -is [array]) { $rejected.Count } else { 0 }
   $o.Add(''); $o.Add('Rejected by validation: ' + $count)
+}
+# The Muse review, only when review is an object. Lens and verdict values
+# count only as exact strings. Refuted findings are only counted; the other
+# findings are listed confirmed, then unchecked, then disputed.
+$rv = O (P $a 'review')
+if ($rv) {
+  $o.Add(''); $o.Add('### Muse review'); $o.Add('')
+  if (-not (Is-Exactly (P $rv 'status') 'ok')) {
+    $line = 'Muse review not available: ' + (Md-Text (P $rv 'status') 20)
+    $msg = Md-Text (P $rv 'message') 300
+    if ($msg) { $line += " $Dash " + $msg }
+    $o.Add($line)
+  } else {
+    $found = @()
+    $list = P $rv 'findings'
+    if ($list -is [array]) { $found = @(foreach ($f in $list) { if (O $f) { $f } }) }
+    $confirmed = With-Verdict $found 'confirmed'
+    $unchecked = With-Verdict $found 'unchecked'
+    $disputed = With-Verdict $found 'disputed'
+    $refuted = With-Verdict $found 'refuted'
+    $o.Add('Lenses: security ' + (Count-Lens $found 'security') + ', code ' + (Count-Lens $found 'code') +
+           ', feature ' + (Count-Lens $found 'feature') + '. Verdicts: ' + $confirmed.Count + ' confirmed, ' +
+           $unchecked.Count + ' unchecked, ' + $disputed.Count + ' disputed, ' + $refuted.Count + ' refuted.')
+    $checkStatus = P $rv 'check_status'
+    if ((Is-Exactly $checkStatus 'error') -or (Is-Exactly $checkStatus 'invalid')) {
+      $line = 'Muse check not available: ' + $checkStatus
+      $checkMsg = Md-Text (P $rv 'check_message') 300
+      if ($checkMsg) { $line += " $Dash " + $checkMsg }
+      $o.Add($line)
+    }
+    $o.Add('')
+    $shown = @($confirmed) + @($unchecked) + @($disputed)
+    if ($shown.Count -eq 0) { $o.Add('No confirmed, unchecked or disputed findings.') }
+    foreach ($f in $shown) {
+      $chk = O (P $f 'check')
+      $line = '- ' + (Md-Text (P $f 'id') 12) + ' [' + (Md-Text (P $f 'lens') 12) + " $Dot " + (Md-Text (P $f 'severity') 12) +
+              " $Dot " + (Md-Text (P $chk 'verdict') 12) + '] **' + (Md-Text (P $f 'title') 200) + '**'
+      $l = Loc $f
+      if ($l) { $line += " $Dash " + $l }
+      $ev = Ids (P $f 'evidence_ids'); if (-not $ev) { $ev = 'none' }
+      $line += " $Dash evidence: " + $ev
+      $o.Add($line)
+      $detail = Md-Text (P $f 'detail') 300
+      if ($detail) { $o.Add('  ' + $detail) }
+      $reason = Md-Text (P $chk 'reason') 300
+      if ($reason) { $o.Add('  Muse check: ' + $reason) }
+    }
+    $o.Add(''); $o.Add('Refuted by Muse check (not shown): ' + $refuted.Count)
+    $rejected = P $rv 'rejected'
+    $count = if ($rejected -is [array]) { $rejected.Count } else { 0 }
+    $o.Add('Rejected by validation: ' + $count)
+  }
+  $o.Add(''); $o.Add('AI review: Muse wrote these findings and a second Muse pass checked them. Not verified by tests.')
 }
 Emit ($o -join "`n")
 if ($status -ceq 'done') { exit 0 }

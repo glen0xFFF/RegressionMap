@@ -263,6 +263,47 @@ if (cmd === 'request') {
     }
     o.push('', 'Rejected by validation: ' + (Array.isArray(m.rejected) ? m.rejected.length : 0));
   }
+  // The Muse review, only when review is an object. Lens and verdict values
+  // count only as exact strings. Refuted findings are only counted; the other
+  // findings are listed confirmed, then unchecked, then disputed.
+  const rv = obj(a.review);
+  if (rv) {
+    o.push('', '### Muse review', '');
+    if (rv.status !== 'ok') {
+      const msg = md(rv.message, 300);
+      o.push('Muse review not available: ' + md(rv.status, 20) + (msg ? ' — ' + msg : ''));
+    } else {
+      const found = Array.isArray(rv.findings) ? rv.findings.filter(obj) : [];
+      const check = (f) => obj(f.check) || {};
+      const lens = (x) => found.filter((f) => f.lens === x).length;
+      const verdict = (x) => found.filter((f) => check(f).verdict === x);
+      o.push('Lenses: security ' + lens('security') + ', code ' + lens('code') + ', feature ' + lens('feature') +
+        '. Verdicts: ' + verdict('confirmed').length + ' confirmed, ' + verdict('unchecked').length + ' unchecked, ' +
+        verdict('disputed').length + ' disputed, ' + verdict('refuted').length + ' refuted.');
+      if (rv.check_status === 'error' || rv.check_status === 'invalid') {
+        const cm = md(rv.check_message, 300);
+        o.push('Muse check not available: ' + rv.check_status + (cm ? ' — ' + cm : ''));
+      }
+      o.push('');
+      const shown = [...verdict('confirmed'), ...verdict('unchecked'), ...verdict('disputed')];
+      if (shown.length === 0) o.push('No confirmed, unchecked or disputed findings.');
+      for (const f of shown) {
+        let line = '- ' + md(f.id, 12) + ' [' + md(f.lens, 12) + ' · ' + md(f.severity, 12) + ' · ' +
+          md(check(f).verdict, 12) + '] **' + md(f.title, 200) + '**';
+        const l = loc(f);
+        if (l) line += ' — ' + l;
+        line += ' — evidence: ' + (ids(f.evidence_ids) || 'none');
+        o.push(line);
+        const detail = md(f.detail, 300);
+        if (detail) o.push('  ' + detail);
+        const reason = md(check(f).reason, 300);
+        if (reason) o.push('  Muse check: ' + reason);
+      }
+      o.push('', 'Refuted by Muse check (not shown): ' + verdict('refuted').length);
+      o.push('Rejected by validation: ' + (Array.isArray(rv.rejected) ? rv.rejected.length : 0));
+    }
+    o.push('', 'AI review: Muse wrote these findings and a second Muse pass checked them. Not verified by tests.');
+  }
   console.log(o.join('\n'));
 } else {
   process.exit(64);
