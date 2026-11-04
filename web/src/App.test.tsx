@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import App from "./App";
 import type { Analysis, ModelResult, Review, ReviewFinding } from "./types";
 
@@ -151,6 +151,41 @@ describe("App", () => {
     expect(await screen.findByText("Last page drops one item")).toBeInTheDocument();
     expect(screen.queryByText("Refuted worry")).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Show 1 refuted" })).toBeInTheDocument();
+  });
+
+  it("the diff shows the visible findings and follows the refuted toggle", async () => {
+    window.sessionStorage.setItem(
+      "regressionmap.recent",
+      JSON.stringify([
+        { id: "a1", repo: "pagination-demo", dot: "fail", startedAt: "2026-11-04T10:00:00.000Z", confirmed: 1 },
+        { id: "a2", repo: "other-demo", dot: "fail", startedAt: "2026-11-04T09:00:00.000Z" },
+      ]),
+    );
+    const other = { ...refuted, id: "R1", title: "Other refuted" };
+    vi.stubGlobal("fetch", vi.fn(async (url: string) => {
+      if (url === "/api/analyses/a1") return json({ ...doneAnalysis, model: okModel, review: review([confirmed, refuted]) });
+      if (url === "/api/analyses/a2") return json({ ...doneAnalysis, id: "a2", repo: "other-demo", model: okModel, review: review([other]) });
+      return setup(url);
+    }));
+    const { container } = render(<App />);
+    const diff = () => container.querySelector(".diffview") as HTMLElement;
+
+    fireEvent.click(await screen.findByRole("button", { name: /pagination-demo/ }));
+    expect(await screen.findByRole("button", { name: "Show 1 refuted" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("tab", { name: "Diff" }));
+    expect(diff()).not.toBeNull();
+    expect(within(diff()).getByText("Last page drops one item")).toBeInTheDocument();
+    expect(within(diff()).queryByText("Refuted worry")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Show 1 refuted" }));
+    expect(within(diff()).getByText("Refuted worry")).toBeInTheDocument();
+    expect(within(diff()).getByText("Refuted by Muse check")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: /other-demo/ }));
+    expect(await screen.findByRole("button", { name: "Show 1 refuted" })).toBeInTheDocument();
+    expect(diff()).not.toBeNull();
+    expect(within(diff()).queryByText("Other refuted")).not.toBeInTheDocument();
+    expect(within(diff()).queryByText("Refuted worry")).not.toBeInTheDocument();
   });
 });
 
