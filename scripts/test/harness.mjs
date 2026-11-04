@@ -292,6 +292,9 @@ export function finding(over = {}) {
 export const unchecked = () => ({ verdict: 'unchecked', reason: '', evidence_ids: [] });
 
 // A review with one finding per verdict. The refuted one (R2) is only counted.
+// The ids follow contract rule 5: severity (high, medium, low), then lens
+// (security, code, feature), so the low code finding R3 comes before the low
+// feature finding R4.
 export function review(over = {}) {
   return {
     status: 'ok',
@@ -318,7 +321,7 @@ export function review(over = {}) {
       }),
       finding({
         id: 'R3',
-        lens: 'feature',
+        lens: 'code',
         severity: 'low',
         title: 'Empty page not handled',
         detail: '',
@@ -331,7 +334,7 @@ export function review(over = {}) {
       }),
       finding({
         id: 'R4',
-        lens: 'code',
+        lens: 'feature',
         severity: 'low',
         title: 'Possible overflow',
         detail: '',
@@ -361,8 +364,8 @@ export const REVIEW_SECTION = reviewSection([
   '- R1 [security · high · confirmed] **Token compared with ==** — `src/auth.ts:12` — evidence: E3',
   '  Timing leak in the token check.',
   '  Muse check: E3 shows a plain == comparison.',
-  '- R3 [feature · low · unchecked] **Empty page not handled** — evidence: E2',
-  '- R4 [code · low · disputed] **Possible overflow** — `src/pagination.ts:7-13` — evidence: E2',
+  '- R3 [code · low · unchecked] **Empty page not handled** — evidence: E2',
+  '- R4 [feature · low · disputed] **Possible overflow** — `src/pagination.ts:7-13` — evidence: E2',
   '  Muse check: Unlikely with page sizes under 1000.',
   '',
   'Refuted by Muse check (not shown): 1',
