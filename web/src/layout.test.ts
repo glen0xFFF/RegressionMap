@@ -8,7 +8,7 @@ import {
   upsertRecent,
   type RecentEntry,
 } from "./layout";
-import type { Analysis, Evidence, Hypothesis, TestRun } from "./types";
+import type { Analysis, Evidence, Hypothesis, Review, TestRun } from "./types";
 
 const run = (exit_code: number, timed_out = false): TestRun => ({
   exit_code, passed: exit_code === 0, timed_out, truncated: false, duration_ms: 1, stdout: "", stderr: "",
@@ -46,6 +46,21 @@ describe("upsertRecent", () => {
     list = upsertRecent(list, analysis({ id: "a1", status: "done", current_run: run(1) }), "ignored");
     expect(list.map((e) => e.id)).toEqual(["a2", "a1"]);
     expect(list[1]).toEqual({ id: "a1", repo: "pagination-demo", dot: "fail", startedAt: t });
+  });
+  it("upsertRecent records the confirmed count", () => {
+    const t = "2026-11-04T10:00:00.000Z";
+    const rv = (confirmed: number): Review => ({
+      status: "ok", model_id: "muse-spark-1.3", message: "", check_status: "ok", check_message: "", summary: "",
+      counts: { confirmed, disputed: 0, refuted: 1, unchecked: 0 }, findings: [], rejected: [],
+    });
+    let list = upsertRecent([], analysis({ id: "a1", status: "running", review: null }), t);
+    expect(list[0]).toStrictEqual({ id: "a1", repo: "pagination-demo", dot: "running", startedAt: t });
+    list = upsertRecent(list, analysis({ id: "a1", current_run: run(1), review: rv(2) }), "ignored");
+    expect(list[0]).toStrictEqual({ id: "a1", repo: "pagination-demo", dot: "fail", startedAt: t, confirmed: 2 });
+    list = upsertRecent(list, analysis({ id: "a2", current_run: run(0), review: rv(0) }), t);
+    expect(list[0]).toStrictEqual({ id: "a2", repo: "pagination-demo", dot: "pass", startedAt: t, confirmed: 0 });
+    list = upsertRecent(list, analysis({ id: "a3", current_run: run(0) }), t);
+    expect(list[0]).toStrictEqual({ id: "a3", repo: "pagination-demo", dot: "pass", startedAt: t });
   });
   it("caps the list at 20 entries", () => {
     let list: RecentEntry[] = [];

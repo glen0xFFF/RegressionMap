@@ -8,6 +8,8 @@ export interface RecentEntry {
   repo: string;
   dot: RecentDot;
   startedAt: string;
+  /** v4: confirmed findings of the Muse review; absent without a review and in entries a v3 page saved. */
+  confirmed?: number;
 }
 
 /** Status dot for the sidebar. Derived from the current run's exit code only. */
@@ -24,13 +26,14 @@ const MAX_RECENT = 20;
 
 /** Insert or update an analysis in the client-side recent list (newest first). */
 export function upsertRecent(list: RecentEntry[], a: Analysis, startedAt: string): RecentEntry[] {
+  const confirmed = a.review ? { confirmed: a.review.counts?.confirmed ?? 0 } : {};
   const idx = list.findIndex((e) => e.id === a.id);
   if (idx >= 0) {
     const next = list.slice();
-    next[idx] = { ...next[idx], repo: a.repo, dot: recentDot(a) };
+    next[idx] = { ...next[idx], repo: a.repo, dot: recentDot(a), ...confirmed };
     return next;
   }
-  return [{ id: a.id, repo: a.repo, dot: recentDot(a), startedAt }, ...list].slice(0, MAX_RECENT);
+  return [{ id: a.id, repo: a.repo, dot: recentDot(a), startedAt, ...confirmed }, ...list].slice(0, MAX_RECENT);
 }
 
 /** Human-readable elapsed time between two epoch-ms timestamps; null when unknown. */

@@ -1,12 +1,13 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import App from "./App";
-import type { Analysis } from "./types";
+import type { Analysis, ModelResult, Review, ReviewFinding } from "./types";
 
 afterEach(() => {
   cleanup();
   vi.unstubAllGlobals();
   vi.useRealTimers();
+  window.sessionStorage.clear();
 });
 
 function json(body: unknown, status = 200) {
@@ -84,4 +85,150 @@ describe("App", () => {
     fireEvent.click(screen.getByRole("button", { name: "History" }));
     expect(screen.getByTestId("history")).toHaveTextContent("a1");
   });
+
+  it("review appears when the poll finishes", async () => {
+    let polls = 0;
+    vi.stubGlobal("fetch", vi.fn(async (url: string, init?: RequestInit) => {
+      if (url === "/api/analyses" && init?.method === "POST")
+        return json({ ...doneAnalysis, status: "running", baseline_run: null, current_run: null, evidence: [], model: null, review: null }, 202);
+      if (url === "/api/analyses/a1") {
+        polls++;
+        return json(
+          polls < 2
+            ? { ...doneAnalysis, status: "running", model: okModel, review: null }
+            : { ...doneAnalysis, model: okModel, review: review([confirmed, refuted]) },
+        );
+      }
+      return setup(url);
+    }));
+    render(<App />);
+
+    const start = await screen.findByTestId("analyze-btn");
+    await waitFor(() => expect(start).toBeEnabled());
+    fireEvent.click(start);
+
+    expect(await screen.findByText("Muse review running…", {}, { timeout: 4000 })).toBeInTheDocument();
+    expect(screen.getByText("end index off by one")).toBeInTheDocument();
+    expect(screen.queryByText("Verify fix")).not.toBeInTheDocument();
+
+    expect(await screen.findByText("Last page drops one item", {}, { timeout: 4000 })).toBeInTheDocument();
+    expect(polls).toBeGreaterThanOrEqual(2);
+    expect(screen.queryByText("Muse review running…")).not.toBeInTheDocument();
+    expect(screen.queryByText("Refuted worry")).not.toBeInTheDocument();
+    expect(screen.getByText("1 confirmed")).toHaveClass("recent-confirmed");
+  });
+
+  it("the refuted toggle starts off and resets when another analysis opens", async () => {
+    window.sessionStorage.setItem(
+      "regressionmap.recent",
+      JSON.stringify([
+        { id: "a1", repo: "pagination-demo", dot: "fail", startedAt: "2026-11-04T10:00:00.000Z", confirmed: 1 },
+        { id: "a2", repo: "other-demo", dot: "fail", startedAt: "2026-11-04T09:00:00.000Z" },
+      ]),
+    );
+    const other = { ...refuted, id: "R1", title: "Other refuted" };
+    vi.stubGlobal("fetch", vi.fn(async (url: string) => {
+      if (url === "/api/analyses/a1") return json({ ...doneAnalysis, model: okModel, review: review([confirmed, refuted]) });
+      if (url === "/api/analyses/a2") return json({ ...doneAnalysis, id: "a2", repo: "other-demo", model: okModel, review: review([other]) });
+      return setup(url);
+    }));
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole("button", { name: /pagination-demo/ }));
+    expect(await screen.findByText("Last page drops one item")).toBeInTheDocument();
+    expect(screen.queryByText("Refuted worry")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Show 1 refuted" }));
+    expect(screen.getByText("Refuted worry")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Hide 1 refuted" })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: /other-demo/ }));
+    expect(await screen.findByRole("button", { name: "Show 1 refuted" })).toBeInTheDocument();
+    expect(screen.queryByText("Other refuted")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Show 1 refuted" }));
+    expect(screen.getByText("Other refuted")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /pagination-demo/ }));
+    expect(await screen.findByText("Last page drops one item")).toBeInTheDocument();
+    expect(screen.queryByText("Refuted worry")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Show 1 refuted" })).toBeInTheDocument();
+  });
+
+  it("the diff shows the visible findings and follows the refuted toggle", async () => {
+    window.sessionStorage.setItem(
+      "regressionmap.recent",
+      JSON.stringify([
+        { id: "a1", repo: "pagination-demo", dot: "fail", startedAt: "2026-11-04T10:00:00.000Z", confirmed: 1 },
+        { id: "a2", repo: "other-demo", dot: "fail", startedAt: "2026-11-04T09:00:00.000Z" },
+      ]),
+    );
+    const other = { ...refuted, id: "R1", title: "Other refuted" };
+    vi.stubGlobal("fetch", vi.fn(async (url: string) => {
+      if (url === "/api/analyses/a1") return json({ ...doneAnalysis, model: okModel, review: review([confirmed, refuted]) });
+      if (url === "/api/analyses/a2") return json({ ...doneAnalysis, id: "a2", repo: "other-demo", model: okModel, review: review([other]) });
+      return setup(url);
+    }));
+    const { container } = render(<App />);
+    const diff = () => container.querySelector(".diffview") as HTMLElement;
+
+    fireEvent.click(await screen.findByRole("button", { name: /pagination-demo/ }));
+    expect(await screen.findByRole("button", { name: "Show 1 refuted" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("tab", { name: "Diff" }));
+    expect(diff()).not.toBeNull();
+    expect(within(diff()).getByText("Last page drops one item")).toBeInTheDocument();
+    expect(within(diff()).queryByText("Refuted worry")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Show 1 refuted" }));
+    expect(within(diff()).getByText("Refuted worry")).toBeInTheDocument();
+    expect(within(diff()).getByText("Refuted by Muse check")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: /other-demo/ }));
+    expect(await screen.findByRole("button", { name: "Show 1 refuted" })).toBeInTheDocument();
+    expect(diff()).not.toBeNull();
+    expect(within(diff()).queryByText("Other refuted")).not.toBeInTheDocument();
+    expect(within(diff()).queryByText("Refuted worry")).not.toBeInTheDocument();
+  });
 });
+
+function setup(url: string): Response {
+  if (url === "/api/health") return json({ ok: true, model_configured: true, model_id: "muse-spark-1.3" });
+  if (url === "/api/repos") return json({ repos: [{ name: "pagination-demo" }] });
+  if (url === "/api/repos/pagination-demo/commits")
+    return json({ commits: [{ sha: "b".repeat(40), short: "bbbbbbb", subject: "baseline" }] });
+  if (url === "/api/commands")
+    return json({ commands: [{ id: "node-test", argv: ["node", "--test"], description: "Run node:test suite" }] });
+  return json({ error: { code: "not_found", message: "nope" } }, 404);
+}
+
+const okModel: ModelResult = {
+  status: "ok",
+  model_id: "muse-spark-1.3",
+  result: {
+    summary: "",
+    limitations: [],
+    hypotheses: [
+      {
+        rank: 1, title: "end index off by one", file: "src/pagination.ts", line_start: 3, line_end: 4, reason: "r",
+        supporting_evidence_ids: ["E1"], counter_evidence_ids: [], verification_suggestion: "", confidence_label: "high",
+      },
+    ],
+  },
+};
+
+const confirmed: ReviewFinding = {
+  id: "R1", lens: "code", severity: "high", title: "Last page drops one item", detail: "d", suggestion: "",
+  file: "src/pagination.ts", line_start: 3, line_end: 3, evidence_ids: ["E1"],
+  check: { verdict: "confirmed", reason: "E1 shows it", evidence_ids: ["E1"] },
+};
+const refuted: ReviewFinding = {
+  ...confirmed, id: "R2", severity: "low", title: "Refuted worry",
+  check: { verdict: "refuted", reason: "E1 shows otherwise", evidence_ids: ["E1"] },
+};
+
+function review(findings: ReviewFinding[]): Review {
+  const n = (v: string) => findings.filter((f) => f.check.verdict === v).length;
+  return {
+    status: "ok", model_id: "muse-spark-1.3", message: "", check_status: "ok", check_message: "", summary: "",
+    counts: { confirmed: n("confirmed"), disputed: n("disputed"), refuted: n("refuted"), unchecked: n("unchecked") },
+    findings, rejected: [],
+  };
+}

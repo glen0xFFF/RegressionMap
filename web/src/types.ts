@@ -1,4 +1,4 @@
-// Types mirror docs/API_CONTRACT.md (v1 + v2 auth). Keep in sync with the frozen contract.
+// Types mirror docs/API_CONTRACT.md (v1 + v2 auth + v4 review). Keep in sync with the frozen contract.
 
 export interface Health {
   ok: boolean;
@@ -62,7 +62,8 @@ export type EvidenceType =
   | "assertion"
   | "stack_frame"
   | "diff_hunk"
-  | "source";
+  | "source"
+  | "commit";
 
 export interface Evidence {
   id: string;
@@ -101,6 +102,50 @@ export interface ModelResult {
   };
 }
 
+// v4: the Muse change review (docs/API_CONTRACT.md, "Muse change review").
+export type ReviewLens = "code" | "feature" | "security";
+export type ReviewSeverity = "high" | "medium" | "low";
+export type ReviewVerdict = "confirmed" | "disputed" | "refuted" | "unchecked";
+
+export interface ReviewCheck {
+  verdict: ReviewVerdict;
+  reason: string;
+  evidence_ids: string[];
+}
+
+export interface ReviewFinding {
+  id: string;
+  lens: ReviewLens;
+  severity: ReviewSeverity;
+  title: string;
+  detail: string;
+  suggestion: string;
+  file: string;
+  line_start: number;
+  line_end: number;
+  evidence_ids: string[];
+  check: ReviewCheck;
+}
+
+export interface ReviewCounts {
+  confirmed: number;
+  disputed: number;
+  refuted: number;
+  unchecked: number;
+}
+
+export interface Review {
+  status: "ok" | "disabled" | "error" | "invalid" | "skipped";
+  model_id: string;
+  message: string;
+  check_status: "ok" | "error" | "invalid" | "skipped";
+  check_message: string;
+  summary: string;
+  counts: ReviewCounts;
+  findings: ReviewFinding[];
+  rejected: string[];
+}
+
 export interface ChangedFile {
   path: string;
   status: string;
@@ -126,6 +171,8 @@ export interface Analysis {
   changed_files?: ChangedFile[] | null;
   evidence?: Evidence[] | null;
   model?: ModelResult | null;
+  /** v4: null while the review chain runs; absent for an analysis stored before v4. */
+  review?: Review | null;
   verifications?: Verification[] | null;
 }
 

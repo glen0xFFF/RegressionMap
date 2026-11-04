@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { api, clearStoredKey, errorMessage, getStoredKey, onUnauthorized, setStoredKey } from "./api";
 import { formatElapsed, upsertRecent, type RecentEntry } from "./layout";
 import { shouldPoll } from "./logic";
+import { visibleFindings } from "./review";
 import { MiddlePanel } from "./components/MiddlePanel";
 import { RightPanel } from "./components/RightPanel";
 import { Sidebar, canManageKeys, type View } from "./components/Sidebar";
@@ -132,6 +133,15 @@ export default function App() {
   const [highlightSeq, setHighlightSeq] = useState(0);
   const highlightTimer = useRef<number | undefined>(undefined);
   const [recent, setRecent] = useState<RecentEntry[]>(loadRecent);
+  // Refuted findings stay hidden until asked for, again for every analysis that opens.
+  // The reset happens during render, so a newly opened analysis never shows them first.
+  const [showRefuted, setShowRefuted] = useState(false);
+  const [refutedFor, setRefutedFor] = useState<string | null>(null);
+  const openId = analysis?.id ?? null;
+  if (refutedFor !== openId) {
+    setRefutedFor(openId);
+    setShowRefuted(false);
+  }
   const startTimes = useRef(new Map<string, number>());
   const [elapsed, setElapsed] = useState<Record<string, string>>({});
   const repoSelect = useRef<HTMLSelectElement>(null);
@@ -242,6 +252,8 @@ export default function App() {
     window.clearTimeout(highlightTimer.current);
     highlightTimer.current = window.setTimeout(() => setHighlight(null), 2500);
   }, []);
+
+  const toggleRefuted = useCallback(() => setShowRefuted((s) => !s), []);
 
   const onVerified = useCallback((v: Verification) => {
     setAnalysis((a) => {
@@ -404,6 +416,7 @@ export default function App() {
           busy={busy}
           error={banner}
           onSelectEvidence={selectEvidence}
+          findings={analysis ? visibleFindings(analysis.review, showRefuted) : []}
         />
       )}
 
@@ -414,6 +427,8 @@ export default function App() {
           commands={commandList}
           onSelectEvidence={selectEvidence}
           onVerified={onVerified}
+          showRefuted={showRefuted}
+          onToggleRefuted={toggleRefuted}
         />
       )}
     </div>

@@ -1,31 +1,43 @@
 import { Fragment } from "react";
+import { FindingCard } from "./FindingCard";
 import { ReviewComment } from "./ReviewComment";
-import { anchorHypotheses, groupDiffsByFile, parseHunk } from "../diff";
+import { anchorFindings, anchorHypotheses, groupDiffsByFile, parseHunk } from "../diff";
 import { evidenceDomId } from "../logic";
-import type { Evidence, Hypothesis } from "../types";
+import { REVIEW_DISCLAIMER } from "../review";
+import type { Evidence, Hypothesis, ReviewFinding } from "../types";
 
 const SIGN: Record<string, string> = { add: "+", del: "-", ctx: " ", hunk: "", meta: "" };
 
-/** PR-style diff of diff_hunk evidence with AI comments anchored on the referenced lines. */
+/**
+ * PR-style diff of diff_hunk evidence with AI comments anchored on the referenced lines:
+ * the hypotheses first, then the Muse review findings (already filtered and in display order).
+ */
 export function DiffView({
   evidence,
   hypotheses,
+  findings = [],
   highlightId,
   onSelectEvidence,
 }: {
   evidence: Evidence[];
   hypotheses: Hypothesis[];
+  findings?: ReviewFinding[];
   highlightId: string | null;
   onSelectEvidence: (id: string) => void;
 }) {
   const groups = groupDiffsByFile(evidence);
   if (groups.length === 0) return <div className="empty-state">No diff hunks between baseline and HEAD.</div>;
   const anchors = anchorHypotheses(hypotheses, evidence);
+  const found = anchorFindings(findings, evidence);
+  // Every surface that shows the review carries the disclaimer (docs/API_CONTRACT.md, v4).
+  const showsFindings = found.rows.size > 0 || found.fileLevel.size > 0;
 
   return (
     <div className="diffview">
+      {showsFindings && <div className="ai-label">{REVIEW_DISCLAIMER}</div>}
       {groups.map((g) => {
         const fileComments = anchors.fileLevel.get(g.file) ?? [];
+        const fileFindings = found.fileLevel.get(g.file) ?? [];
         return (
           <div key={g.file} className="file-diff">
             <div className="file-header" data-testid={`file-header-${g.file}`}>
@@ -34,11 +46,16 @@ export function DiffView({
                 <span className="c-add">+{g.add}</span> <span className="c-del">−{g.del}</span>
               </span>
             </div>
-            {fileComments.length > 0 && (
+            {fileComments.length + fileFindings.length > 0 && (
               <div className="file-comments" data-testid={`file-comments-${g.file}`}>
                 {fileComments.map((h, i) => (
                   <div key={`${h.rank}-${i}`} className="inline-comment">
                     <ReviewComment hypothesis={h} evidence={evidence} onSelectEvidence={onSelectEvidence} compact />
+                  </div>
+                ))}
+                {fileFindings.map((f, i) => (
+                  <div key={`${f.id}-${i}`} className="inline-comment inline-finding">
+                    <FindingCard finding={f} evidence={evidence} onSelectEvidence={onSelectEvidence} compact />
                   </div>
                 ))}
               </div>
@@ -46,6 +63,7 @@ export function DiffView({
             {g.hunks.map((e) => {
               const rows = parseHunk(e.excerpt);
               const rowAnchors = anchors.rows.get(e.id);
+              const rowFindings = found.rows.get(e.id);
               return (
                 <div key={e.id} id={evidenceDomId(e.id)} className={highlightId === e.id ? "hunk ev-hl" : "hunk"}>
                   <div className="hunk-title small">
@@ -67,6 +85,11 @@ export function DiffView({
                         {rowAnchors?.get(i)?.map((h, j) => (
                           <div key={`c-${i}-${j}`} className="inline-comment">
                             <ReviewComment hypothesis={h} evidence={evidence} onSelectEvidence={onSelectEvidence} compact />
+                          </div>
+                        ))}
+                        {rowFindings?.get(i)?.map((f, j) => (
+                          <div key={`f-${i}-${j}`} className="inline-comment inline-finding">
+                            <FindingCard finding={f} evidence={evidence} onSelectEvidence={onSelectEvidence} compact />
                           </div>
                         ))}
                       </Fragment>

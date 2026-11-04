@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { anchorHypotheses, changesTable, countDiffLines, groupDiffsByFile, parseHunk, redactPath } from "./diff";
-import type { Evidence, Hypothesis } from "./types";
+import { anchorFindings, anchorHypotheses, changesTable, countDiffLines, groupDiffsByFile, parseHunk, redactPath } from "./diff";
+import type { Evidence, Hypothesis, ReviewFinding } from "./types";
 
 const HUNK = [
   "@@ -3,4 +3,5 @@ function page(items, size) {",
@@ -210,5 +210,44 @@ describe("anchorHypotheses", () => {
     const a = anchorHypotheses(undefined, hunks);
     expect(a.rows.size).toBe(0);
     expect(a.fileLevel.size).toBe(0);
+  });
+});
+
+const fnd = (id: string, file: string, line_start: number, line_end = line_start): ReviewFinding => ({
+  id, lens: "code", severity: "high", title: id, detail: "", suggestion: "", file, line_start, line_end,
+  evidence_ids: [], check: { verdict: "confirmed", reason: "", evidence_ids: [] },
+});
+
+describe("anchorFindings", () => {
+  const hunks = [ev("E1", "src/p.js", HUNK), ev("E2", "src/q.js", "@@ -1 +1 @@\n-a\n+b")];
+
+  it("anchorFindings places findings on their rows", () => {
+    const h = anchorHypotheses([hyp(1, "src/p.js", 7)], hunks);
+    const f = anchorFindings([fnd("R1", "src/p.js", 7)], hunks);
+    expect([...(h.rows.get("E1")?.keys() ?? [])]).toEqual([6]);
+    expect([...(f.rows.get("E1")?.keys() ?? [])]).toEqual([6]);
+    expect(f.rows.get("E1")?.get(6)?.map((x) => x.id)).toEqual(["R1"]);
+    expect(f.fileLevel.size).toBe(0);
+  });
+
+  it("anchorFindings keeps the given order and puts unplaced lines under the file header", () => {
+    const f = anchorFindings(
+      [fnd("R3", "src/q.js", 1), fnd("R1", "src/q.js", 1), fnd("R2", "src/p.js", 0, 0), fnd("R4", "src/p.js", 99)],
+      hunks,
+    );
+    expect(f.rows.get("E2")?.get(2)?.map((x) => x.id)).toEqual(["R3", "R1"]);
+    expect(f.fileLevel.get("src/p.js")?.map((x) => x.id)).toEqual(["R2", "R4"]);
+  });
+
+  it("anchorFindings skips findings without a diff hunk", () => {
+    const withSource = [...hunks, ev("E3", "src/s.js", "const s = 1;", "source")];
+    const f = anchorFindings([fnd("R1", "src/s.js", 1), fnd("R2", "", 0, 0), fnd("R3", "src/s.js", 0, 0)], withSource);
+    expect(f.rows.size).toBe(0);
+    expect(f.fileLevel.size).toBe(0);
+  });
+
+  it("anchorFindings handles missing findings and evidence", () => {
+    expect(anchorFindings(undefined, hunks).rows.size).toBe(0);
+    expect(anchorFindings(null, null).fileLevel.size).toBe(0);
   });
 });

@@ -1,5 +1,5 @@
 import { classifyDiffLine, type DiffLineKind } from "./logic";
-import type { ChangedFile, Evidence, Hypothesis } from "./types";
+import type { ChangedFile, Evidence, Hypothesis, ReviewFinding } from "./types";
 
 export interface DiffCounts {
   add: number;
@@ -154,12 +154,16 @@ export function groupDiffsByFile(evidence: Evidence[] | null | undefined): FileD
   return [...map.values()];
 }
 
-export interface Anchors {
-  /** evidence id -> row index -> hypotheses to render directly under that row */
-  rows: Map<string, Map<number, Hypothesis[]>>;
-  /** file path -> hypotheses to render under the file header (no usable line) */
-  fileLevel: Map<string, Hypothesis[]>;
+/** Comments placed in the diff view: rows and the file level, each in the order they were given. */
+interface Placement<T> {
+  /** evidence id -> row index -> comments to render directly under that row */
+  rows: Map<string, Map<number, T[]>>;
+  /** file path -> comments to render under the file header (no usable line) */
+  fileLevel: Map<string, T[]>;
 }
+
+export type Anchors = Placement<Hypothesis>;
+export type FindingAnchors = Placement<ReviewFinding>;
 
 /**
  * Map hypotheses to positions in the diff view. A hypothesis whose line_start (HEAD side)
@@ -167,19 +171,34 @@ export interface Anchors {
  * outside every hunk of its file goes under the file header. Files without hunks are ignored.
  */
 export function anchorHypotheses(hyps: Hypothesis[] | null | undefined, evidence: Evidence[] | null | undefined): Anchors {
-  const rows = new Map<string, Map<number, Hypothesis[]>>();
-  const fileLevel = new Map<string, Hypothesis[]>();
+  return place([...(hyps ?? [])].sort((a, b) => a.rank - b.rank), evidence);
+}
+
+/**
+ * Map review findings to positions in the diff view with the rules of anchorHypotheses,
+ * keeping the given order (the caller passes them filtered and in display order). A finding
+ * about no file, or about a file with no diff_hunk item, is not anchored.
+ */
+export function anchorFindings(fs: ReviewFinding[] | null | undefined, evidence: Evidence[] | null | undefined): FindingAnchors {
+  return place([...(fs ?? [])], evidence);
+}
+
+function place<T extends { file: string; line_start: number; line_end: number }>(
+  items: T[],
+  evidence: Evidence[] | null | undefined,
+): Placement<T> {
+  const rows = new Map<string, Map<number, T[]>>();
+  const fileLevel = new Map<string, T[]>();
   const hunks = diffHunks(evidence);
   const parsed = hunks.map((h) => ({ ev: h, rows: parseHunk(h.excerpt) }));
-  const sorted = [...(hyps ?? [])].sort((a, b) => a.rank - b.rank);
 
-  for (const h of sorted) {
-    const mine = parsed.filter((p) => p.ev.file === h.file);
-    if (!h.file || mine.length === 0) continue;
+  for (const item of items) {
+    const mine = parsed.filter((p) => p.ev.file === item.file);
+    if (!item.file || mine.length === 0) continue;
     let placed = false;
-    if (h.line_start > 0) {
-      const start = h.line_start;
-      const end = Math.max(h.line_end || start, start);
+    if (item.line_start > 0) {
+      const start = item.line_start;
+      const end = Math.max(item.line_end || start, start);
       for (const p of mine) {
         const nums = p.rows.map((r) => r.newNo).filter((n): n is number => n !== null);
         if (nums.length === 0) continue;
@@ -210,12 +229,12 @@ export function anchorHypotheses(hyps: Hypothesis[] | null | undefined, evidence
           m = new Map();
           rows.set(p.ev.id, m);
         }
-        m.set(idx, [...(m.get(idx) ?? []), h]);
+        m.set(idx, [...(m.get(idx) ?? []), item]);
         placed = true;
         break;
       }
     }
-    if (!placed) fileLevel.set(h.file, [...(fileLevel.get(h.file) ?? []), h]);
+    if (!placed) fileLevel.set(item.file, [...(fileLevel.get(item.file) ?? []), item]);
   }
   return { rows, fileLevel };
 }
