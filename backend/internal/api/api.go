@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"os"
@@ -140,7 +141,14 @@ type Server struct {
 	// delivery finishes. It lives only here: never in an Analysis, so it is
 	// never returned, logged or persisted.
 	notifyURLs map[string]pendingNotify
-	delivering int // deliveries in flight
+	// delivering holds the id of every analysis whose notification this
+	// process is still sending, so loadStored keeps its stored "pending".
+	delivering map[string]struct{}
+	// runs holds the cancel func of every analysis whose run goroutine has
+	// not returned yet. Drain cancels them and waits for them.
+	runs     map[string]context.CancelFunc
+	stopping bool          // Drain has begun
+	changed  chan struct{} // closed when active, runs or delivering shrinks; nil while nobody waits
 }
 
 type pendingNotify struct{ url, format string }
@@ -383,8 +391,15 @@ func (s *Server) loadStored(id string) (Analysis, bool) {
 	if a.Verifications == nil {
 		a.Verifications = []Verification{}
 	}
+	// A stored "pending" is a delivery that a previous process did not
+	// finish, unless this process is still sending it.
 	if n := a.Notification; n != nil && n.Status == "pending" {
-		n.Status, n.LastError = "failed", "delivery interrupted: the server stopped before it finished"
+		s.mu.Lock()
+		_, inFlight := s.delivering[id]
+		s.mu.Unlock()
+		if !inFlight {
+			n.Status, n.LastError = "failed", msgDeliveryInterrupted
+		}
 	}
 	return a, true
 }
@@ -400,22 +415,51 @@ func (s *Server) snapshot(id string) (Analysis, bool) {
 	return s.loadStored(id)
 }
 
-// mutate applies f to the in-memory analysis (adopting fallback from the
-// store when it was evicted or created by an earlier process) and persists
-// the result. f returns false to skip the change.
+// mutate applies f to the in-memory analysis and persists the result. f
+// returns false to skip the change. When the analysis is not in memory
+// (evicted, or created by an earlier process) and fallback is not nil, the
+// stored copy is loaded and adopted; fallback, the caller's possibly older
+// snapshot, is adopted only when there is no stored copy, so it cannot
+// overwrite a change saved since it was taken (a delivery outcome, say).
 func (s *Server) mutate(id string, fallback *Analysis, f func(a *Analysis) bool) {
+	var load func() (Analysis, bool)
+	if fallback != nil {
+		load = func() (Analysis, bool) {
+			if a, ok := s.loadStored(id); ok {
+				return a, true
+			}
+			return *fallback, true
+		}
+	}
+	s.mutateWith(id, load, f)
+}
+
+// mutateWith is mutate with the fallback produced by load, which runs only
+// when the analysis is not in memory. The memory check, the load and the
+// change happen in one saveMu critical section; every save and eviction
+// also holds saveMu, so the analysis cannot leave memory in between and the
+// change cannot be lost. load is called without s.mu held.
+func (s *Server) mutateWith(id string, load func() (Analysis, bool), f func(a *Analysis) bool) {
 	s.saveMu.Lock()
 	defer s.saveMu.Unlock()
 	s.mu.Lock()
 	a, ok := s.jobs[id]
 	if !ok {
-		if fallback == nil {
+		if load == nil {
 			s.mu.Unlock()
 			return
 		}
-		c := *fallback
-		a = &c
-		s.insertLocked(a)
+		s.mu.Unlock()
+		c, found := load()
+		s.mu.Lock()
+		if a, ok = s.jobs[id]; !ok {
+			if !found {
+				s.mu.Unlock()
+				return
+			}
+			a = &c
+			s.insertLocked(a)
+		}
 	}
 	if !f(a) {
 		s.mu.Unlock()
@@ -468,11 +512,17 @@ func (s *Server) finish(id string, f func(a *Analysis)) {
 		if s.running[a.Repo] == id {
 			delete(s.running, a.Repo)
 			s.active--
+			s.signalLocked()
 		}
 		if p, ok := s.notifyURLs[id]; ok && a.Notification != nil {
 			delete(s.notifyURLs, id)
 			pn, payload, host, send = p, payloadOf(a), a.Notification.Host, true
-			s.delivering++ // in the same critical section as active--
+			// In the same critical section as active--, so Drain never
+			// sees the analysis as neither running nor delivering.
+			if s.delivering == nil {
+				s.delivering = map[string]struct{}{}
+			}
+			s.delivering[id] = struct{}{}
 		}
 		return true
 	})
@@ -511,21 +561,29 @@ func payloadOf(a *Analysis) notify.Payload {
 	return p
 }
 
-const deliveryDeadline = 2 * time.Minute
+const (
+	deliveryDeadline = 2 * time.Minute
+
+	msgInterrupted         = "analysis interrupted: the server stopped while it was running"
+	msgDeliveryInterrupted = "delivery interrupted: the server stopped before it finished"
+)
 
 // deliver sends one notification and records its outcome on the analysis.
 // Only the host is ever logged or stored.
 func (s *Server) deliver(id string, pn pendingNotify, p notify.Payload, host string) {
+	// Leaves the in-flight set only after the outcome is recorded, so a
+	// read of the stored analysis in between still sees "pending".
 	defer func() {
 		s.mu.Lock()
-		s.delivering--
+		delete(s.delivering, id)
+		s.signalLocked()
 		s.mu.Unlock()
 	}()
 	var res notify.Result
 	func() {
 		defer func() {
 			if r := recover(); r != nil {
-				log.Printf("analysis %s: notification to %s panicked", id, host)
+				slog.Error("notification panicked", "analysis", id, "host", host, "panic", scrubURL(fmt.Sprint(r), pn.url))
 				res = notify.Result{Err: "internal error"}
 			}
 		}()
@@ -538,16 +596,9 @@ func (s *Server) deliver(id string, pn pendingNotify, p notify.Payload, host str
 	if res.Delivered {
 		status, res.Err = "delivered", ""
 	}
-	var fallback *Analysis
-	s.mu.Lock()
-	_, inMemory := s.jobs[id]
-	s.mu.Unlock()
-	if !inMemory {
-		if a, ok := s.loadStored(id); ok {
-			fallback = &a
-		}
-	}
-	s.mutate(id, fallback, func(a *Analysis) bool {
+	// An analysis evicted from memory meanwhile is loaded from the store
+	// inside the same critical section that records the outcome.
+	s.mutateWith(id, func() (Analysis, bool) { return s.loadStored(id) }, func(a *Analysis) bool {
 		if a.Notification == nil {
 			return false
 		}
@@ -557,26 +608,98 @@ func (s *Server) deliver(id string, pn pendingNotify, p notify.Payload, host str
 		return true
 	})
 	if !res.Delivered {
-		log.Printf("analysis %s: notification to %s failed after %d attempt(s): %s", id, host, res.Attempts, res.Err)
+		slog.Warn("notification failed", "analysis", id, "host", host, "attempts", res.Attempts,
+			"status_code", res.StatusCode, "error", res.Err)
 	}
 }
 
-// scrubURL removes the notify URL, its path and its query from msg, as a
-// second guard behind the Notifier, and caps its length.
+// scrubURL removes the notify URL, its path and its query from msg, before
+// and after removing control characters (a decoded path can hold one, and
+// one inserted into a part would otherwise hide it), as a second guard
+// behind the Notifier, and caps its length at 500 characters.
 func scrubURL(msg, raw string) string {
 	parts := []string{raw}
 	if u, err := url.Parse(raw); err == nil {
 		parts = append(parts, u.RawQuery, u.EscapedPath(), u.Path)
 	}
-	for _, p := range parts {
-		if len(p) > 1 {
-			msg = strings.ReplaceAll(msg, p, "")
+	remove := func(msg string) string {
+		for _, p := range parts {
+			if len(p) > 1 {
+				msg = strings.ReplaceAll(msg, p, "")
+			}
 		}
+		return msg
 	}
+	msg = remove(notify.StripControl(remove(msg)))
 	if r := []rune(msg); len(r) > 500 {
 		msg = string(r[:500])
 	}
 	return msg
+}
+
+// Drain is the second half of a graceful shutdown, after the HTTP server
+// has stopped taking requests. It ends every running analysis with status
+// error and msgInterrupted, which starts its notification, stops their test
+// processes, and then waits until no analysis is running and no
+// notification is being delivered. If ctx ends first it returns an error
+// that wraps ctx.Err() and counts the analysis runs still stopping and the
+// notifications still being sent; a delivery cut off then stays "pending"
+// in DATA_DIR, which the next process reports as failed with
+// msgDeliveryInterrupted.
+func (s *Server) Drain(ctx context.Context) error {
+	for {
+		s.mu.Lock()
+		s.stopping = true
+		ids := make([]string, 0, len(s.running))
+		for _, id := range s.running {
+			ids = append(ids, id)
+		}
+		s.mu.Unlock()
+		// Ended before their runs are cancelled, so a cancelled run cannot
+		// end its analysis first with "analysis timed out".
+		for _, id := range ids {
+			s.interrupt(id)
+		}
+		s.mu.Lock()
+		cancels := make([]context.CancelFunc, 0, len(s.runs))
+		for _, cancel := range s.runs {
+			cancels = append(cancels, cancel)
+		}
+		idle := s.active == 0 && len(s.runs) == 0 && len(s.delivering) == 0
+		if !idle && s.changed == nil {
+			s.changed = make(chan struct{})
+		}
+		changed := s.changed
+		s.mu.Unlock()
+		for _, cancel := range cancels {
+			cancel()
+		}
+		if idle {
+			return nil
+		}
+		select {
+		case <-changed:
+		case <-ctx.Done():
+			s.mu.Lock()
+			runs, deliveries := len(s.runs), len(s.delivering)
+			s.mu.Unlock()
+			return fmt.Errorf("%d analysis run(s) still stopping, %d notification(s) still being sent: %w", runs, deliveries, ctx.Err())
+		}
+	}
+}
+
+// interrupt ends a running analysis because the server is stopping.
+func (s *Server) interrupt(id string) {
+	s.finish(id, func(a *Analysis) { a.Status, a.Error = "error", msgInterrupted })
+}
+
+// signalLocked wakes Drain after active, runs or delivering shrank. s.mu
+// must be held.
+func (s *Server) signalLocked() {
+	if s.changed != nil {
+		close(s.changed)
+		s.changed = nil
+	}
 }
 
 // ---- handlers ------------------------------------------------------------
@@ -593,14 +716,7 @@ func (s *Server) create(w http.ResponseWriter, r *http.Request) {
 		fail(w, 400, "bad_request", "invalid JSON body")
 		return
 	}
-	format := req.NotifyFormat
-	if format == "" {
-		format = notify.FormatJSON
-	}
-	if !notify.ValidFormat(format) {
-		fail(w, 400, "bad_request", "notify_format must be json or slack")
-		return
-	}
+	// The notification checks, in the order of the v3 addendum.
 	var notifyHost string
 	if req.NotifyURL != "" {
 		if s.cfg.WebhookSecret == "" || s.cfg.Notifier == nil {
@@ -613,6 +729,14 @@ func (s *Server) create(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		notifyHost = strings.ToLower(u.Hostname())
+	}
+	format := req.NotifyFormat
+	if format == "" {
+		format = notify.FormatJSON
+	}
+	if !notify.ValidFormat(format) {
+		fail(w, 400, "bad_request", "notify_format must be json or slack")
+		return
 	}
 	repo, dir, err := s.repoDir(req.Repo)
 	if err != nil {
@@ -685,12 +809,32 @@ func (s *Server) create(w http.ResponseWriter, r *http.Request) {
 func (s *Server) supervise(id, dir string, cmd Command, base, cur string) {
 	ctx, cancel := context.WithTimeout(context.Background(), s.cfg.JobTimeout)
 	defer cancel()
+	// Registered until the run goroutine returns, so Drain can stop it and
+	// wait for it.
+	s.mu.Lock()
+	if s.runs == nil {
+		s.runs = map[string]context.CancelFunc{}
+	}
+	s.runs[id] = cancel
+	stopping := s.stopping
+	s.mu.Unlock()
+	if stopping {
+		// Created after Drain began: end it before it runs anything.
+		s.interrupt(id)
+		cancel()
+	}
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
 		defer func() {
+			s.mu.Lock()
+			delete(s.runs, id)
+			s.signalLocked()
+			s.mu.Unlock()
+		}()
+		defer func() {
 			if p := recover(); p != nil {
-				log.Printf("analysis %s panicked: %v", id, p)
+				slog.Error("analysis panicked", "analysis", id, "panic", notify.StripControl(fmt.Sprint(p)))
 				s.finish(id, func(a *Analysis) { a.Status, a.Error = "error", "internal error" })
 			}
 		}()

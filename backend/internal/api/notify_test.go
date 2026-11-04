@@ -7,18 +7,22 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io"
 	"log"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"regressionmap/internal/model"
 	"regressionmap/internal/notify"
@@ -350,8 +354,9 @@ func TestNotifyAfterErrorStatusExactlyOnce(t *testing.T) {
 
 // tlsReceiver is a TLS webhook receiver plus a real notify.Sender whose
 // resolver maps the receiver's certificate host (example.com) to a public
-// TEST-NET-3 address. The injected dialer is called only with an address
-// that passed the public-IP check, and routes it to the local receiver.
+// address. The injected dialer is called only with an address that passed
+// the public-IP check, and routes it to the local receiver. (The TEST-NET
+// ranges are not public under the v3 addendum, so they cannot stand in.)
 type tlsReceiver struct {
 	srv    *httptest.Server
 	sender *notify.Sender
@@ -372,12 +377,12 @@ func newTLSReceiver(t *testing.T) *tlsReceiver {
 		w.WriteHeader(200)
 	}))
 	t.Cleanup(r.srv.Close)
-	vetted := netip.MustParseAddr("203.0.113.7")
+	vetted := netip.MustParseAddr("93.184.216.34")
 	r.sender = &notify.Sender{
 		Secret:   []byte(testWebhookSecret),
 		Resolver: staticResolver{"example.com": {vetted}},
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			if addr != "203.0.113.7:443" {
+			if addr != "93.184.216.34:443" {
 				t.Errorf("dial to unexpected address %s", addr)
 			}
 			var d net.Dialer
@@ -504,5 +509,770 @@ func TestStoredPendingNotificationIsReportedFailed(t *testing.T) {
 	if code := do(t, "GET", srv.URL+"/api/analyses/"+id, nil, &a); code != 200 || a.Notification == nil ||
 		a.Notification.Status != "failed" || !strings.Contains(a.Notification.LastError, "interrupted") {
 		t.Fatalf("%d %+v", code, a.Notification)
+	}
+}
+
+// ---- v3 addendum ---------------------------------------------------------
+
+// releaser returns a func that unblocks f once. The test's cleanup calls it
+// too, so a failing test never leaves a delivery blocked.
+func releaser(t *testing.T, f *fakeNotifier) func() {
+	var once sync.Once
+	rel := func() { once.Do(func() { close(f.release) }) }
+	t.Cleanup(rel)
+	return rel
+}
+
+func waitCalls(t *testing.T, f *fakeNotifier, n int) {
+	t.Helper()
+	deadline := time.Now().Add(60 * time.Second)
+	for len(f.Calls()) < n {
+		if time.Now().After(deadline) {
+			t.Fatalf("notifier called %d time(s), want %d", len(f.Calls()), n)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// captureJSONLog makes a JSON slog handler the process default for the
+// test, as main does with LOG_FORMAT=json, and restores the previous slog
+// and log package settings afterwards. Call it before newServer, so the
+// server is idle before the settings are restored.
+func captureJSONLog(t *testing.T) *syncBuffer {
+	buf := &syncBuffer{}
+	prev, prevOut, prevFlags := slog.Default(), log.Writer(), log.Flags()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(buf, nil)))
+	t.Cleanup(func() {
+		slog.SetDefault(prev)
+		log.SetOutput(prevOut)
+		log.SetFlags(prevFlags)
+	})
+	return buf
+}
+
+// jsonLines parses every log line and fails on one that is not JSON.
+func jsonLines(t *testing.T, s string) []map[string]any {
+	t.Helper()
+	var out []map[string]any
+	for _, line := range strings.Split(s, "\n") {
+		if line == "" {
+			continue
+		}
+		var rec map[string]any
+		if err := json.Unmarshal([]byte(line), &rec); err != nil {
+			t.Fatalf("log line is not JSON (%v): %q", err, line)
+		}
+		out = append(out, rec)
+	}
+	return out
+}
+
+func assertNoControl(t *testing.T, where, s string) {
+	t.Helper()
+	for _, r := range s {
+		if r < 0x20 || (r >= 0x7f && r <= 0x9f) {
+			t.Fatalf("%s keeps control character %U: %q", where, r, s)
+		}
+	}
+}
+
+// goroutineBlocked reports whether a goroutine whose stack contains every
+// marker is parked on a sync.Mutex.
+func goroutineBlocked(markers ...string) bool {
+	buf := make([]byte, 4<<20)
+	n := runtime.Stack(buf, true)
+	for _, g := range strings.Split(string(buf[:n]), "\n\n") {
+		if !strings.Contains(g, "[sync.Mutex.Lock") && !strings.Contains(g, "lockSlow") {
+			continue
+		}
+		all := true
+		for _, m := range markers {
+			all = all && strings.Contains(g, m)
+		}
+		if all {
+			return true
+		}
+	}
+	return false
+}
+
+func waitBlocked(t *testing.T, what string, markers ...string) {
+	t.Helper()
+	deadline := time.Now().Add(30 * time.Second)
+	for !goroutineBlocked(markers...) {
+		if time.Now().After(deadline) {
+			t.Fatalf("%s never blocked on a mutex", what)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// POST /api/analyses checks the notification fields in the addendum's
+// order: webhooks_disabled, then invalid_notify_url, then bad_request for
+// notify_format, with or without notify_url.
+func TestNotifyRequestCheckOrder(t *testing.T) {
+	_, off, _, offShas := newServer(t, []string{"r1"}, func(c *Config) { c.Commands = []Command{slowCmd(50)} })
+	fake := newFake(false, notify.Result{Delivered: true, Attempts: 1, StatusCode: 200})
+	_, on, _, onShas := newServer(t, []string{"r1"}, func(c *Config) {
+		c.Commands = []Command{slowCmd(50)}
+		c.WebhookSecret = testWebhookSecret
+		c.Notifier = fake
+	})
+	body := func(base, url, format string) map[string]any {
+		b := startBody("r1", base, "slow")
+		if url != "" {
+			b["notify_url"] = url
+		}
+		if format != "" {
+			b["notify_format"] = format
+		}
+		return b
+	}
+	cases := []struct {
+		name, srv, base, url, format, code string
+	}{
+		{"disabled, bad format", off.URL, offShas["r1"].Baseline, secretNotifyURL, "xml", "webhooks_disabled"},
+		{"disabled, bad URL, bad format", off.URL, offShas["r1"].Baseline, "http://hooks.example.com/services/PATHSECRET", "xml", "webhooks_disabled"},
+		{"disabled, no URL, bad format", off.URL, offShas["r1"].Baseline, "", "xml", "bad_request"},
+		{"bad URL, bad format", on.URL, onShas["r1"].Baseline, "http://hooks.example.com/services/PATHSECRET", "xml", "invalid_notify_url"},
+		{"valid URL, bad format", on.URL, onShas["r1"].Baseline, secretNotifyURL, "xml", "bad_request"},
+		{"no URL, bad format", on.URL, onShas["r1"].Baseline, "", "Slack", "bad_request"},
+	}
+	for _, c := range cases {
+		code, resp := rawDo(t, "POST", c.srv+"/api/analyses", body(c.base, c.url, c.format))
+		var er apiErr
+		json.Unmarshal([]byte(resp), &er)
+		if code != 400 || er.Error.Code != c.code {
+			t.Errorf("%s: %d %s, want 400 %s", c.name, code, resp, c.code)
+		}
+		assertNoLeak(t, "error body", resp)
+	}
+	// A valid notify_format without notify_url is accepted and ignored.
+	code, resp := rawDo(t, "POST", on.URL+"/api/analyses", body(onShas["r1"].Baseline, "", "slack"))
+	if code != 202 || !strings.Contains(resp, `"notification":null`) {
+		t.Fatalf("format without URL: %d %s", code, resp)
+	}
+	if n := len(fake.Calls()); n != 0 {
+		t.Fatalf("no notification was requested, got %d calls", n)
+	}
+}
+
+// MaxJobs=1: a second analysis evicts A from memory while A's delivery is
+// still in flight. GET keeps showing "pending", because this process is
+// still delivering, and the real outcome is recorded when it ends (through
+// the load of the evicted analysis from DATA_DIR).
+func TestNotifyPendingWhileDeliveringAfterEviction(t *testing.T) {
+	data := t.TempDir()
+	fake := newFake(true, notify.Result{Delivered: true, Attempts: 1, StatusCode: 200})
+	s, srv, _, shas := newServer(t, []string{"r1", "r2"}, func(c *Config) {
+		c.DataDir = data
+		c.MaxJobs = 1
+		c.Commands = []Command{slowCmd(50)}
+		c.WebhookSecret = testWebhookSecret
+		c.Notifier = fake
+	})
+	release := releaser(t, fake)
+	var a Analysis
+	if code := do(t, "POST", srv.URL+"/api/analyses", notifyBody("r1", shas["r1"].Baseline, "slow", secretNotifyURL, "json"), &a); code != 202 {
+		t.Fatalf("POST A %d", code)
+	}
+	pollDone(t, srv.URL, a.ID)
+	waitCalls(t, fake, 1)
+	if code := do(t, "POST", srv.URL+"/api/analyses", startBody("r2", shas["r2"].Baseline, "slow"), nil); code != 202 {
+		t.Fatalf("POST B %d", code)
+	}
+	s.mu.Lock()
+	_, inMemory := s.jobs[a.ID]
+	s.mu.Unlock()
+	if inMemory {
+		t.Fatal("fixture: A must have been evicted by B")
+	}
+	var got Analysis
+	if code := do(t, "GET", srv.URL+"/api/analyses/"+a.ID, nil, &got); code != 200 {
+		t.Fatalf("GET A %d", code)
+	}
+	if n := got.Notification; n == nil || n.Status != "pending" || n.LastError != "" {
+		t.Fatalf("in-flight delivery of an evicted analysis shown as %+v, want pending", got.Notification)
+	}
+
+	release()
+	fin := waitNotification(t, srv.URL, a.ID, "delivered")
+	if n := fin.Notification; n.Attempts != 1 || n.LastStatusCode != 200 || n.LastError != "" {
+		t.Fatalf("delivered notification %+v", n)
+	}
+	waitIdle(t, s)
+	if st, ok := loadStoredAnalysis(t, data, a.ID); !ok || st.Notification == nil || st.Notification.Status != "delivered" {
+		t.Fatalf("stored notification %+v", st.Notification)
+	}
+}
+
+// The analysis leaves memory between the end of its delivery and the
+// recording of the outcome: create, queued on saveMu behind a persist in
+// progress, evicts it (MaxJobs=1) just before deliver records. The outcome
+// is still recorded, in DATA_DIR and in what GET serves.
+func TestDeliveryOutcomeRecordedWhenEvictedWhileRecording(t *testing.T) {
+	data := t.TempDir()
+	fake := newFake(true, notify.Result{Delivered: true, Attempts: 1, StatusCode: 200})
+	s, srv, _, shas := newServer(t, []string{"r1", "r2"}, func(c *Config) {
+		c.DataDir = data
+		c.MaxJobs = 1
+		c.Commands = []Command{slowCmd(50)}
+		c.WebhookSecret = testWebhookSecret
+		c.Notifier = fake
+	})
+	release := releaser(t, fake)
+	var a Analysis
+	if code := do(t, "POST", srv.URL+"/api/analyses", notifyBody("r1", shas["r1"].Baseline, "slow", secretNotifyURL, "json"), &a); code != 202 {
+		t.Fatalf("POST A %d", code)
+	}
+	pollDone(t, srv.URL, a.ID)
+	waitCalls(t, fake, 1)
+
+	s.saveMu.Lock() // a persist in progress elsewhere
+	locked := true
+	defer func() {
+		if locked {
+			s.saveMu.Unlock()
+		}
+	}()
+	bDone := make(chan int, 1)
+	go func() {
+		var b Analysis
+		bDone <- do(t, "POST", srv.URL+"/api/analyses", startBody("r2", shas["r2"].Baseline, "slow"), &b)
+	}()
+	waitBlocked(t, "create", "(*Server).create")
+	release() // the receiver answered 200
+	waitBlocked(t, "deliver", "(*Server).deliver")
+	locked = false
+	s.saveMu.Unlock() // create runs first and evicts A, then deliver records
+	if code := <-bDone; code != 202 {
+		t.Fatalf("POST B %d", code)
+	}
+	waitIdle(t, s)
+
+	var got Analysis
+	do(t, "GET", srv.URL+"/api/analyses/"+a.ID, nil, &got)
+	if n := got.Notification; n == nil || n.Status != "delivered" || n.Attempts != 1 || n.LastStatusCode != 200 {
+		t.Fatalf("GET serves %+v after a successful delivery", got.Notification)
+	}
+	if st, ok := loadStoredAnalysis(t, data, a.ID); !ok || st.Notification == nil || st.Notification.Status != "delivered" {
+		t.Fatalf("stored notification %+v after a successful delivery", st.Notification)
+	}
+}
+
+// A verification takes its snapshot of an evicted analysis while the
+// delivery is in flight; the delivery records "delivered" while the
+// verification command runs. The verification must not write its stale
+// snapshot back over the recorded outcome.
+func TestVerifyKeepsDeliveryOutcomeRecordedMeanwhile(t *testing.T) {
+	data := t.TempDir()
+	fake := newFake(true, notify.Result{Delivered: true, Attempts: 1, StatusCode: 200})
+	s, srv, _, shas := newServer(t, []string{"r1", "r2"}, func(c *Config) {
+		c.DataDir = data
+		c.MaxJobs = 1
+		c.Commands = []Command{slowCmd(50), slowCmd(20000), slowCmd(2500)}
+		c.Commands[1].ID = "stuck"
+		c.Commands[2].ID = "check"
+		c.WebhookSecret = testWebhookSecret
+		c.Notifier = fake
+	})
+	release := releaser(t, fake)
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		s.Drain(ctx) // ends the stuck analysis
+	}()
+	var a Analysis
+	if code := do(t, "POST", srv.URL+"/api/analyses", notifyBody("r1", shas["r1"].Baseline, "slow", secretNotifyURL, "json"), &a); code != 202 {
+		t.Fatalf("POST A %d", code)
+	}
+	pollDone(t, srv.URL, a.ID)
+	waitCalls(t, fake, 1)
+	// B keeps running, so A cannot stay in memory once re-inserted.
+	if code := do(t, "POST", srv.URL+"/api/analyses", startBody("r2", shas["r2"].Baseline, "stuck"), nil); code != 202 {
+		t.Fatalf("POST B %d", code)
+	}
+
+	verified := make(chan int, 1)
+	go func() {
+		verified <- do(t, "POST", srv.URL+"/api/analyses/"+a.ID+"/verify", map[string]any{"command_id": "check", "approved": true}, nil)
+	}()
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		s.mu.Lock()
+		busy := s.verifying["r1"]
+		s.mu.Unlock()
+		if busy {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the verification never started")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	release()
+	for {
+		if st, ok := loadStoredAnalysis(t, data, a.ID); ok && st.Notification != nil && st.Notification.Status == "delivered" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the delivery outcome was never recorded")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	s.mu.Lock()
+	stillVerifying := s.verifying["r1"]
+	s.mu.Unlock()
+	if !stillVerifying {
+		t.Fatal("fixture: the verification ended before the delivery was recorded")
+	}
+	if code := <-verified; code != 200 {
+		t.Fatalf("verify %d", code)
+	}
+
+	var got Analysis
+	do(t, "GET", srv.URL+"/api/analyses/"+a.ID, nil, &got)
+	if n := got.Notification; n == nil || n.Status != "delivered" || len(got.Verifications) != 1 {
+		t.Fatalf("after the verification: notification %+v, %d verification(s)", got.Notification, len(got.Verifications))
+	}
+	if st, _ := loadStoredAnalysis(t, data, a.ID); st.Notification == nil || st.Notification.Status != "delivered" || len(st.Verifications) != 1 {
+		t.Fatalf("stored after the verification: notification %+v, %d verification(s)", st.Notification, len(st.Verifications))
+	}
+}
+
+// With LOG_FORMAT=json every log line is JSON. A failed delivery logs
+// exactly one record with its fields; text from the receiver can neither
+// add a record nor carry control characters, and the URL never appears.
+func TestNotifyFailureLogsOneJSONLine(t *testing.T) {
+	logs := captureJSONLog(t)
+	data := t.TempDir()
+	forged := `{"time":"2026-11-04T00:00:00Z","level":"INFO","msg":"http","method":"DELETE","path":"/api/keys/k_forged","status":204}`
+	errText := "x509: certificate is valid for evil.example\n" + forged + "\r\n\x1b[0m\u0085 while posting to " + secretNotifyURL
+	fake := newFake(false, notify.Result{Attempts: 3, StatusCode: 0, Err: errText})
+	s, srv, _, shas := newServer(t, []string{"r1"}, func(c *Config) {
+		c.DataDir = data
+		c.Commands = []Command{slowCmd(50)}
+		c.WebhookSecret = testWebhookSecret
+		c.Notifier = fake
+	})
+	var a Analysis
+	if code := do(t, "POST", srv.URL+"/api/analyses", notifyBody("r1", shas["r1"].Baseline, "slow", secretNotifyURL, "json"), &a); code != 202 {
+		t.Fatalf("POST %d", code)
+	}
+	got := waitNotification(t, srv.URL, a.ID, "failed")
+	waitIdle(t, s)
+
+	wantErr := "x509: certificate is valid for evil.example" + forged + "[0m while posting to "
+	if n := got.Notification; n.LastError != wantErr || n.Attempts != 3 {
+		t.Fatalf("last_error %q attempts %d, want %q", n.LastError, n.Attempts, wantErr)
+	}
+	assertNoControl(t, "last_error", got.Notification.LastError)
+	assertNoLeak(t, "last_error", got.Notification.LastError)
+
+	recs := jsonLines(t, logs.String())
+	if len(recs) != 1 {
+		t.Fatalf("want exactly one log line, got %d:\n%s", len(recs), logs.String())
+	}
+	r := recs[0]
+	if r["level"] != "WARN" || r["msg"] != "notification failed" || r["analysis"] != a.ID || r["host"] != "hooks.example.com" ||
+		r["attempts"] != float64(3) || r["status_code"] != float64(0) || r["error"] != wantErr {
+		t.Fatalf("log record %v", r)
+	}
+	assertNoLeak(t, "log", logs.String())
+}
+
+// scrubURL is the second guard behind the Notifier: whatever error text a
+// Notifier returns, the URL, its path and its query never reach last_error,
+// DATA_DIR or the log.
+func TestNotifyErrorWithURLIsScrubbed(t *testing.T) {
+	logs := captureJSONLog(t)
+	data := t.TempDir()
+	errText := `Post "` + secretNotifyURL + `": refused; path /services/T000/B000/PATHSECRET; query token=QUERYSECRET`
+	fake := newFake(false, notify.Result{Attempts: 1, Err: errText})
+	s, srv, _, shas := newServer(t, []string{"r1"}, func(c *Config) {
+		c.DataDir = data
+		c.Commands = []Command{slowCmd(50)}
+		c.WebhookSecret = testWebhookSecret
+		c.Notifier = fake
+	})
+	var a Analysis
+	if code := do(t, "POST", srv.URL+"/api/analyses", notifyBody("r1", shas["r1"].Baseline, "slow", secretNotifyURL, "json"), &a); code != 202 {
+		t.Fatalf("POST %d", code)
+	}
+	waitNotification(t, srv.URL, a.ID, "failed")
+	waitIdle(t, s)
+	_, body := rawDo(t, "GET", srv.URL+"/api/analyses/"+a.ID, nil)
+	assertNoLeak(t, "GET body", body)
+	if !strings.Contains(body, "refused") {
+		t.Fatalf("the rest of the error text is kept: %s", body)
+	}
+	raw, err := os.ReadFile(filepath.Join(data, "analyses", a.ID+".json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertNoLeak(t, "persisted file", string(raw))
+	assertNoLeak(t, "log", logs.String())
+}
+
+func TestScrubURL(t *testing.T) {
+	msg := `Post "` + secretNotifyURL + "\": refused\n; path /services/T000/B000/PATHSECRET; query token=QUERYSECRET\x1b"
+	got := scrubURL(msg, secretNotifyURL)
+	assertNoLeak(t, "scrubURL", got)
+	assertNoControl(t, "scrubURL", got)
+	if !strings.Contains(got, "refused") {
+		t.Fatalf("scrubURL lost the text: %q", got)
+	}
+	if n := utf8.RuneCountInString(scrubURL(strings.Repeat("é", 600), secretNotifyURL)); n != 500 {
+		t.Fatalf("scrubURL keeps %d characters, want 500", n)
+	}
+	// The URL parts are removed before and after the control characters: a
+	// decoded path can hold one, and one inserted into a part would
+	// otherwise hide it.
+	got = scrubURL("receiver said: /services/T0/B0/PATH\nSECRET was refused", "https://hooks.example.com/services/T0/B0/PATH%0ASECRET")
+	if strings.Contains(got, "SECRET") || strings.Contains(got, "/services/") || !strings.Contains(got, "was refused") {
+		t.Fatalf("decoded path with a control character: %q", got)
+	}
+	got = scrubURL("refused: /services/T000/B000/PATH\x00SECRET", secretNotifyURL)
+	assertNoLeak(t, "scrubURL of a path split by a control character", got)
+}
+
+// last_error never contains a resolved address: with the real Sender, a
+// receiver that resets the connection during the TLS handshake gives an
+// error without either end of the connection, in GET, DATA_DIR and the log.
+func TestNotifyConnectionErrorCarriesNoAddress(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			buf := make([]byte, 512)
+			c.Read(buf) // the ClientHello
+			c.(*net.TCPConn).SetLinger(0)
+			c.Close() // RST
+		}
+	}()
+	logs := captureJSONLog(t)
+	data := t.TempDir()
+	sender := &notify.Sender{
+		Secret:   []byte(testWebhookSecret),
+		Resolver: staticResolver{"hooks.example.com": {netip.MustParseAddr("93.184.216.34")}},
+		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			var d net.Dialer
+			return d.DialContext(ctx, "tcp", ln.Addr().String())
+		},
+		Sleep: func(context.Context, time.Duration) error { return nil },
+	}
+	s, srv, _, shas := newServer(t, []string{"r1"}, func(c *Config) {
+		c.DataDir = data
+		c.Commands = []Command{slowCmd(50)}
+		c.WebhookSecret = testWebhookSecret
+		c.Notifier = sender
+	})
+	var a Analysis
+	if code := do(t, "POST", srv.URL+"/api/analyses", notifyBody("r1", shas["r1"].Baseline, "slow", secretNotifyURL, "json"), &a); code != 202 {
+		t.Fatalf("POST %d", code)
+	}
+	got := waitNotification(t, srv.URL, a.ID, "failed")
+	waitIdle(t, s)
+	if n := got.Notification; n.Attempts != 3 || n.LastError == "" {
+		t.Fatalf("notification %+v, want 3 failed attempts", n)
+	}
+	raw, err := os.ReadFile(filepath.Join(data, "analyses", a.ID+".json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Both ends of this connection are 127.0.0.1; in production they are
+	// the server's own address and the vetted address.
+	for where, text := range map[string]string{"last_error": got.Notification.LastError, "persisted file": string(raw), "log": logs.String()} {
+		for _, addr := range []string{"127.0.0.1", "93.184.216.34", ln.Addr().String()} {
+			if strings.Contains(text, addr) {
+				t.Fatalf("%s carries the address %s:\n%s", where, addr, text)
+			}
+		}
+	}
+}
+
+// panicTransport panics on every request, so the model step of an
+// analysis panics with a value the test chooses.
+type panicTransport struct{ value string }
+
+func (p panicTransport) RoundTrip(*http.Request) (*http.Response, error) { panic(p.value) }
+
+// A panicking analysis ends as error with "internal error", and its panic
+// is logged as one JSON record whose text has no control characters.
+func TestAnalysisPanicIsLoggedWithoutControlCharacters(t *testing.T) {
+	logs := captureJSONLog(t)
+	s, srv, _, shas := newServer(t, []string{"r1"}, func(c *Config) {
+		c.Commands = []Command{slowCmd(50)}
+		c.Model = &model.Client{BaseURL: "http://model.invalid", APIKey: "k", Model: "m",
+			HTTP: &http.Client{Transport: panicTransport{"boom\n{\"level\":\"INFO\",\"msg\":\"forged\"}\r\x1b[0m\u0085end"}}}
+	})
+	var a Analysis
+	if code := do(t, "POST", srv.URL+"/api/analyses", startBody("r1", shas["r1"].Baseline, "slow"), &a); code != 202 {
+		t.Fatalf("POST %d", code)
+	}
+	if got := pollDone(t, srv.URL, a.ID); got.Status != "error" || got.Error != "internal error" {
+		t.Fatalf("after a panic: status %q error %q", got.Status, got.Error)
+	}
+	waitIdle(t, s)
+	var panics []map[string]any
+	for _, r := range jsonLines(t, logs.String()) {
+		if r["msg"] == "analysis panicked" {
+			panics = append(panics, r)
+		}
+		if r["msg"] == "forged" {
+			t.Fatalf("the panic text forged a log record:\n%s", logs.String())
+		}
+	}
+	const want = `boom{"level":"INFO","msg":"forged"}[0mend`
+	if len(panics) != 1 || panics[0]["level"] != "ERROR" || panics[0]["analysis"] != a.ID || panics[0]["panic"] != want {
+		t.Fatalf("panic log records %v, want one with panic %q\n%s", panics, want, logs.String())
+	}
+}
+
+// blockTransport holds every request until release is closed and ignores
+// the request's context, like a model call that does not stop in time.
+type blockTransport struct {
+	entered chan struct{}
+	release chan struct{}
+	once    *sync.Once
+}
+
+func (b blockTransport) RoundTrip(*http.Request) (*http.Response, error) {
+	b.once.Do(func() { close(b.entered) })
+	<-b.release
+	return nil, errors.New("released")
+}
+
+// When the budget runs out, Drain's error says what it was still waiting
+// for: here an analysis run that has not stopped, and no notification.
+func TestDrainErrorNamesWhatIsLeft(t *testing.T) {
+	bt := blockTransport{entered: make(chan struct{}), release: make(chan struct{}), once: &sync.Once{}}
+	s, srv, _, shas := newServer(t, []string{"r1"}, func(c *Config) {
+		c.Commands = []Command{slowCmd(50)}
+		c.Model = &model.Client{BaseURL: "http://model.invalid", APIKey: "k", Model: "m", HTTP: &http.Client{Transport: bt}}
+	})
+	var once sync.Once
+	t.Cleanup(func() { once.Do(func() { close(bt.release) }) })
+	var a Analysis
+	if code := do(t, "POST", srv.URL+"/api/analyses", startBody("r1", shas["r1"].Baseline, "slow"), &a); code != 202 {
+		t.Fatalf("POST %d", code)
+	}
+	select {
+	case <-bt.entered:
+	case <-time.After(60 * time.Second):
+		t.Fatal("the model step never started")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	err := s.Drain(ctx)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Drain = %v, want context.DeadlineExceeded", err)
+	}
+	const want = "1 analysis run(s) still stopping, 0 notification(s) still being sent"
+	if !strings.Contains(err.Error(), want) {
+		t.Fatalf("Drain error %q, want it to contain %q", err, want)
+	}
+}
+
+type panicNotifier struct{ value any }
+
+func (p panicNotifier) Send(context.Context, string, string, notify.Payload) notify.Result {
+	panic(p.value)
+}
+
+// A panicking Notifier does not take the server down: the notification
+// ends failed with "internal error", the delivery is no longer counted as
+// in flight, and the panic is logged (without the URL) as one JSON line.
+func TestNotifyPanicIsRecovered(t *testing.T) {
+	logs := captureJSONLog(t)
+	data := t.TempDir()
+	s, srv, _, shas := newServer(t, []string{"r1"}, func(c *Config) {
+		c.DataDir = data
+		c.Commands = []Command{slowCmd(50)}
+		c.WebhookSecret = testWebhookSecret
+		c.Notifier = panicNotifier{"boom while posting to " + secretNotifyURL + "\nforged"}
+	})
+	var a Analysis
+	if code := do(t, "POST", srv.URL+"/api/analyses", notifyBody("r1", shas["r1"].Baseline, "slow", secretNotifyURL, "json"), &a); code != 202 {
+		t.Fatalf("POST %d", code)
+	}
+	got := waitNotification(t, srv.URL, a.ID, "failed")
+	if n := got.Notification; n.LastError != "internal error" || n.Attempts != 0 {
+		t.Fatalf("notification after a panic %+v", n)
+	}
+	waitIdle(t, s)
+	if code := do(t, "GET", srv.URL+"/api/health", nil, nil); code != 200 {
+		t.Fatalf("server after a panic: %d", code)
+	}
+	var panics []map[string]any
+	for _, r := range jsonLines(t, logs.String()) {
+		if r["msg"] == "notification panicked" {
+			panics = append(panics, r)
+		}
+	}
+	if len(panics) != 1 || panics[0]["analysis"] != a.ID || panics[0]["host"] != "hooks.example.com" ||
+		panics[0]["panic"] != "boom while posting to forged" {
+		t.Fatalf("panic log records %v\n%s", panics, logs.String())
+	}
+	assertNoLeak(t, "log", logs.String())
+}
+
+// The top hypothesis is the one with the lowest rank, whatever the order.
+func TestPayloadTopHypothesisIsLowestRank(t *testing.T) {
+	a := &Analysis{ID: "a1", Repo: "r1", Status: "done", Model: &model.Result{Status: "ok", Result: &model.Output{
+		Hypotheses: []model.Hypothesis{
+			{Rank: 2, Title: "second", File: "b.ts"},
+			{Rank: 1, Title: "first", File: "a.ts", LineStart: 3, LineEnd: 4, ConfidenceLabel: "high"},
+			{Rank: 3, Title: "third", File: "c.ts"},
+		},
+	}}}
+	p := payloadOf(a)
+	if h := p.TopHypothesis; h == nil || h.Rank != 1 || h.Title != "first" || h.File != "a.ts" || h.LineStart != 3 || h.LineEnd != 4 || h.ConfidenceLabel != "high" {
+		t.Fatalf("top hypothesis %+v", p.TopHypothesis)
+	}
+	if p.ModelStatus != "ok" {
+		t.Fatalf("model_status %q", p.ModelStatus)
+	}
+	a.Model.Result.Hypotheses = nil
+	if p := payloadOf(a); p.TopHypothesis != nil {
+		t.Fatalf("no hypothesis must give null, got %+v", p.TopHypothesis)
+	}
+}
+
+// Shutdown: a delivery still in flight completes before Drain returns.
+func TestDrainWaitsForDeliveryInFlight(t *testing.T) {
+	data := t.TempDir()
+	fake := newFake(true, notify.Result{Delivered: true, Attempts: 1, StatusCode: 200})
+	s, srv, _, shas := newServer(t, []string{"r1"}, func(c *Config) {
+		c.DataDir = data
+		c.Commands = []Command{slowCmd(50)}
+		c.WebhookSecret = testWebhookSecret
+		c.Notifier = fake
+	})
+	release := releaser(t, fake)
+	var a Analysis
+	if code := do(t, "POST", srv.URL+"/api/analyses", notifyBody("r1", shas["r1"].Baseline, "slow", secretNotifyURL, "json"), &a); code != 202 {
+		t.Fatalf("POST %d", code)
+	}
+	pollDone(t, srv.URL, a.ID)
+	waitCalls(t, fake, 1)
+
+	drained := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		drained <- s.Drain(ctx)
+	}()
+	select {
+	case err := <-drained:
+		t.Fatalf("Drain returned (%v) while the delivery was still in flight", err)
+	case <-time.After(300 * time.Millisecond):
+	}
+	release()
+	select {
+	case err := <-drained:
+		if err != nil {
+			t.Fatalf("Drain: %v", err)
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("Drain did not return after the delivery ended")
+	}
+	if st, ok := loadStoredAnalysis(t, data, a.ID); !ok || st.Notification == nil || st.Notification.Status != "delivered" {
+		t.Fatalf("outcome not recorded before Drain returned: %+v", st.Notification)
+	}
+}
+
+// Shutdown: a running analysis ends as error with the addendum's message,
+// which starts its notification, and Drain waits for that delivery.
+func TestDrainEndsRunningAnalysisAndNotifies(t *testing.T) {
+	data := t.TempDir()
+	fake := newFake(false, notify.Result{Delivered: true, Attempts: 1, StatusCode: 200})
+	s, srv, _, shas := newServer(t, []string{"r1"}, func(c *Config) {
+		c.DataDir = data
+		c.Commands = []Command{slowCmd(20000)}
+		c.WebhookSecret = testWebhookSecret
+		c.Notifier = fake
+	})
+	var a Analysis
+	if code := do(t, "POST", srv.URL+"/api/analyses", notifyBody("r1", shas["r1"].Baseline, "slow", secretNotifyURL, "json"), &a); code != 202 {
+		t.Fatalf("POST %d", code)
+	}
+	time.Sleep(300 * time.Millisecond) // the analysis is under way
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	start := time.Now()
+	if err := s.Drain(ctx); err != nil {
+		t.Fatalf("Drain: %v", err)
+	}
+	if el := time.Since(start); el > 15*time.Second {
+		t.Fatalf("Drain took %v: it waited for the test command instead of stopping it", el)
+	}
+	const want = "analysis interrupted: the server stopped while it was running"
+	calls := fake.Calls()
+	if len(calls) != 1 || calls[0].payload.Status != "error" || calls[0].payload.Error != want {
+		t.Fatalf("notification of the interrupted analysis: %+v", calls)
+	}
+	var got Analysis
+	do(t, "GET", srv.URL+"/api/analyses/"+a.ID, nil, &got)
+	if got.Status != "error" || got.Error != want || got.Notification == nil || got.Notification.Status != "delivered" {
+		t.Fatalf("after Drain: status %q error %q notification %+v", got.Status, got.Error, got.Notification)
+	}
+	if st, ok := loadStoredAnalysis(t, data, a.ID); !ok || st.Status != "error" || st.Error != want || st.Notification.Status != "delivered" {
+		t.Fatalf("stored after Drain: %+v", st)
+	}
+}
+
+// Shutdown: Drain gives up when its context ends. The cut-off delivery
+// stays pending while this process runs, and a restarted server over the
+// same DATA_DIR reports it as failed.
+func TestDrainReturnsWhenContextEnds(t *testing.T) {
+	data := t.TempDir()
+	fake := newFake(true, notify.Result{Delivered: true, Attempts: 1, StatusCode: 200})
+	s, srv, root, shas := newServer(t, []string{"r1"}, func(c *Config) {
+		c.DataDir = data
+		c.Commands = []Command{slowCmd(50)}
+		c.WebhookSecret = testWebhookSecret
+		c.Notifier = fake
+	})
+	releaser(t, fake)
+	var a Analysis
+	if code := do(t, "POST", srv.URL+"/api/analyses", notifyBody("r1", shas["r1"].Baseline, "slow", secretNotifyURL, "json"), &a); code != 202 {
+		t.Fatalf("POST %d", code)
+	}
+	pollDone(t, srv.URL, a.ID)
+	waitCalls(t, fake, 1)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	err := s.Drain(ctx)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Drain = %v, want context.DeadlineExceeded", err)
+	}
+	if want := "0 analysis run(s) still stopping, 1 notification(s) still being sent"; !strings.Contains(err.Error(), want) {
+		t.Fatalf("Drain error %q, want it to contain %q", err, want)
+	}
+	if el := time.Since(start); el < 250*time.Millisecond || el > 5*time.Second {
+		t.Fatalf("Drain returned after %v, want about 300ms", el)
+	}
+	var got Analysis
+	do(t, "GET", srv.URL+"/api/analyses/"+a.ID, nil, &got)
+	if got.Notification == nil || got.Notification.Status != "pending" {
+		t.Fatalf("still delivering, GET shows %+v", got.Notification)
+	}
+
+	srv2 := httptest.NewServer(New(Config{Root: root, Model: &model.Client{}, DataDir: data}))
+	defer srv2.Close()
+	var after Analysis
+	do(t, "GET", srv2.URL+"/api/analyses/"+a.ID, nil, &after)
+	if n := after.Notification; n == nil || n.Status != "failed" || n.LastError != "delivery interrupted: the server stopped before it finished" {
+		t.Fatalf("after a restart: %+v", after.Notification)
 	}
 }

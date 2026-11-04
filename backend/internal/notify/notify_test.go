@@ -12,15 +12,24 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 // The httptest TLS certificate is valid for example.com, so test URLs use it.
 const testHost = "example.com"
+
+// publicIP stands in for the receiver's public address; the harness dialer
+// routes every dial to the local receiver. (The TEST-NET ranges are not
+// public under the v3 addendum, so they cannot stand in.)
+const publicIP = "93.184.216.34"
 
 // A secret-bearing URL: neither the path nor the query may ever leak.
 const testURL = "https://" + testHost + "/services/T000/B000/PATHSECRET?token=QUERYSECRET"
@@ -151,28 +160,171 @@ func TestValidate(t *testing.T) {
 }
 
 func TestIsPublic(t *testing.T) {
-	public := []string{"93.184.216.34", "8.8.8.8", "1.1.1.1", "2606:4700:4700::1111", "::ffff:8.8.8.8"}
-	for _, s := range public {
-		if !IsPublic(netip.MustParseAddr(s)) {
-			t.Errorf("%s must be public", s)
-		}
+	cases := []struct {
+		addr   string
+		public bool
+		why    string
+	}{
+		// Public controls.
+		{"93.184.216.34", true, "public IPv4"},
+		{"8.8.8.8", true, "public IPv4"},
+		{"1.1.1.1", true, "public IPv4"},
+		{"2606:4700:4700::1111", true, "public IPv6"},
+		{"2001:4860:4860::8888", true, "public IPv6 outside the Teredo /32"},
+		{"::ffff:8.8.8.8", true, "IPv4-mapped: judged by the public IPv4 it carries"},
+
+		// v3 ranges.
+		{"127.0.0.1", false, "loopback"},
+		{"127.255.0.1", false, "loopback"},
+		{"10.0.0.5", false, "private"},
+		{"172.16.0.1", false, "private"},
+		{"192.168.1.1", false, "private"},
+		{"169.254.169.254", false, "link-local, cloud metadata"},
+		{"169.254.0.1", false, "link-local"},
+		{"100.64.1.1", false, "CGNAT"},
+		{"100.127.255.254", false, "CGNAT"},
+		{"0.0.0.0", false, "unspecified"},
+		{"0.1.2.3", false, "this network"},
+		{"192.0.0.8", false, "IETF protocol assignments"},
+		{"198.18.0.1", false, "benchmarking"},
+		{"198.19.255.255", false, "benchmarking"},
+		{"240.0.0.1", false, "reserved"},
+		{"255.255.255.255", false, "broadcast"},
+		{"224.0.0.1", false, "multicast"},
+		{"239.1.1.1", false, "multicast"},
+		{"::1", false, "loopback"},
+		{"::", false, "unspecified"},
+		{"fd00::1", false, "unique local"},
+		{"fc00::1", false, "unique local"},
+		{"fe80::1", false, "link-local"},
+		{"ff02::1", false, "multicast"},
+		{"ff05::2", false, "multicast"},
+		{"64:ff9b::a00:5", false, "NAT64"},
+		{"fd00:ec2::254", false, "metadata (unique local)"},
+
+		// IPv4-mapped: judged by the IPv4 address it carries.
+		{"::ffff:127.0.0.1", false, "mapped loopback"},
+		{"::ffff:10.0.0.5", false, "mapped private"},
+		{"::ffff:169.254.169.254", false, "mapped metadata"},
+		{"::ffff:100.64.1.1", false, "mapped CGNAT"},
+		{"::ffff:192.0.2.1", false, "mapped documentation range"},
+
+		// Addendum: IPv6 that embeds IPv4.
+		{"2002:7f00:1::1", false, "6to4 embedding 127.0.0.1"},
+		{"2002:a9fe:a9fe::1", false, "6to4 embedding 169.254.169.254"},
+		{"2002:a00:5::1", false, "6to4 embedding 10.0.0.5"},
+		{"2002:808:808::1", false, "6to4, even embedding a public IPv4"},
+		{"2001:0:4136:e378:8000:63bf:3fff:fdd2", false, "Teredo"},
+		{"2001::1", false, "Teredo"},
+		{"::ffff:0:7f00:1", false, "IPv4-translated 127.0.0.1"},
+		{"::ffff:0:808:808", false, "IPv4-translated, even of a public IPv4"},
+
+		// Addendum: documentation ranges.
+		{"192.0.2.1", false, "TEST-NET-1"},
+		{"198.51.100.1", false, "TEST-NET-2"},
+		{"203.0.113.10", false, "TEST-NET-3"},
+		{"2001:db8::1", false, "IPv6 documentation"},
+		{"2001:db8:ffff::1", false, "IPv6 documentation"},
 	}
-	blocked := []string{
-		"127.0.0.1", "127.255.0.1", "10.0.0.5", "172.16.0.1", "192.168.1.1",
-		"169.254.169.254", "169.254.0.1", "100.64.1.1", "100.127.255.254",
-		"0.0.0.0", "0.1.2.3", "192.0.0.8", "198.18.0.1", "198.19.255.255",
-		"240.0.0.1", "255.255.255.255", "224.0.0.1", "239.1.1.1",
-		"::1", "::", "fd00::1", "fc00::1", "fe80::1", "ff02::1", "ff05::2",
-		"::ffff:127.0.0.1", "::ffff:10.0.0.5", "::ffff:169.254.169.254", "::ffff:100.64.1.1",
-		"64:ff9b::a00:5", "fd00:ec2::254",
-	}
-	for _, s := range blocked {
-		if IsPublic(netip.MustParseAddr(s)) {
-			t.Errorf("%s must not be public", s)
+	for _, c := range cases {
+		if got := IsPublic(netip.MustParseAddr(c.addr)); got != c.public {
+			t.Errorf("IsPublic(%s) = %v, want %v (%s)", c.addr, got, c.public, c.why)
 		}
 	}
 	if IsPublic(netip.Addr{}) {
 		t.Error("the zero Addr must not be public")
+	}
+	if IsPublic(netip.MustParseAddr("fe80::1%eth0")) {
+		t.Error("a zoned address must not be public")
+	}
+}
+
+// The message for a refused host is fixed: it never names the address the
+// host resolved to, and a name that does not resolve at all gives the same
+// answer, so notify_url cannot map internal DNS names to addresses.
+func TestBlockedErrorNeverCarriesAddress(t *testing.T) {
+	const want = "host does not resolve to a public address"
+	cases := map[string]struct {
+		res  mapResolver
+		hide []string
+	}{
+		"private":          {mapResolver{testHost: addrs(t, "10.20.30.40")}, []string{"10.20.30.40"}},
+		"public+private":   {mapResolver{testHost: addrs(t, publicIP, "172.16.5.6")}, []string{"172.16.5.6", publicIP}},
+		"mapped private":   {mapResolver{testHost: addrs(t, "::ffff:10.0.0.5")}, []string{"10.0.0.5"}},
+		"6to4 of loopback": {mapResolver{testHost: addrs(t, "2002:7f00:1::1")}, []string{"2002:7f00:1::1", "127.0.0.1"}},
+		"no such host":     {mapResolver{}, nil},
+		"no addresses":     {mapResolver{testHost: {}}, nil},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			h := newHarness(t, func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) })
+			h.sender.Resolver = c.res
+			res := h.sender.Send(context.Background(), testURL, FormatJSON, samplePayload())
+			if res.Delivered || res.Err != want {
+				t.Fatalf("Err = %q, want %q", res.Err, want)
+			}
+			for _, ip := range c.hide {
+				if strings.Contains(res.Err, ip) {
+					t.Fatalf("Err %q carries the resolved address %s", res.Err, ip)
+				}
+			}
+			if res.Attempts != 1 || h.dials.Load() != 0 || len(h.sleeps) != 0 {
+				t.Fatalf("a refused host must not be dialled or retried: attempts=%d dials=%d sleeps=%v", res.Attempts, h.dials.Load(), h.sleeps)
+			}
+			// The resolver check itself returns the bare error.
+			if _, err := h.sender.vet(context.Background(), testHost); !errors.Is(err, ErrBlockedAddress) || err.Error() != want {
+				t.Fatalf("vet error %v, want exactly %q", err, want)
+			}
+		})
+	}
+
+	// The connect-time check refuses inside net.Dialer, whose *net.OpError
+	// names the address. Send reports the fixed text only.
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) }, publicIP)
+	h.sender.DialContext = func(_ context.Context, network, _ string) (net.Conn, error) {
+		return nil, &net.OpError{Op: "dial", Net: network, Addr: &net.TCPAddr{IP: net.ParseIP("10.9.8.7"), Port: 443}, Err: ErrBlockedAddress}
+	}
+	res := h.sender.Send(context.Background(), testURL, FormatJSON, samplePayload())
+	if res.Err != want || res.Attempts != 1 {
+		t.Fatalf("connect-time refusal: Err = %q attempts=%d, want %q after 1 attempt", res.Err, res.Attempts, want)
+	}
+}
+
+// Error text can come from the receiver (a TLS certificate name, for
+// example). Control characters are removed so it cannot forge log records
+// or break the JSON log.
+func TestErrorTextHasNoControlCharacters(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) }, publicIP)
+	h.sender.DialContext = func(context.Context, string, string) (net.Conn, error) {
+		return nil, errors.New("certificate is valid for evil.example\n{\"level\":\"INFO\",\"msg\":\"forged\"}\r\x1b[2J\x00\x7f\u0085\u009fend")
+	}
+	res := h.sender.Send(context.Background(), testURL, FormatJSON, samplePayload())
+	if res.Delivered || res.Err == "" {
+		t.Fatalf("result %+v", res)
+	}
+	for _, r := range res.Err {
+		if r < 0x20 || (r >= 0x7f && r <= 0x9f) {
+			t.Fatalf("Err keeps control character %U: %q", r, res.Err)
+		}
+	}
+	if !strings.Contains(res.Err, "evil.example") || !strings.Contains(res.Err, "[2Jend") {
+		t.Fatalf("Err lost its printable text: %q", res.Err)
+	}
+}
+
+// "At most 2048 characters" counts Unicode characters, not bytes.
+func TestValidateCountsCharactersNotBytes(t *testing.T) {
+	prefix := "https://" + testHost + "/"
+	exact := prefix + strings.Repeat("é", MaxURLLength-utf8.RuneCountInString(prefix))
+	if n := utf8.RuneCountInString(exact); n != MaxURLLength || len(exact) <= MaxURLLength {
+		t.Fatalf("fixture: %d characters, %d bytes", n, len(exact))
+	}
+	if _, err := Validate(exact); err != nil {
+		t.Fatalf("a URL of exactly %d characters (%d bytes) must be accepted: %v", MaxURLLength, len(exact), err)
+	}
+	_, err := Validate(exact + "é")
+	if err == nil || err.Error() != "notify_url is longer than 2048 characters" {
+		t.Fatalf("a URL of %d characters must be rejected as too long, got %v", MaxURLLength+1, err)
 	}
 }
 
@@ -185,8 +337,8 @@ func TestBlockedAddressesAreNeverDialed(t *testing.T) {
 		"mapped loopback":   {"::ffff:127.0.0.1"},
 		"cgnat":             {"100.64.1.1"},
 		"ula":               {"fd00::1"},
-		"mixed public+priv": {"203.0.113.10", "10.0.0.5"},
-		"mixed priv first":  {"192.168.0.1", "203.0.113.10"},
+		"mixed public+priv": {publicIP, "10.0.0.5"},
+		"mixed priv first":  {"192.168.0.1", publicIP},
 	}
 	for name, ips := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -201,7 +353,7 @@ func TestBlockedAddressesAreNeverDialed(t *testing.T) {
 			if n := h.dials.Load(); n != 0 {
 				t.Fatalf("dialer called %d time(s), want 0", n)
 			}
-			if !strings.Contains(res.Err, "non-public") {
+			if res.Err != "host does not resolve to a public address" {
 				t.Fatalf("error %q does not say why", res.Err)
 			}
 			if res.Attempts != 1 || len(h.sleeps) != 0 {
@@ -225,12 +377,12 @@ func TestDefaultResolverRejectsLoopback(t *testing.T) {
 }
 
 func TestDialsOnlyTheVettedAddressOnPort443(t *testing.T) {
-	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(204) }, "203.0.113.10")
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(204) }, publicIP)
 	res := h.sender.Send(context.Background(), testURL, FormatJSON, samplePayload())
 	if !res.Delivered {
 		t.Fatalf("not delivered: %+v", res)
 	}
-	if len(h.dialed) != 1 || h.dialed[0] != "203.0.113.10:443" {
+	if len(h.dialed) != 1 || h.dialed[0] != publicIP+":443" {
 		t.Fatalf("dialed %v, want the vetted IP on 443", h.dialed)
 	}
 }
@@ -252,7 +404,7 @@ func TestJSONDeliverySignedAndExact(t *testing.T) {
 		got.method = r.Method
 		got.path = r.URL.RequestURI()
 		w.WriteHeader(200)
-	}, "203.0.113.10")
+	}, publicIP)
 	res := h.sender.Send(context.Background(), testURL, FormatJSON, samplePayload())
 	if !res.Delivered || res.Attempts != 1 || res.StatusCode != 200 || res.Err != "" {
 		t.Fatalf("result %+v", res)
@@ -296,7 +448,7 @@ func TestNullTopHypothesis(t *testing.T) {
 func TestRedirectIsNotFollowed(t *testing.T) {
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "https://"+testHost+"/elsewhere", http.StatusFound)
-	}, "203.0.113.10")
+	}, publicIP)
 	res := h.sender.Send(context.Background(), testURL, FormatJSON, samplePayload())
 	if res.Delivered || res.StatusCode != 302 || res.Attempts != 1 {
 		t.Fatalf("result %+v", res)
@@ -315,7 +467,7 @@ func TestRetriesOn503ThenSucceeds(t *testing.T) {
 			return
 		}
 		w.WriteHeader(200)
-	}, "203.0.113.10")
+	}, publicIP)
 	res := h.sender.Send(context.Background(), testURL, FormatJSON, samplePayload())
 	if !res.Delivered || res.Attempts != 3 || res.StatusCode != 200 || res.Err != "" {
 		t.Fatalf("result %+v", res)
@@ -333,12 +485,12 @@ func TestRetriesOn429AndNetworkError(t *testing.T) {
 			return
 		}
 		w.WriteHeader(200)
-	}, "203.0.113.10")
+	}, publicIP)
 	if res := h.sender.Send(context.Background(), testURL, FormatJSON, samplePayload()); !res.Delivered || res.Attempts != 2 {
 		t.Fatalf("429: %+v", res)
 	}
 
-	h2 := newHarness(t, func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) }, "203.0.113.10")
+	h2 := newHarness(t, func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) }, publicIP)
 	h2.failDial.Store(1)
 	if res := h2.sender.Send(context.Background(), testURL, FormatJSON, samplePayload()); !res.Delivered || res.Attempts != 2 {
 		t.Fatalf("network error: %+v", res)
@@ -346,7 +498,7 @@ func TestRetriesOn429AndNetworkError(t *testing.T) {
 }
 
 func TestGivesUpAfterThreeAttempts(t *testing.T) {
-	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(502) }, "203.0.113.10")
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(502) }, publicIP)
 	res := h.sender.Send(context.Background(), testURL, FormatJSON, samplePayload())
 	if res.Delivered || res.Attempts != 3 || res.StatusCode != 502 || h.requests.Load() != 3 {
 		t.Fatalf("result %+v requests=%d", res, h.requests.Load())
@@ -357,7 +509,7 @@ func TestGivesUpAfterThreeAttempts(t *testing.T) {
 }
 
 func TestClientErrorIsNotRetried(t *testing.T) {
-	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(400) }, "203.0.113.10")
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(400) }, publicIP)
 	res := h.sender.Send(context.Background(), testURL, FormatJSON, samplePayload())
 	if res.Delivered || res.Attempts != 1 || res.StatusCode != 400 || h.requests.Load() != 1 || len(h.sleeps) != 0 {
 		t.Fatalf("result %+v requests=%d sleeps=%v", res, h.requests.Load(), h.sleeps)
@@ -376,7 +528,7 @@ func assertNoURLSecrets(t *testing.T, s string) {
 func TestErrorsNeverContainPathOrQuery(t *testing.T) {
 	// Network errors on every attempt: net/http wraps them in *url.Error,
 	// whose message contains the full URL.
-	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) }, "203.0.113.10")
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) }, publicIP)
 	h.failDial.Store(10)
 	res := h.sender.Send(context.Background(), testURL, FormatJSON, samplePayload())
 	if res.Delivered || res.Attempts != 3 || res.Err == "" {
@@ -408,7 +560,7 @@ func TestPerAttemptTimeout(t *testing.T) {
 		case <-release:
 		case <-r.Context().Done():
 		}
-	}, "203.0.113.10")
+	}, publicIP)
 	defer close(release)
 	h.sender.Timeout = 150 * time.Millisecond
 	start := time.Now()
@@ -432,7 +584,7 @@ func TestSlackDelivery(t *testing.T) {
 		body, _ = io.ReadAll(r.Body)
 		sig = r.Header.Get("X-RegressionMap-Signature")
 		w.WriteHeader(200)
-	}, "203.0.113.10")
+	}, publicIP)
 	res := h.sender.Send(context.Background(), testURL, FormatSlack, samplePayload())
 	if !res.Delivered {
 		t.Fatalf("result %+v", res)
@@ -477,12 +629,318 @@ func TestSlackTextEdgeCases(t *testing.T) {
 }
 
 func TestUnknownFormatRejected(t *testing.T) {
-	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) }, "203.0.113.10")
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) }, publicIP)
 	res := h.sender.Send(context.Background(), testURL, "xml", samplePayload())
 	if res.Delivered || res.Attempts != 0 || h.requests.Load() != 0 {
 		t.Fatalf("result %+v", res)
 	}
 	if !ValidFormat("json") || !ValidFormat("slack") || ValidFormat("xml") || ValidFormat("") {
 		t.Fatal("ValidFormat")
+	}
+}
+
+func TestStripControl(t *testing.T) {
+	var in strings.Builder
+	for r := rune(0); r <= 0xa0; r++ {
+		in.WriteRune(r)
+	}
+	in.WriteString("é…✓")
+	got := StripControl(in.String())
+	var want strings.Builder
+	for r := rune(0x20); r < 0x7f; r++ {
+		want.WriteRune(r)
+	}
+	want.WriteString(" é…✓")
+	if got != want.String() {
+		t.Fatalf("StripControl\n got %q\nwant %q", got, want.String())
+	}
+}
+
+// publicOnlyControl is the connect-time check of the production dialer.
+func TestPublicOnlyControl(t *testing.T) {
+	cases := []struct {
+		addr string
+		ok   bool
+	}{
+		{"8.8.8.8:443", true},
+		{"[2606:4700:4700::1111]:443", true},
+		{"[::ffff:8.8.8.8]:443", true},
+		{"127.0.0.1:443", false},
+		{"10.0.0.5:443", false},
+		{"169.254.169.254:443", false},
+		{"[::1]:443", false},
+		{"[::ffff:10.0.0.5]:443", false},
+		{"[2002:7f00:1::1]:443", false},
+		{"[2001:0:4136:e378:8000:63bf:3fff:fdd2]:443", false},
+		{"192.0.2.1:443", false},
+		{"[fe80::1%eth0]:443", false},
+		{"not-an-address", false},
+		{"example.com:443", false},
+	}
+	for _, c := range cases {
+		err := publicOnlyControl("tcp", c.addr, nil)
+		if c.ok && err != nil {
+			t.Errorf("publicOnlyControl(%s) = %v, want nil", c.addr, err)
+		}
+		if !c.ok && !errors.Is(err, ErrBlockedAddress) {
+			t.Errorf("publicOnlyControl(%s) = %v, want ErrBlockedAddress", c.addr, err)
+		}
+	}
+}
+
+// Without the DialContext seam, the production dialer re-checks the address
+// at connect time: a loopback address that somehow got past the resolver
+// check is still never connected to.
+func TestProductionDialerRechecksAtConnect(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	var accepted atomic.Int32
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			accepted.Add(1)
+			c.Close()
+		}
+	}()
+	_, port, _ := net.SplitHostPort(ln.Addr().String())
+	var s Sender // production configuration: no seams
+	conn, err := s.dialVetted(context.Background(), "tcp", addrs(t, "127.0.0.1"), port)
+	if err == nil {
+		conn.Close()
+		t.Fatal("the production dialer connected to a loopback address")
+	}
+	if !errors.Is(err, ErrBlockedAddress) {
+		t.Fatalf("dial error %v, want ErrBlockedAddress", err)
+	}
+	time.Sleep(100 * time.Millisecond)
+	if n := accepted.Load(); n != 0 {
+		t.Fatalf("listener accepted %d connection(s)", n)
+	}
+}
+
+// The production client never uses a proxy (one would bypass the vetted
+// dial, for example through HTTPS_PROXY) and never follows a redirect.
+func TestProductionClientHasNoProxyAndNoRedirects(t *testing.T) {
+	t.Setenv("HTTPS_PROXY", "http://127.0.0.1:9")
+	t.Setenv("HTTP_PROXY", "http://127.0.0.1:9")
+	var s Sender
+	c := s.client()
+	tr, ok := c.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("transport %T", c.Transport)
+	}
+	if tr.Proxy != nil {
+		t.Fatal("the transport must not use a proxy")
+	}
+	if tr.DialContext == nil {
+		t.Fatal("the transport must dial through the vetted dialer")
+	}
+	if c.CheckRedirect == nil || c.CheckRedirect(nil, nil) != http.ErrUseLastResponse {
+		t.Fatal("redirects must not be followed")
+	}
+}
+
+// Without the Sleep seam the backoff really waits, and gives up as soon as
+// the delivery's context ends.
+func TestDefaultSleepWaitsAndHonoursContext(t *testing.T) {
+	var s Sender
+	const d = 80 * time.Millisecond
+	start := time.Now()
+	if err := s.sleep(context.Background(), d); err != nil {
+		t.Fatalf("sleep: %v", err)
+	}
+	if el := time.Since(start); el < d {
+		t.Fatalf("sleep returned after %v, want at least %v", el, d)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	start = time.Now()
+	if err := s.sleep(ctx, time.Minute); !errors.Is(err, context.Canceled) {
+		t.Fatalf("sleep on an ended context = %v, want context.Canceled", err)
+	}
+	if el := time.Since(start); el > 5*time.Second {
+		t.Fatalf("sleep on an ended context took %v", el)
+	}
+}
+
+// ---- addresses in connection errors (v3 addendum) --------------------------
+
+const publicIPv6 = "2606:4700:4700::1111"
+
+// serverAddr stands in for the server's own address, which the local side
+// of a connection error names.
+var serverAddr = &net.TCPAddr{IP: net.ParseIP("10.1.2.3"), Port: 51515}
+
+// connAddrs are the address texts no delivery error may contain.
+var connAddrs = []string{publicIP, "2606:4700", "10.1.2.3", "51515"}
+
+func assertNoAddress(t *testing.T, where, s string, hide ...string) {
+	t.Helper()
+	for _, a := range append(append([]string{}, connAddrs...), hide...) {
+		if strings.Contains(s, a) {
+			t.Fatalf("%s carries the address %s: %q", where, a, s)
+		}
+	}
+}
+
+// last_error never contains a resolved address. A dial to a vetted address
+// that is refused, and a connection the receiver resets during the TLS
+// handshake, report their cause without the vetted address and without the
+// server's own address.
+func TestConnectionErrorsNeverCarryAddresses(t *testing.T) {
+	t.Run("refused", func(t *testing.T) {
+		h := newHarness(t, func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) }, publicIP, publicIPv6)
+		h.sender.DialContext = func(_ context.Context, network, addr string) (net.Conn, error) {
+			ta, err := net.ResolveTCPAddr("tcp", addr)
+			if err != nil {
+				return nil, err
+			}
+			return nil, &net.OpError{Op: "dial", Net: network, Source: serverAddr, Addr: ta, Err: os.NewSyscallError("connect", syscall.ECONNREFUSED)}
+		}
+		res := h.sender.Send(context.Background(), testURL, FormatJSON, samplePayload())
+		if res.Delivered || res.Attempts != 3 || !strings.Contains(res.Err, "dial tcp") || !strings.Contains(res.Err, "connect: ") {
+			t.Fatalf("result %+v, want 3 attempts and the cause of the refusal", res)
+		}
+		assertNoAddress(t, "Result.Err", res.Err)
+	})
+
+	t.Run("reset", func(t *testing.T) {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { ln.Close() })
+		go func() {
+			for {
+				c, err := ln.Accept()
+				if err != nil {
+					return
+				}
+				buf := make([]byte, 512)
+				c.Read(buf) // the ClientHello
+				c.(*net.TCPConn).SetLinger(0)
+				c.Close() // RST
+			}
+		}()
+		h := newHarness(t, func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) }, publicIP)
+		h.sender.DialContext = func(ctx context.Context, _, _ string) (net.Conn, error) {
+			var d net.Dialer
+			return d.DialContext(ctx, "tcp", ln.Addr().String())
+		}
+		res := h.sender.Send(context.Background(), testURL, FormatJSON, samplePayload())
+		if res.Delivered || res.Attempts != 3 || res.Err == "" {
+			t.Fatalf("result %+v, want 3 failed attempts", res)
+		}
+		// Both ends of this connection are 127.0.0.1; in production they are
+		// the server's own address and the vetted address.
+		assertNoAddress(t, "Result.Err", res.Err, "127.0.0.1")
+	})
+}
+
+// The production dialer names the vetted address in its *net.OpError; the
+// error dialVetted returns does not, and keeps the cause.
+func TestProductionDialErrorCarriesNoAddress(t *testing.T) {
+	var s Sender // production configuration: no seams
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	conn, err := s.dialVetted(ctx, "tcp", addrs(t, publicIP, publicIPv6), "443")
+	if err == nil {
+		conn.Close()
+		t.Fatal("dial on an ended context succeeded")
+	}
+	assertNoAddress(t, "dial error", err.Error())
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("dial error %v lost its cause", err)
+	}
+}
+
+// opErrConn fails every operation with the *net.OpError a real connection
+// returns, which names both ends of the connection.
+type opErrConn struct{}
+
+func (opErrConn) fail(op string) error {
+	return &net.OpError{Op: op, Net: "tcp", Source: serverAddr,
+		Addr: &net.TCPAddr{IP: net.ParseIP(publicIP), Port: 443}, Err: os.ErrDeadlineExceeded}
+}
+func (c opErrConn) Read([]byte) (int, error)         { return 0, c.fail("read") }
+func (c opErrConn) Write([]byte) (int, error)        { return 0, c.fail("write") }
+func (c opErrConn) Close() error                     { return c.fail("close") }
+func (opErrConn) LocalAddr() net.Addr                { return serverAddr }
+func (opErrConn) RemoteAddr() net.Addr               { return &net.TCPAddr{IP: net.ParseIP(publicIP), Port: 443} }
+func (c opErrConn) SetDeadline(time.Time) error      { return c.fail("set") }
+func (c opErrConn) SetReadDeadline(time.Time) error  { return c.fail("set") }
+func (c opErrConn) SetWriteDeadline(time.Time) error { return c.fail("set") }
+
+// Every error of a connection dialVetted returns is free of addresses, and
+// keeps its operation, its cause and its timeout flag.
+func TestConnectionOperationErrorsCarryNoAddress(t *testing.T) {
+	s := &Sender{DialContext: func(context.Context, string, string) (net.Conn, error) { return opErrConn{}, nil }}
+	conn, err := s.dialVetted(context.Background(), "tcp", addrs(t, publicIP), "443")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, rerr := conn.Read(make([]byte, 1))
+	_, werr := conn.Write([]byte("x"))
+	ops := map[string]error{
+		"read": rerr, "write": werr, "close": conn.Close(),
+		"set": conn.SetDeadline(time.Now()), "set read": conn.SetReadDeadline(time.Now()), "set write": conn.SetWriteDeadline(time.Now()),
+	}
+	for name, err := range ops {
+		if err == nil {
+			t.Fatalf("%s: no error", name)
+		}
+		assertNoAddress(t, name+" error", err.Error())
+		var ne net.Error
+		if !errors.Is(err, os.ErrDeadlineExceeded) || !errors.As(err, &ne) || !ne.Timeout() {
+			t.Fatalf("%s error %v lost its cause or its timeout flag", name, err)
+		}
+		if op := strings.SplitN(name, " ", 2)[0]; !strings.HasPrefix(err.Error(), op+" tcp: ") {
+			t.Fatalf("%s error %q, want it to start with %q", name, err, op+" tcp: ")
+		}
+	}
+}
+
+// clean is the last guard: an IP address, or an address with its port, that
+// reached the error text some other way is removed. Text that only looks
+// like an address is kept.
+func TestCleanDropsAddresses(t *testing.T) {
+	u, _ := url.Parse(testURL)
+	cases := map[string]string{
+		"read tcp 10.1.2.3:51515->93.184.216.34:443: connection reset":              "connection reset",
+		"dial tcp [2606:4700:4700::1111]:443: connect: connection refused":          "connection refused",
+		"dial tcp 2606:4700:4700::1111: connect: no route to host":                  "no route to host",
+		"x509: certificate is valid for 10.0.0.7, ::ffff:10.0.0.8, not example.com": "certificate is valid for",
+		"x509: certificate is valid for abcd::ef, not example.com":                  "not example.com",
+	}
+	for msg, keep := range cases {
+		got := clean(errors.New(msg), u)
+		assertNoAddress(t, "clean", got, "10.0.0.7", "10.0.0.8", "abcd::ef")
+		if !strings.Contains(got, keep) {
+			t.Fatalf("clean(%q) = %q, lost %q", msg, got, keep)
+		}
+	}
+	const plain = "receiver returned HTTP 503; x509: deadbeef; at 12:34:56; v1.2.3; ::"
+	if got := clean(errors.New(plain), u); got != plain {
+		t.Fatalf("clean(%q) = %q, want it unchanged", plain, got)
+	}
+}
+
+// The URL parts are removed both before and after the control characters,
+// so neither a decoded path that holds one nor a control character inserted
+// into a URL part lets the part through.
+func TestCleanRemovesURLAroundControlCharacters(t *testing.T) {
+	u, _ := url.Parse("https://" + testHost + "/services/T0/B0/PATH%0ASECRET")
+	if got := clean(errors.New("receiver said: /services/T0/B0/PATH\nSECRET was refused"), u); strings.Contains(got, "SECRET") || strings.Contains(got, "/services/") || !strings.Contains(got, "was refused") {
+		t.Fatalf("decoded path with a control character: %q", got)
+	}
+	u, _ = url.Parse(testURL)
+	if got := clean(errors.New("refused: /services/T000/B000/PATH\x00SECRET"), u); strings.Contains(got, "PATHSECRET") || strings.Contains(got, "/services/") {
+		t.Fatalf("path split by a control character: %q", got)
 	}
 }
