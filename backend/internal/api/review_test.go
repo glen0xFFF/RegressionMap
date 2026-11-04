@@ -221,6 +221,15 @@ func rawAnalysis(t *testing.T, url, id string) map[string]json.RawMessage {
 	return out
 }
 
+// field returns the raw JSON of m's key k, or "(no such key)" when m lacks
+// it, so a failure tells a missing key apart from a null one.
+func field(m map[string]json.RawMessage, k string) string {
+	if v, ok := m[k]; ok {
+		return string(v)
+	}
+	return "(no such key)"
+}
+
 // rawRows returns the rows of GET /api/analyses as raw JSON fields.
 func rawRows(t *testing.T, url string) []map[string]json.RawMessage {
 	t.Helper()
@@ -335,8 +344,9 @@ func TestHypothesesShowWhileReviewRuns(t *testing.T) {
 	got := rawAnalysis(t, srv.URL, a.ID)
 	var mr struct{ Status string }
 	json.Unmarshal(got["model"], &mr)
-	if string(got["status"]) != `"running"` || mr.Status != "ok" || string(got["review"]) != "null" {
-		t.Fatalf("while the review runs: status %s, model %s, review %s; want running, ok model and null", got["status"], got["model"], got["review"])
+	if field(got, "status") != `"running"` || mr.Status != "ok" || field(got, "review") != "null" {
+		t.Fatalf("while the review runs: status %s, model %s, review %s; want running, ok model and null",
+			field(got, "status"), field(got, "model"), field(got, "review"))
 	}
 	release()
 	done := pollDone(t, srv.URL, a.ID)
@@ -617,8 +627,8 @@ func TestListRowsCarryReviewCounts(t *testing.T) {
 	want, _ := json.Marshal(a.Review.Counts)
 	for _, row := range rawRows(t, srv.URL) {
 		if string(row["id"]) == `"`+a.ID+`"` {
-			if string(row["review_counts"]) != string(want) || string(want) != `{"confirmed":1,"disputed":0,"refuted":0,"unchecked":0}` {
-				t.Fatalf("review_counts %s, want %s", row["review_counts"], want)
+			if field(row, "review_counts") != string(want) || string(want) != `{"confirmed":1,"disputed":0,"refuted":0,"unchecked":0}` {
+				t.Fatalf("review_counts %s, want %s", field(row, "review_counts"), want)
 			}
 			return
 		}
@@ -642,12 +652,15 @@ func TestStoredAnalysisWithoutReviewLoads(t *testing.T) {
 	srv := httptest.NewServer(New(Config{Root: t.TempDir(), Model: &model.Client{}, DataDir: data}))
 	defer srv.Close()
 	got := rawAnalysis(t, srv.URL, id)
-	if string(got["status"]) != `"done"` || string(got["review"]) != "null" {
-		t.Fatalf("stored v3 analysis: status %s review %s, want done and null", got["status"], got["review"])
+	if field(got, "status") != `"done"` || field(got, "review") != "null" {
+		t.Fatalf("stored v3 analysis: status %s review %s, want done and null", field(got, "status"), field(got, "review"))
 	}
 	rows := rawRows(t, srv.URL)
-	if len(rows) != 1 || string(rows[0]["review_counts"]) != "null" {
-		t.Fatalf("rows %v, want one row with review_counts null", rows)
+	if len(rows) != 1 {
+		t.Fatalf("%d rows, want 1", len(rows))
+	}
+	if field(rows[0], "review_counts") != "null" {
+		t.Fatalf("review_counts %s, want null", field(rows[0], "review_counts"))
 	}
 }
 
