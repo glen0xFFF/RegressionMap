@@ -301,13 +301,16 @@ type reviewItem struct {
 	EvidenceIDs []string `json:"evidence_ids"`
 }
 
-// ValidateReview parses the review answer and applies the contract's rules in
-// order: per-finding checks and repeats, the text limits, at most maxPerLens
-// findings per lens (highest severity first, then the model's order), then
-// the order by severity, lens and the model's order, with the ids R1, R2, ...
-// Every kept finding is unchecked. The rejections are in the model's order.
-// An answer that is not a JSON object, has a field the schema does not have,
-// or lacks summary or findings is an error.
+// ValidateReview parses the review answer and applies the contract's rules 2,
+// 4 and 5 in that order: the per-finding checks and repeats, at most
+// maxPerLens findings per lens (highest severity first, then the model's
+// order), then the order by severity, lens and the model's order, with the
+// ids R1, R2, ... Rule 3, the text limits, comes last and cuts only the kept
+// findings. Cutting text changes no lens, severity or position, so the result
+// is the one the contract's order gives. Every kept finding is unchecked. The
+// rejections are in the model's order. An answer that is not a JSON object,
+// has a field the schema does not have, or lacks summary or findings is an
+// error.
 func ValidateReview(content string, ev []evidence.Item) (summary string, kept []Finding, rejected []string, err error) {
 	// Pointer fields tell an absent (or null) field apart from a zero value.
 	var raw struct {
