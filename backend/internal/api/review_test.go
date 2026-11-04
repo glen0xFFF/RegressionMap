@@ -457,6 +457,22 @@ func TestReviewChangeDeadlines(t *testing.T) {
 			t.Fatalf("model calls %v, want none", n)
 		}
 	})
+
+	// Without a key the review is disabled (contract rule 5), even when no
+	// time is left: the key check comes before the deadline check.
+	t.Run("no key and no time left", func(t *testing.T) {
+		m := newChainModel(t)
+		mc := m.client()
+		mc.APIKey = ""
+		s := New(Config{Root: t.TempDir(), Model: mc})
+		rv := s.reviewChange(jobCtx(t, 500*time.Millisecond), "a1", in)
+		if rv.Status != "disabled" || rv.Message != model.MsgNotConfigured || rv.CheckStatus != "skipped" || rv.CheckMessage != "no review to check" {
+			t.Fatalf("review %+v, want disabled with %q", rv, model.MsgNotConfigured)
+		}
+		if n := m.Names(); len(n) != 0 {
+			t.Fatalf("model calls %v, want none", n)
+		}
+	})
 }
 
 // drainNow drains s and fails the test if that takes more than 30 s.
