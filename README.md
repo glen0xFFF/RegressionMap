@@ -36,6 +36,49 @@ Production hardening (also verified 2026-11-04):
 
 Not implemented: other test runners than `node --test`, ESLint.
 
+## Muse change review
+
+Every analysis also reviews the change between the baseline and HEAD. This is the v4 contract: see "Muse change review (v4, 2026-11-04)" in `docs/API_CONTRACT.md`. The section below describes the behaviour that contract defines.
+
+Muse (the configured `MODEL_ID`, `muse-spark-1.3` by default, called with the same key as the hypotheses) writes findings through three lenses:
+
+- `code`: bugs, error handling, concurrency, resource leaks, broken edge cases.
+- `feature`: whether the change does what its commit messages and tests say, missing cases, behaviour changes a user would notice.
+- `security`: injection, authentication and authorisation, secrets, unsafe input handling, SSRF, path traversal, unsafe deserialisation.
+
+A second Muse call, the check, then tries to refute each finding using only the evidence. The server checks both answers without a model. Each finding carries one of four labels: `Confirmed by Muse check`, `Disputed by Muse check`, `Refuted by Muse check` or `Not checked`. Every surface that shows the review carries this line:
+
+`AI review: Muse wrote these findings and a second Muse pass checked them. Not verified by tests.`
+
+A review is not a test result. In RegressionMap only the approval-gated verification rerun, whose exit code decides PASS or FAIL, is called verified.
+
+**Findings.** Each finding has an id (`R1`, `R2`, ...), a lens, a severity (`high`, `medium` or `low`, always shown as a word), a title, a detail, a suggestion that is shown as text and never executed, a file and line range, the evidence ids it cites, and the check's verdict and reason. A finding must cite at least one `diff_hunk` or `source` item, and its range must lie within 3 lines of cited evidence for its file. The server rejects a finding that breaks a rule and lists the reason under `rejected`, in the form `finding N ("<title>"): <reason>`. Text over a limit is cut and ends with `…[truncated]`. At most 5 findings per lens are kept.
+
+**Display order.** Confirmed findings come first, then unchecked, then disputed, then refuted. Refuted findings are hidden by default: the API always includes them, the web UI shows them behind a toggle, and the CI summary and the Slack text only count them. Nothing is gated on findings: exit codes, and the `status` and `error` of an analysis, do not change because of the review.
+
+**Statuses.** `review.status` is one of:
+
+- `ok`: the review answer was read. An answer with no findings is `ok` too.
+- `disabled`: no model key is set, and no call is made. The message is `Meta model not configured: MODEL_API_KEY is not set on the backend.`
+- `error`: the review call failed or ran out of time, for example `review stopped at the analysis deadline`, `no time was left for the review` or `the analysis ended before the review finished`.
+- `invalid`: the answer did not match the schema, or it had findings and `no finding passed validation`.
+- `skipped`: `the analysis ended before the change could be reviewed`, for example after a git failure.
+
+`review.check_status` is `ok`, `error`, `invalid` or `skipped`. A check that runs out of time is `error` with `check stopped at the analysis deadline`, and every finding is then `unchecked`. No check call is made when there is nothing to check: `check_message` is then `no finding to check` or `no review to check`. A review problem never changes the analysis `status` or `error`.
+
+**Commit evidence.** The evidence adds one `commit` item per commit that HEAD has and the baseline does not have (`git log <baseline>..<HEAD>`), newest first, at most 10. Its `file` is `""`, its lines are `0`, and its title is `commit <first 7 characters of the sha>: <first line of the message>`. The excerpt is the whole message, redacted like other evidence, at most 1000 bytes per commit and 4000 bytes for all commits, inside the 40000-byte evidence budget. The `commit` items come after every other item, so the other items keep their ids. The hypothesis call receives them too, and a hypothesis may cite them. If git cannot list the messages, `warnings` gets `commit messages could not be read: the evidence holds no commit items`; if they are larger than 1 MiB, it gets `commit messages larger than 1 MiB: only the commits that fit were read`.
+
+**Where it shows.**
+
+- API: `GET /api/analyses/{id}` adds `review`, and each row of `GET /api/analyses` adds `review_counts`. Both are `null` for an analysis stored before v4. `review` is also `null` while the review chain has not ended: the analysis is then still `running`, and its hypotheses are already shown.
+- Web UI: a "Muse review" section under the hypotheses, findings anchored on their lines in the diff view, and the confirmed count in the sidebar.
+- CI scripts: a "Muse review" section after the hypotheses in the summary, on stdout and in `GITHUB_STEP_SUMMARY`, with the counts per lens and per verdict, one line per confirmed, unchecked or disputed finding, the number of refuted findings, and the disclaimer line. Review text gets the same escaping as hypothesis text. A summary of an analysis without a review is unchanged.
+- Webhooks: the `json` body adds `review` as its last field, and the `slack` text adds one sentence about the review. See "CI and notifications".
+
+**Model calls.** An analysis now makes up to three model calls, one after another and never at the same time: the hypotheses, then the review, then the check. The check runs only when the review kept at least one finding. The review chain stops 15 s before the job deadline, so an analysis takes longer than before but still ends within its timeout. The hypothesis result is saved as soon as it exists.
+
+**Steering risk.** Everything the review path sends to the model goes through the same redaction as the hypothesis path, commit messages included. Repository text, commit messages included, can steer the review: it can hide problems or invent them. The evidence rules, the check call and the labels limit this. They do not remove it. Nothing a model writes is executed, followed or rendered as markup.
+
 ## Run it
 
 One command (creates `demo-workspace/` with the fixture if missing, starts the API with `go run` and Vite):
@@ -134,11 +177,11 @@ With `WEB_DIR` set:
 
 ## CI and notifications
 
-A failing CI run can start an analysis and get the result back in two ways: the CI script waits for the result and writes a summary, or the server calls a webhook when the analysis finishes. Webhooks are the v3 contract: see "Completion notifications (v3)" and "Review fixes to v3" in `docs/API_CONTRACT.md`.
+A failing CI run can start an analysis and get the result back in two ways: the CI script waits for the result and writes a summary, or the server calls a webhook when the analysis finishes. Webhooks are the v3 contract: see "Completion notifications (v3)" and "Review fixes to v3" in `docs/API_CONTRACT.md`. The v4 section "Muse change review (v4, 2026-11-04)" adds the review to the `json` body and changes the `slack` text.
 
 **1. Get an `analyze` key.** On a server you run, create one with `server keys create --name ci --scope analyze` (it uses `DATA_DIR`; in the Docker image: `/app/regressionmap keys create --name ci --scope analyze`) or on the UI's API Keys page. The secret (`rm_live_…`) is shown once. Store it as a CI secret, for example `REGRESSIONMAP_KEY`. Do not use an `admin` key in CI. Each key may make `RATE_LIMIT_PER_HOUR` `POST /api/analyses` requests in a sliding hour. Requests the server rejects count too: `400 invalid_repo`, `400 invalid_baseline`, `409 analysis_running`, `429 too_many_analyses` and the webhook errors below. So CI runs with a wrong `REPO` or `BASELINE` use up the key's quota without starting an analysis. Over the limit the answer is `429 rate_limited` with `Retry-After`; a request refused that way does not count. For the hosted demo, the operator gives out the keys.
 
-**2. Call the script.** `scripts/ci-analyze.sh` (POSIX sh, needs `curl` and `node`) and `scripts/ci-analyze.ps1` (Windows PowerShell 5.1 or PowerShell 7) take the same inputs and give the same output and exit codes. They start `POST /api/analyses`, poll every `POLL_SECONDS` (default 3 s), and print a markdown summary: status, baseline and HEAD PASS/FAIL from the exit codes, the ranked hypotheses with `file:line`, confidence and cited evidence IDs under the label "AI-generated hypotheses — not verified", and the number of rejected hypotheses. With `GITHUB_STEP_SUMMARY` set, the summary is also appended there.
+**2. Call the script.** `scripts/ci-analyze.sh` (POSIX sh, needs `curl` and `node`) and `scripts/ci-analyze.ps1` (Windows PowerShell 5.1 or PowerShell 7) take the same inputs and give the same output and exit codes. They start `POST /api/analyses`, poll every `POLL_SECONDS` (default 3 s), and print a markdown summary: status, baseline and HEAD PASS/FAIL from the exit codes, the ranked hypotheses with `file:line`, confidence and cited evidence IDs under the label "AI-generated hypotheses — not verified", and the number of rejected hypotheses. When the analysis has a review, a "Muse review" section follows (see "Muse change review"). With `GITHUB_STEP_SUMMARY` set, the summary is also appended there.
 
 ```sh
 export REGRESSIONMAP_URL=https://regressionmap.example.com   # http:// only for 127.0.0.1, localhost or [::1]
@@ -177,8 +220,12 @@ An empty string counts as not given. A valid `notify_format` without `notify_url
 
 When the analysis reaches `done` or `error`, the server sends one `POST` (`User-Agent: RegressionMap-Webhook/1`, 5 s timeout per attempt, up to 3 attempts after 1 s and 4 s, at most 2 minutes in all, retried only on network errors, 5xx and 429). A notification that cannot finish before the server stops is reported as `failed` and never retried (see "Shutdown").
 
-- `json` bodies carry `event`, `id`, `repo`, `status`, `error`, `baseline`, `current`, `baseline_passed`, `current_passed`, `model_status`, `top_hypothesis` (or `null`), `created_at` and `finished_at`. `baseline_passed` and `current_passed` are `false` when that run did not happen, and `model_status` is `""` when the model step did not run, so read `status` and `error` first. The bodies are signed: `X-RegressionMap-Event: analysis.completed` and `X-RegressionMap-Signature: sha256=<hex HMAC-SHA256 of the exact body with WEBHOOK_SECRET>`.
-- `slack` bodies are `{"text": "…"}`: one paragraph with the repo, the status, PASS, FAIL or `not run` for the baseline and HEAD, and the top hypothesis title with its `file:line` and confidence. It has no evidence and no source code and ends with "AI-generated hypothesis, not verified." Slack bodies are not signed; the token in the Slack URL protects them.
+- `json` bodies carry `event`, `id`, `repo`, `status`, `error`, `baseline`, `current`, `baseline_passed`, `current_passed`, `model_status`, `top_hypothesis` (or `null`), `created_at`, `finished_at` and `review`. `review` is the last field and is `null` when the analysis has no review. Otherwise it holds the review `status`, the `confirmed`, `disputed`, `refuted` and `unchecked` counts, and `top_finding`: the first confirmed finding in display order, else the first unchecked one, else `null`. It carries no detail, suggestion, reason, evidence or summary. `baseline_passed` and `current_passed` are `false` when that run did not happen, and `model_status` is `""` when the model step did not run, so read `status` and `error` first. The bodies are signed: `X-RegressionMap-Event: analysis.completed` and `X-RegressionMap-Signature: sha256=<hex HMAC-SHA256 of the exact body with WEBHOOK_SECRET>`.
+- `slack` bodies are `{"text": "…"}`: one paragraph with the repo, the status, PASS, FAIL or `not run` for the baseline and HEAD, the top hypothesis title with its `file:line` and confidence, and one sentence about the review. It has no evidence and no source code. Slack bodies are not signed; the token in the Slack URL protects them. v4 changed this text:
+  - The hypothesis title, each finding title and each location sit inside an inline code span, with backticks removed from the string, so Slack makes no links from them. `&`, `<` and `>` are still escaped. An empty title becomes the plain word `untitled`. A location is the file, plus `:<line_start>` when `line_start` is above 0.
+  - The review sentence is `Muse review: <counts>.`, with the counts above 0 in display order, followed by ``Top: [<lens>, <severity>] `<title>` (`<location>`).`` for `top_finding`. The `Top:` part is left out when `top_finding` is `null`, and the location in brackets when the finding has no file. It is `Muse review: no findings.` when the review is `ok` with no findings, and `Muse review: not available (<status>).` when `review.status` is not `ok`. There is no review sentence when the analysis has no review.
+  - The text ends with `AI-generated hypothesis and review, not verified.` instead of `AI-generated hypothesis, not verified.`
+  - Example: ``RegressionMap analysis of pagination-demo finished with status done. Baseline PASS, HEAD FAIL. Top hypothesis: `end index off by one` (`src/pagination.ts:7`, confidence high). Muse review: 1 confirmed, 1 disputed. Top: [code, high] `Last page drops one item` (`src/pagination.ts:7`). AI-generated hypothesis and review, not verified.``
 
 `GET /api/analyses/{id}` shows the delivery under `notification`: host, format, status (`pending`, `delivered` or `failed`), attempts, last status code and `last_error`. While the server is still sending, the status is `pending`, also when the analysis has left the in-memory list. `last_error` never holds the URL path or query, a resolved address, or control characters, and is at most 500 characters.
 
@@ -235,7 +282,7 @@ The analysis continues after a cut. Each cut of the first three kinds adds one s
 - `diff larger than 8 MiB: only the first 8 MiB were analysed`
 - `N file(s) larger than 1 MiB were read only in part`, where N counts distinct files
 
-Warnings never name a file. The model's input starts with a note that the server cut the input, and the system prompt asks the model to say so in `limitations`. The `source` item of a changed file read in part covers its complete lines and ends with the `…[truncated]` mark; if not one complete line fits, it has lines `0`–`0` and the excerpt `(source larger than 1 MiB, not read)`. `(source not readable)` still means the read failed. The UI does not show `warnings` yet: read them with `GET /api/analyses/{id}`.
+The `commit` evidence items can add two more warnings: see "Commit evidence" under "Muse change review". Warnings never name a file. The model's input starts with a note that the server cut the input, and the system prompt asks the model to say so in `limitations`. The `source` item of a changed file read in part covers its complete lines and ends with the `…[truncated]` mark; if not one complete line fits, it has lines `0`–`0` and the excerpt `(source larger than 1 MiB, not read)`. `(source not readable)` still means the read failed. The UI does not show `warnings` yet: read them with `GET /api/analyses/{id}`.
 
 A git failure during an analysis names its step: the error starts with `baseline worktree failed: `, `HEAD worktree failed: `, `changed-file list failed: ` or `diff failed: `, followed by git's own message. `baseline_run` and `current_run` are saved as soon as each run finishes, so a later git failure keeps them. Every git call waits at most 2 s after git exits for its output. If a hook leaves a background process that holds the output open, the call fails (`exec: WaitDelay expired before I/O complete`) instead of hanging. `GET /api/repos/{name}/commits` still answers `500 git_failed` when the `git log` output passes 1 MiB.
 
@@ -251,4 +298,6 @@ A git failure during an analysis names its step: the error starts with `baseline
 
 Hypotheses are not proof of cause. The confidence label is a qualitative estimate from the model, not a calibrated probability. Evidence parsing targets node:test output; other runners produce a failure summary without parsed frames.
 
-Path redaction can merge two files: changed files whose paths differ only in a part that looks like a secret show the same `[REDACTED]` path in the evidence. A URL in a model-written title can still show as a link in Slack.
+Path redaction can merge two files: changed files whose paths differ only in a part that looks like a secret show the same `[REDACTED]` path in the evidence.
+
+Muse review findings are not proof either. A confirmed finding means that a second Muse pass found the cited evidence to support it, not that a test showed the problem. Repository text can steer the review (see "Muse change review").

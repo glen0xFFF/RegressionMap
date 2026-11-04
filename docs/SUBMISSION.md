@@ -21,17 +21,18 @@ RegressionMap takes a local Git repository, a known-good baseline commit, and an
 2. Collects evidence and gives each item a stable ID (E1, E2, …): failing assertions with actual and expected values, stack frames with the real source lines, diff hunks, and the current source of changed files.
 3. Sends this bounded, redacted evidence bundle to a Meta model and asks for ranked root-cause hypotheses as strict JSON. Each hypothesis must cite evidence IDs and may list counter-evidence.
 4. Validates the model output. A result with a missing `summary`, `hypotheses` or `limitations` field is invalid. A hypothesis is rejected, and shown as rejected with its reason, when it cites no evidence ID, cites an unknown ID, uses an unsafe path or names a file outside the evidence, gives an invalid line range or one more than 3 lines away from the evidence for that file, has an unknown confidence label or a rank below 1, or repeats an earlier rank. Only the 5 best-ranked hypotheses are kept. A title, reason or verification suggestion over its limit (200, 2000 and 500 characters) is cut and ends with `…[truncated]`.
-5. Lets the developer apply a fix and approve a verification rerun. The test runner's exit code decides PASS or FAIL. The model never does.
+5. Reviews the change between the baseline and HEAD with Muse (the **Muse review**, v4). Muse writes findings through three lenses: `code` (bugs, error handling, concurrency, resource leaks, broken edge cases), `feature` (whether the change does what its commit messages and tests say) and `security` (injection, authentication and authorisation, secrets, unsafe input handling, SSRF, path traversal). Each finding must cite evidence IDs, including at least one diff hunk or source item. The evidence now also holds one `commit` item per commit in the range, newest first, at most 10. A second Muse call then tries to refute each finding, and the server validates both answers without a model. Each finding is labelled `Confirmed by Muse check`, `Disputed by Muse check`, `Refuted by Muse check` or `Not checked`. Refuted findings are hidden by default, and nothing is gated on findings. The review shows in the API, the web UI, the CI summary, the `json` webhook and the Slack text, which now ends with `AI-generated hypothesis and review, not verified.`
+6. Lets the developer apply a fix and approve a verification rerun. The test runner's exit code decides PASS or FAIL. The model never does.
 
 ## What makes it different
-RegressionMap is not a chatbot. The tools collect the evidence deterministically, and the model only ranks and explains it. Every AI claim points to evidence the user can inspect. The UI labels the output "AI-generated hypotheses — not verified". The model's suggested verification is shown as text and is never executed.
+RegressionMap is not a chatbot. The tools collect the evidence deterministically, and the model only ranks and explains it. Every AI claim points to evidence the user can inspect. The UI labels the output "AI-generated hypotheses — not verified". The model's suggested verification is shown as text and is never executed. Every surface that shows the Muse review carries the line `AI review: Muse wrote these findings and a second Muse pass checked them. Not verified by tests.`
 
 ## Meta technology
 - **Model:** `muse-spark-1.3`
 - **Access method:** OpenAI-compatible Chat Completions, `POST https://api.meta.ai/v1/chat/completions`, with `Authorization: Bearer $MODEL_API_KEY`. Source: https://dev.meta.ai/docs/protocols/chat-completions
 - **Structured output:** `response_format` of type `json_schema` with `strict: true`. Source: https://dev.meta.ai/docs/structured-output
-- **What the model does:** ranks plausible causes, explains each hypothesis using the cited evidence, lists counter-evidence, and states its limitations.
-- **What stays deterministic:** git diff extraction, test execution, evidence collection and IDs, secret redaction, output validation, and the PASS/FAIL result of verification.
+- **What the model does:** ranks plausible causes, explains each hypothesis using the cited evidence, lists counter-evidence, and states its limitations. In the Muse review it writes findings about the change and, in a second call, tries to refute each one. An analysis makes up to three model calls (hypotheses, review, check), one after another, with the same key.
+- **What stays deterministic:** git diff extraction, commit messages, test execution, evidence collection and IDs, secret redaction, output validation of the hypotheses, the review and the check, and the PASS/FAIL result of verification.
 - **Live result observed on 2026-11-04 with the demo fixture:**
   - The baseline test passed and HEAD failed with exit code 1.
   - RegressionMap collected 9 evidence items.
@@ -48,7 +49,8 @@ RegressionMap is not a chatbot. The tools collect the evidence deterministically
 - The API key is kept on the backend only. It is never returned to the browser and it is scrubbed from error messages.
 - Test runs, verification runs and git never receive the model key, the webhook secret, or any variable whose name ends in `_KEY`, `_SECRET`, `_TOKEN` or `_PASSWORD`. An operator can let named variables through to test and verification runs with `TEST_ENV_ALLOW`, never to git and never the server's own secrets. The startup log lists the names, never the values, of the variables that test runs do not get.
 - Completion webhooks are off unless the operator sets `WEBHOOK_SECRET` (at least 32 characters, counted as Unicode characters, not bytes). `json` deliveries are signed with HMAC-SHA256. The server sends them only over `https://` to hosts whose every address is public, checks the address again at connect time, follows no redirects, and never logs, returns or stores the full notify URL.
-- Likely secrets in the evidence are redacted before the model request.
+- Likely secrets in the evidence are redacted before the model request. The review path uses the same redaction, commit messages included.
+- Model-written review text (titles, details, suggestions, reasons, the summary) is always shown as text: never as HTML, a Markdown link or image, a Slack link or a GitHub workflow command.
 
 ## New work completed during the hackathon
 The work was built from an empty repository on 2026-11-04, inside the Oct 26 – Nov 4, 2026 window.
@@ -70,6 +72,9 @@ The work was built from an empty repository on 2026-11-04, inside the Oct 26 –
 - The confidence label is a qualitative estimate, not a calibrated probability.
 - Evidence parsing is built for `node --test` output. Other runners would produce a failure summary without parsed stack frames.
 - Only `node --test` is on the command allowlist in this version.
+- Muse review findings are not proof. A finding confirmed by the Muse check is supported by the cited evidence in a second Muse pass, not shown by a test.
+- Repository text, commit messages included, can steer the review: it can hide problems or invent them. The evidence rules, the check call and the labels limit this. They do not remove it.
+- The review makes an analysis take longer, because its model calls run one after another. The hypotheses are saved and shown as soon as they exist.
 - Without `DATA_DIR`, analyses are kept only in memory and are lost when the server restarts. With `DATA_DIR` (as in the hosted demo, see `deploy/Dockerfile`), they are saved to disk and survive restarts.
 
 ## Live demo
@@ -86,6 +91,17 @@ Live since 2026-11-04. It runs on the author's server as a hardened Docker conta
   - the model returned `ok` with 0 rejected hypotheses;
   - rank 1, high confidence: "Off-by-one in paginate slice end index in src/pagination.ts" (lines 7–13), citing E1–E4, E6 and E9;
   - the unrelated `format.ts` change and the test edit were ranked low.
+
+v3 live checks, measured on 2026-11-04 after the v3 deploy:
+
+- The server checkout `/opt/regressionmap` runs `c6f005d` (`c6f005d2e6470ae609622c1463f5596ae4373982`). The container `regressionmap` runs the image `regressionmap:local`, also tagged `regressionmap:c6f005d`, was deployed at 2026-11-04T11:23:11Z, and reports healthy.
+- `GET https://regressionmap.glenox.net/api/health` returns `{"auth_required":true,"model_configured":true,"model_id":"muse-spark-1.3","ok":true}`.
+- `GET https://regressionmap.glenox.net/api/repos` without a key returns 401.
+- Plain HTTP (`http://regressionmap.glenox.net`) answers `HTTP/1.1 301 Moved Permanently` to HTTPS.
+- The container's stop timeout (`docker inspect`, `.Config.StopTimeout`) is 40 s, so the server's shutdown drain has time to finish.
+- Webhooks are disabled: `WEBHOOK_SECRET` is not set, and the startup log line shows `"webhooks_enabled":false`, together with `"rate_limit_per_hour":20` and `"test_env_withheld":"MODEL_API_KEY"`.
+
+**TODO:** the Muse review (v4) is described above from the frozen v4 contract. Record its live check after the v4 deploy.
 
 Visitors need an API key, because every `/api` call except the health check requires `Authorization: Bearer`. **TODO:** create a judges' key with the `analyze` scope (`docker compose -f deploy/docker-compose.yml exec regressionmap /app/regressionmap keys create --name judges --scope analyze` on the server) and give it to the judges through the submission form, never in this file.
 
