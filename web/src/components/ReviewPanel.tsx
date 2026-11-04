@@ -42,7 +42,8 @@ function Body({
   onSelectEvidence: (id: string) => void;
 }) {
   if (rv.status !== "ok") {
-    const s = NOT_OK[rv.status] ?? NOT_OK.error;
+    // An unknown status, even an inherited key such as "toString", reads as failed.
+    const s = Object.prototype.hasOwnProperty.call(NOT_OK, rv.status) ? NOT_OK[rv.status] : NOT_OK.error;
     return (
       <>
         <div className={s.cls}>{`${s.lead}: ${rv.message}`}</div>

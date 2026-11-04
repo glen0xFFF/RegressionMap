@@ -82,6 +82,16 @@ describe("ReviewPanel", () => {
     expect(screen.queryByRole("button", { name: /refuted/ })).not.toBeInTheDocument();
   });
 
+  it("ReviewPanel shows an unknown status as failed", () => {
+    for (const status of ["toString", "constructor", "later"]) {
+      render(panel(review({ status: status as Review["status"], message: "msg" })));
+      expect(screen.getByText("Muse review failed: msg")).toHaveClass("card", "card-error");
+      expect(screen.queryByText(/^undefined/)).not.toBeInTheDocument();
+      expect(screen.getByText(REVIEW_DISCLAIMER)).toBeInTheDocument();
+      cleanup();
+    }
+  });
+
   it("ReviewPanel shows running and older analyses", () => {
     const { rerender } = render(panel(null, { running: true }));
     expect(screen.getByRole("heading", { name: "Muse review" })).toBeInTheDocument();
