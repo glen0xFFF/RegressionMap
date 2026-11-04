@@ -27,6 +27,12 @@ services:
     environment:
       - ALLOWED_HOSTS=regressionmap.glenox.net
       - RATE_LIMIT_PER_HOUR=20
+      # This hosted demo runs without sign-in: /api requests without a key run
+      # as the public demo identity (analyze scope, one shared limit of
+      # RATE_LIMIT_PER_HOUR analyses per hour). To turn it off, remove this
+      # line and run `docker compose -f deploy/docker-compose.yml up -d`.
+      # See "Public demo mode" in deploy/README.md.
+      - PUBLIC_DEMO=1
 
     networks:
       - coolify

@@ -132,11 +132,13 @@ curl https://regressionmap.glenox.net/api/health
 Expected:
 
 - `curl -sI` prints `HTTP/2 200` (the UI), with the security headers (`content-security-policy`, ...). Cloudflare adds its own headers.
-- `/api/health` returns `{"ok":true,...,"auth_required":true}`. `auth_required` is true because requests through Traefik are not local.
-- Without a key, the API is closed:
+- `/api/health` returns `{"ok":true,...,"auth_required":false}`, because `docker-compose.yml` sets `PUBLIC_DEMO=1` (see "Public demo mode" in step 7). Without `PUBLIC_DEMO=1`, `auth_required` is true, because requests through Traefik are not local.
+- Without a key, the API answers as the public demo identity. A bad key is still refused, and key management stays closed:
 
 ```sh
-curl -s -o /dev/null -w '%{http_code}\n' https://regressionmap.glenox.net/api/repos    # expect: 401
+curl -s -o /dev/null -w '%{http_code}\n' https://regressionmap.glenox.net/api/repos    # expect: 200 (401 without PUBLIC_DEMO=1)
+curl -s -o /dev/null -w '%{http_code}\n' -H 'Authorization: Bearer rm_live_invalid' https://regressionmap.glenox.net/api/repos   # expect: 401
+curl -s -o /dev/null -w '%{http_code}\n' https://regressionmap.glenox.net/api/keys     # expect: 403 (401 without PUBLIC_DEMO=1)
 ```
 
 - With a key (read it from a file or a prompt, not from the command line):
@@ -178,6 +180,31 @@ The file is replaced whole. If webhooks are on, add the `WEBHOOK_SECRET` line ag
 ```sh
 docker compose -f deploy/docker-compose.yml logs regressionmap | grep -o '"webhooks_enabled":[a-z]*' | tail -n 1   # expect: "webhooks_enabled":true
 ```
+
+### Public demo mode (`PUBLIC_DEMO`)
+
+`docker-compose.yml` sets `PUBLIC_DEMO=1`, so the hosted demo needs no sign-in. A request to `/api/*` without an `Authorization` header runs as the public demo identity, which has the `analyze` scope: it can list repositories, commits and commands, start and read analyses, and run verifications. `GET /api/health` reports `"auth_required":false`, `GET /api/me` answers `{"mode":"public"}`, and the UI shows no sign-in card, no API Keys page and no Sign out. A request that sends a key is checked as before, so a bad or revoked key still gets `401`. `/api/keys*` answers the public identity with `403 forbidden_scope`: key management still needs an admin key, or `docker exec` as above.
+
+**Cost.** Anyone who can reach `https://regressionmap.glenox.net` can start analyses, and each analysis makes up to three model calls with the server's `MODEL_API_KEY`. Only these limits bound that cost:
+
+- one rate-limit bucket that every request without a key shares: `RATE_LIMIT_PER_HOUR` (20) `POST /api/analyses` per sliding hour, then `429 rate_limited` with `Retry-After`. Requests the server rejects count too. Each key keeps its own bucket, so key holders are not blocked when the public bucket is used up;
+- the job limits: one analysis or verification per repository at a time, and at most two analyses running at once.
+
+Verifications run the allowlisted test command in the container. They make no model call and are not rate limited.
+
+**Check.** The startup log line carries `"public_demo":true`, after a `WARNING: PUBLIC_DEMO=1` line:
+
+```sh
+docker compose -f deploy/docker-compose.yml logs regressionmap | grep -o '"public_demo":[a-z]*' | tail -n 1   # expect: "public_demo":true
+```
+
+**Turn it off.** Remove the `- PUBLIC_DEMO=1` line from `deploy/docker-compose.yml`, then:
+
+```sh
+docker compose -f deploy/docker-compose.yml up -d
+```
+
+Compose recreates the container because its environment changed. The log then shows `"public_demo":false`, `/api/health` reports `"auth_required":true`, and `/api/repos` without a key gets `401` again. Any value other than `1` also leaves the mode off. Commit the removal to the repository as well, so that the next update (step 8) does not bring the line back.
 
 ## 8. Update
 
@@ -248,7 +275,7 @@ docker run --rm -v regressionmap-data:/data:ro -v "$PWD":/backup debian:bookworm
 
 **Network.** No port is published on the host (`ports:` is absent). The only way in is Cloudflare → `coolify-proxy` (TLS, Let's Encrypt certificate, so "Full (strict)" works) → the `coolify` network → container port 8080. A host firewall change is not needed, and a misconfigured firewall cannot expose the API directly. Other containers on the `coolify` network can reach `regressionmap:8080`. They are not local callers (their peer address is not loopback), so they need a key like everyone else.
 
-**Authentication.** Requests through Traefik carry `X-Forwarded-For` and a non-loopback peer, so they are never "local": every `/api/*` call except `GET /api/health` needs `Authorization: Bearer rm_live_...`. Keys are stored as SHA-256 hashes and compared in constant time. `ALLOWED_HOSTS=regressionmap.glenox.net` is the only extra name accepted in Host/Origin, which keeps DNS-rebinding and cross-site protection on. Only processes inside the container (the healthcheck, `docker exec`) are local, and whoever can run `docker exec` already controls the host.
+**Authentication.** Requests through Traefik carry `X-Forwarded-For` and a non-loopback peer, so they are never "local": every `/api/*` call except `GET /api/health` needs `Authorization: Bearer rm_live_...`. With `PUBLIC_DEMO=1`, which this deployment sets, a call without that header runs as the public demo identity (`analyze` scope) instead; see "Public demo mode" in step 7. Keys are stored as SHA-256 hashes and compared in constant time. `ALLOWED_HOSTS=regressionmap.glenox.net` is the only extra name accepted in Host/Origin, which keeps DNS-rebinding and cross-site protection on. Only processes inside the container (the healthcheck, `docker exec`) are local, and whoever can run `docker exec` already controls the host.
 
 **Container hardening.**
 
@@ -261,7 +288,7 @@ docker run --rm -v regressionmap-data:/data:ro -v "$PWD":/backup debian:bookworm
 - Child environment. Test runs, verification runs and git never receive `MODEL_API_KEY`, `MODEL_API_KEY_FILE`, `WEBHOOK_SECRET`, or any variable whose name ends in `_KEY`, `_SECRET`, `_TOKEN` or `_PASSWORD`, in any letter case. `TEST_ENV_ALLOW` can let named variables through to test and verification runs, never to git and never the three server secrets. This deployment does not set it: the demo tests need no credentials. The startup log line carries `test_env_withheld`, the names (never the values) of the variables test runs do not get. This is defence in depth, not a boundary: see "Demo-only workspace".
 - git configuration is not weakened. There is no `safe.directory '*'`. The workspace repositories are owned by uid 10001, the same user that runs git. The entrypoint warns if a repository has a different owner.
 
-**Demo-only workspace.** The API runs `node --test` (the only allowlisted command) on repositories in `/workspace`. Test code is arbitrary code: it runs as the same user as the server and could read what that user can read, including `/data` and the server's own process environment. Therefore `/workspace` holds only the generated `pagination-demo` fixture. Do not mount real repositories, host directories or the Docker socket into this container. The API has no endpoint to upload or change code. An analyze key can only start analyses and verifications of repositories that already exist there. The container has outbound internet access, because the model call goes to `https://api.meta.ai`.
+**Demo-only workspace.** The API runs `node --test` (the only allowlisted command) on repositories in `/workspace`. Test code is arbitrary code: it runs as the same user as the server and could read what that user can read, including `/data` and the server's own process environment. Therefore `/workspace` holds only the generated `pagination-demo` fixture. Do not mount real repositories, host directories or the Docker socket into this container. The API has no endpoint to upload or change code. An analyze key, and the public demo identity, can only start analyses and verifications of repositories that already exist there. The container has outbound internet access, because the model call goes to `https://api.meta.ai`.
 
 ## What was not verified
 
@@ -271,4 +298,5 @@ These files were written and checked statically (`sh -n` on the entrypoint, labe
 - That the v2 server (`ALLOWED_HOSTS`, `RATE_LIMIT_PER_HOUR`, `keys` subcommand, admin-key check at startup) is in the commit you build. The names follow `docs/API_CONTRACT.md`.
 - How the `letsencrypt` resolver of coolify-proxy issues certificates behind Cloudflare (see step 6).
 - That a `WEBHOOK_SECRET` line in `deploy/.env` reaches the server through `env_file`: the startup log should show `"webhooks_enabled":true` (step 7).
+- That `PUBLIC_DEMO=1` in the environment list reaches the server: the startup log should show `"public_demo":true`, and a request to `/api/repos` without a key should get `200` (steps 6 and 7).
 - That `stop_grace_period: 40s` lets the drain finish: after `docker compose -f deploy/docker-compose.yml stop`, the log should show `drained`, or the warning `drain incomplete` with its `error` and `timeout` fields (see "Stop" in step 10), before the container exits.

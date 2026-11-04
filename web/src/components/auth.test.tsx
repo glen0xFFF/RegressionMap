@@ -1,10 +1,10 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { Sidebar } from "./Sidebar";
+import { Sidebar, canManageKeys } from "./Sidebar";
 import { SignIn } from "./SignIn";
 import { KeysPage } from "./KeysPage";
 import { VerifyPanel } from "./VerifyPanel";
-import { clearStoredKey } from "../api";
+import { clearStoredKey, setStoredKey } from "../api";
 import type { ApiKey, Me } from "../types";
 
 afterEach(() => {
@@ -55,6 +55,18 @@ describe("Sidebar API Keys nav visibility", () => {
     expect(item.querySelector("svg")).not.toBeNull();
     fireEvent.click(item);
     expect(onView).toHaveBeenCalledWith("keys");
+  });
+
+  it("offers the public demo identity no key management, no key identity and no sign-out", () => {
+    const publicMe: Me = { mode: "public" };
+    expect(canManageKeys(publicMe)).toBe(false);
+    // Even with a sign-out handler passed, the footer offers none for the public identity.
+    const onSignOut = vi.fn();
+    render(<Sidebar {...sidebarProps} me={publicMe} onSignOut={onSignOut} />);
+    expect(navLabels()).toEqual(["Analyze", "History"]);
+    expect(screen.queryByRole("button", { name: /sign out/i })).not.toBeInTheDocument();
+    expect(document.querySelector(".whoami")).toBeNull();
+    expect(screen.getByText(/backend ok/)).toBeInTheDocument();
   });
 
   it("shows the signed-in key name and prefix and a Sign out action in the footer", () => {
@@ -251,6 +263,8 @@ describe("VerifyPanel busy and rate-limit errors", () => {
   });
 
   it("shows rate_limited with Retry-After", async () => {
+    // Local requests are never rate limited, so this caller holds a key.
+    setStoredKey(SECRET);
     vi.stubGlobal(
       "fetch",
       vi.fn(async () => json({ error: { code: "rate_limited", message: "slow down" } }, 429, { "Retry-After": "9" })),

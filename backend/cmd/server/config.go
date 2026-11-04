@@ -39,6 +39,10 @@ type config struct {
 	AllowedHosts     []string // ALLOWED_HOSTS, extra Host/Origin names (lower-cased)
 	RateLimitPerHour int      // RATE_LIMIT_PER_HOUR, per-key POST /api/analyses limit, default 20
 
+	// PublicDemo is PUBLIC_DEMO=1: a non-local /api request without an
+	// Authorization header runs as the public demo identity (analyze scope).
+	PublicDemo bool
+
 	// WebhookSecret is WEBHOOK_SECRET: the HMAC key of completion
 	// notifications. "" disables them. It must never be logged.
 	WebhookSecret string
@@ -187,6 +191,7 @@ func loadConfig(getenv func(string) string) (config, []string, error) {
 		Root:         getenv("WORKSPACE_ROOT"),
 		Addr:         or(getenv("ADDR"), defaultAddr),
 		AllowRemote:  getenv("REGRESSIONMAP_ALLOW_REMOTE") == "1",
+		PublicDemo:   getenv("PUBLIC_DEMO") == "1",
 		DataDir:      getenv("DATA_DIR"),
 		WebDir:       getenv("WEB_DIR"),
 		LogFormat:    or(getenv("LOG_FORMAT"), "text"),
@@ -221,6 +226,9 @@ func loadConfig(getenv func(string) string) (config, []string, error) {
 	}
 	if cfg.RateLimitPerHour, err = parseRateLimit(getenv("RATE_LIMIT_PER_HOUR")); err != nil {
 		return config{}, nil, err
+	}
+	if cfg.PublicDemo {
+		warns = append(warns, fmt.Sprintf("WARNING: PUBLIC_DEMO=1 - non-local /api requests without a key run as the public demo identity with the analyze scope. Anyone can start analyses (one shared limit of %d per hour, RATE_LIMIT_PER_HOUR) and verifications; analyses call the model with the server's key. API key management still needs an admin key.", cfg.RateLimitPerHour))
 	}
 
 	if cfg.WebDir != "" {
@@ -366,6 +374,7 @@ func logStartup(lg *slog.Logger, cfg config, warns []string) {
 		"data_dir", cfg.DataDir,
 		"allowed_hosts", strings.Join(cfg.AllowedHosts, ","),
 		"rate_limit_per_hour", cfg.RateLimitPerHour,
+		"public_demo", cfg.PublicDemo,
 		"webhooks_enabled", cfg.WebhookSecret != "",
 		"test_env_withheld", strings.Join(proc.WithheldNames(cfg.TestEnvAllow), ","),
 		"test_env_allow", strings.Join(cfg.TestEnvAllow, ","),

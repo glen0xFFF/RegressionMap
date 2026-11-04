@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import App from "./App";
 import { KEY_STORAGE, clearStoredKey, getStoredKey, setStoredKey } from "./api";
 
@@ -122,6 +122,97 @@ function localBackend(analysisResponse?: () => Response) {
   return fn;
 }
 
+/**
+ * A hosted demo with PUBLIC_DEMO=1: a request without a key runs as the public demo identity,
+ * and any key is refused. refuseAfterMs holds each refusal back, so that /api/me can go out
+ * with the stored key before the first 401 for it arrives. analysisResponse answers
+ * POST /api/analyses (default: 409 analysis_running).
+ */
+function publicBackend(refuseAfterMs = 0, analysisResponse?: () => Response) {
+  const fn = vi.fn(async (url: string, init?: RequestInit) => {
+    const auth = (init?.headers as Record<string, string> | undefined)?.Authorization;
+    if (url === "/api/health") return json({ ok: true, model_configured: true, model_id: "m", auth_required: false });
+    if (auth !== undefined) {
+      if (refuseAfterMs > 0) await new Promise((r) => setTimeout(r, refuseAfterMs));
+      return json({ error: { code: "unauthorized", message: "missing or invalid API key" } }, 401, { "WWW-Authenticate": "Bearer" });
+    }
+    if (url === "/api/me") return json({ mode: "public" });
+    if (url.startsWith("/api/keys"))
+      return json({ error: { code: "forbidden_scope", message: "the public demo cannot manage API keys; use an admin key" } }, 403);
+    if (url === "/api/analyses" && init?.method === "POST")
+      return analysisResponse?.() ?? json({ error: { code: "analysis_running", message: "analysis already running" } }, 409);
+    return common(url, init) ?? json({ error: { code: "not_found", message: "nope" } }, 404);
+  });
+  vi.stubGlobal("fetch", fn);
+  return fn;
+}
+
+describe("App public demo", () => {
+  it("shows no sign-in card, no API Keys item, no key identity and no sign-out, and the analyze view is usable", async () => {
+    const fn = publicBackend();
+    render(<App />);
+    const start = await screen.findByTestId("analyze-btn");
+    await waitFor(() => expect(start).toBeEnabled());
+    await waitFor(() => expect(fn.mock.calls.some(([url]) => url === "/api/me")).toBe(true));
+    // Let the {"mode":"public"} answer render.
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 0));
+    });
+
+    expect(screen.getByTestId("analyze-btn")).toBeEnabled();
+    expect(screen.queryByTestId("signin")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("API key")).not.toBeInTheDocument();
+    expect(within(screen.getByRole("navigation")).queryByRole("button", { name: "API Keys" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /sign out/i })).not.toBeInTheDocument();
+    expect(document.querySelector(".whoami")).toBeNull();
+    expect(screen.getByText(/backend ok/)).toBeInTheDocument();
+
+    // Starting an analysis reaches the API without a key.
+    fireEvent.click(screen.getByTestId("analyze-btn"));
+    expect(await screen.findByRole("alert")).toHaveTextContent(/already running/);
+    expect(fn.mock.calls.some(([url, init]) => url === "/api/analyses" && init?.method === "POST")).toBe(true);
+    expect(fn.mock.calls.every(([, init]) => (init?.headers as Record<string, string> | undefined)?.Authorization === undefined)).toBe(true);
+    expect(fn.mock.calls.some(([url]) => String(url).startsWith("/api/keys"))).toBe(false);
+  });
+
+  it.each([
+    ["before /api/me goes out with it", 0],
+    ["after /api/me went out with it", 50],
+  ])("drops a stored key refused %s and carries on as the public demo without a sign-in card", async (_when, refuseAfterMs) => {
+    const STALE = "rm_live_REVOKEDREVOKEDREVOKEDREVOKEDRE";
+    const authOf = (init?: RequestInit) => (init?.headers as Record<string, string> | undefined)?.Authorization;
+    setStoredKey(STALE);
+    const fn = publicBackend(refuseAfterMs);
+    render(<App />);
+
+    const start = await screen.findByTestId("analyze-btn");
+    await waitFor(() => expect(start).toBeEnabled());
+    // Let every held-back refusal arrive and render.
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, refuseAfterMs + 50));
+    });
+
+    // The stored key was sent and checked, and the 401 for it dropped it.
+    expect(fn.mock.calls.some(([, init]) => authOf(init) === `Bearer ${STALE}`)).toBe(true);
+    expect(getStoredKey()).toBeNull();
+    expect(window.sessionStorage.getItem(KEY_STORAGE)).toBeNull();
+    // The last load of each resource went out without a key.
+    for (const path of ["/api/me", "/api/repos", "/api/commands"]) {
+      const calls = fn.mock.calls.filter(([url]) => url === path);
+      const last = calls[calls.length - 1];
+      expect(last, path).toBeDefined();
+      expect(authOf(last?.[1]), path).toBeUndefined();
+    }
+    expect(screen.getByTestId("analyze-btn")).toBeEnabled();
+    expect(screen.queryByTestId("signin")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("API key")).not.toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(within(screen.getByRole("navigation")).queryByRole("button", { name: "API Keys" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /sign out/i })).not.toBeInTheDocument();
+    expect(document.querySelector(".whoami")).toBeNull();
+  });
+});
+
 describe("App API Keys view", () => {
   it("is reachable in local mode; the secret is gone after navigating away and back", async () => {
     localBackend();
@@ -154,9 +245,20 @@ describe("App analysis start errors", () => {
     return screen.findByRole("alert");
   }
 
-  it("shows 429 rate_limited with Retry-After", async () => {
+  it("shows 429 rate_limited with Retry-After for a key", async () => {
+    // Local requests are never rate limited, so this caller holds a key.
+    setStoredKey(GOOD);
     localBackend(() => json({ error: { code: "rate_limited", message: "rate limit exceeded" } }, 429, { "Retry-After": "42" }));
     expect(await startAndGetAlert()).toHaveTextContent("Rate limit reached for this API key. Retry after 42 s.");
+  });
+
+  it("shows 429 rate_limited for the public demo without mentioning an API key", async () => {
+    publicBackend(0, () =>
+      json({ error: { code: "rate_limited", message: "analysis rate limit of the public demo reached; retry later" } }, 429, { "Retry-After": "42" }),
+    );
+    const alert = await startAndGetAlert();
+    expect(alert).toHaveTextContent("The public demo has reached its shared analysis rate limit. Retry after 42 s.");
+    expect(alert).not.toHaveTextContent(/API key/);
   });
 
   it("shows 409 analysis_running clearly", async () => {
