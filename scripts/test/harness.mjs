@@ -361,11 +361,11 @@ export const reviewSection = (body) => ['', '', '### Muse review', '', ...body, 
 export const REVIEW_SECTION = reviewSection([
   'Lenses: security 1, code 2, feature 1. Verdicts: 1 confirmed, 1 unchecked, 1 disputed, 1 refuted.',
   '',
-  '- R1 [security · high · confirmed] **Token compared with ==** — `src/auth.ts:12` — evidence: E3',
+  '- R1 [security · high · Confirmed by Muse check] **Token compared with ==** — `src/auth.ts:12` — evidence: E3',
   '  Timing leak in the token check.',
   '  Muse check: E3 shows a plain == comparison.',
-  '- R3 [code · low · unchecked] **Empty page not handled** — evidence: E2',
-  '- R4 [feature · low · disputed] **Possible overflow** — `src/pagination.ts:7-13` — evidence: E2',
+  '- R3 [code · low · Not checked] **Empty page not handled** — evidence: E2',
+  '- R4 [feature · low · Disputed by Muse check] **Possible overflow** — `src/pagination.ts:7-13` — evidence: E2',
   '  Muse check: Unlikely with page sizes under 1000.',
   '',
   'Refuted by Muse check (not shown): 1',
@@ -561,7 +561,7 @@ export const HOSTILE_REVIEW_SUMMARY =
   reviewSection([
     'Lenses: security 1, code 0, feature 0. Verdicts: 1 confirmed, 0 unchecked, 0 disputed, 0 refuted.',
     '',
-    '- R1 [security · high · confirmed] **' + HOSTILE_REVIEW_MD + '** — `src/' + HOSTILE_REVIEW_CODE + '.ts:12` — evidence: E3',
+    '- R1 [security · high · Confirmed by Muse check] **' + HOSTILE_REVIEW_MD + '** — `src/' + HOSTILE_REVIEW_CODE + '.ts:12` — evidence: E3',
     '  ' + HOSTILE_REVIEW_MD,
     '  Muse check: ' + HOSTILE_REVIEW_MD,
     '',
@@ -571,9 +571,10 @@ export const HOSTILE_REVIEW_SUMMARY =
 
 // Review text over every cap of the review section that the output shows.
 // A cut value keeps max - 1 characters and ends with an ellipsis. The listed
-// finding keeps the verdict "confirmed", so that it is listed; the verdict
-// cap therefore cannot show. The check_status of a failed check is printed
-// only when it is exactly "error" or "invalid", so it has no cap to show.
+// finding keeps the verdict "confirmed", so that it is listed; its line shows
+// the contract label, never the verdict text, so the verdict has no cap to
+// show. The check_status of a failed check is printed only when it is exactly
+// "error" or "invalid", so it has no cap to show.
 const CUT = '…';
 
 export function cappedReviewAnalysis() {
@@ -604,7 +605,7 @@ export const CAPPED_REVIEW_SUMMARY =
     '',
     // id 12; lens, severity 12 each; title 200; file 200; evidence ids 12 each
     '- R' + '1'.repeat(10) + CUT +
-      ' [' + 'l'.repeat(11) + CUT + ' · ' + 's'.repeat(11) + CUT + ' · confirmed]' +
+      ' [' + 'l'.repeat(11) + CUT + ' · ' + 's'.repeat(11) + CUT + ' · Confirmed by Muse check]' +
       ' **' + 't'.repeat(199) + CUT + '**' +
       ' — `' + 'f'.repeat(199) + CUT + ':12`' +
       ' — evidence: E' + '7'.repeat(10) + CUT + ', E' + '8'.repeat(10) + CUT,
@@ -653,7 +654,7 @@ export const CAPPED_CHECK_SUMMARY =
     'Lenses: security 1, code 0, feature 0. Verdicts: 0 confirmed, 1 unchecked, 0 disputed, 0 refuted.',
     'Muse check not available: error — ' + 'c'.repeat(299) + CUT,
     '',
-    '- R1 [security · high · unchecked] **Token compared with ==** — `src/auth.ts:12` — evidence: E3',
+    '- R1 [security · high · Not checked] **Token compared with ==** — `src/auth.ts:12` — evidence: E3',
     '  Timing leak in the token check.',
     '',
     'Refuted by Muse check (not shown): 0',
