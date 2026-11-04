@@ -12,9 +12,12 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 	"unicode/utf8"
@@ -763,5 +766,181 @@ func TestDefaultSleepWaitsAndHonoursContext(t *testing.T) {
 	}
 	if el := time.Since(start); el > 5*time.Second {
 		t.Fatalf("sleep on an ended context took %v", el)
+	}
+}
+
+// ---- addresses in connection errors (v3 addendum) --------------------------
+
+const publicIPv6 = "2606:4700:4700::1111"
+
+// serverAddr stands in for the server's own address, which the local side
+// of a connection error names.
+var serverAddr = &net.TCPAddr{IP: net.ParseIP("10.1.2.3"), Port: 51515}
+
+// connAddrs are the address texts no delivery error may contain.
+var connAddrs = []string{publicIP, "2606:4700", "10.1.2.3", "51515"}
+
+func assertNoAddress(t *testing.T, where, s string, hide ...string) {
+	t.Helper()
+	for _, a := range append(append([]string{}, connAddrs...), hide...) {
+		if strings.Contains(s, a) {
+			t.Fatalf("%s carries the address %s: %q", where, a, s)
+		}
+	}
+}
+
+// last_error never contains a resolved address. A dial to a vetted address
+// that is refused, and a connection the receiver resets during the TLS
+// handshake, report their cause without the vetted address and without the
+// server's own address.
+func TestConnectionErrorsNeverCarryAddresses(t *testing.T) {
+	t.Run("refused", func(t *testing.T) {
+		h := newHarness(t, func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) }, publicIP, publicIPv6)
+		h.sender.DialContext = func(_ context.Context, network, addr string) (net.Conn, error) {
+			ta, err := net.ResolveTCPAddr("tcp", addr)
+			if err != nil {
+				return nil, err
+			}
+			return nil, &net.OpError{Op: "dial", Net: network, Source: serverAddr, Addr: ta, Err: os.NewSyscallError("connect", syscall.ECONNREFUSED)}
+		}
+		res := h.sender.Send(context.Background(), testURL, FormatJSON, samplePayload())
+		if res.Delivered || res.Attempts != 3 || !strings.Contains(res.Err, "dial tcp") || !strings.Contains(res.Err, "connect: ") {
+			t.Fatalf("result %+v, want 3 attempts and the cause of the refusal", res)
+		}
+		assertNoAddress(t, "Result.Err", res.Err)
+	})
+
+	t.Run("reset", func(t *testing.T) {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { ln.Close() })
+		go func() {
+			for {
+				c, err := ln.Accept()
+				if err != nil {
+					return
+				}
+				buf := make([]byte, 512)
+				c.Read(buf) // the ClientHello
+				c.(*net.TCPConn).SetLinger(0)
+				c.Close() // RST
+			}
+		}()
+		h := newHarness(t, func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) }, publicIP)
+		h.sender.DialContext = func(ctx context.Context, _, _ string) (net.Conn, error) {
+			var d net.Dialer
+			return d.DialContext(ctx, "tcp", ln.Addr().String())
+		}
+		res := h.sender.Send(context.Background(), testURL, FormatJSON, samplePayload())
+		if res.Delivered || res.Attempts != 3 || res.Err == "" {
+			t.Fatalf("result %+v, want 3 failed attempts", res)
+		}
+		// Both ends of this connection are 127.0.0.1; in production they are
+		// the server's own address and the vetted address.
+		assertNoAddress(t, "Result.Err", res.Err, "127.0.0.1")
+	})
+}
+
+// The production dialer names the vetted address in its *net.OpError; the
+// error dialVetted returns does not, and keeps the cause.
+func TestProductionDialErrorCarriesNoAddress(t *testing.T) {
+	var s Sender // production configuration: no seams
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	conn, err := s.dialVetted(ctx, "tcp", addrs(t, publicIP, publicIPv6), "443")
+	if err == nil {
+		conn.Close()
+		t.Fatal("dial on an ended context succeeded")
+	}
+	assertNoAddress(t, "dial error", err.Error())
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("dial error %v lost its cause", err)
+	}
+}
+
+// opErrConn fails every operation with the *net.OpError a real connection
+// returns, which names both ends of the connection.
+type opErrConn struct{}
+
+func (opErrConn) fail(op string) error {
+	return &net.OpError{Op: op, Net: "tcp", Source: serverAddr,
+		Addr: &net.TCPAddr{IP: net.ParseIP(publicIP), Port: 443}, Err: os.ErrDeadlineExceeded}
+}
+func (c opErrConn) Read([]byte) (int, error)         { return 0, c.fail("read") }
+func (c opErrConn) Write([]byte) (int, error)        { return 0, c.fail("write") }
+func (c opErrConn) Close() error                     { return c.fail("close") }
+func (opErrConn) LocalAddr() net.Addr                { return serverAddr }
+func (opErrConn) RemoteAddr() net.Addr               { return &net.TCPAddr{IP: net.ParseIP(publicIP), Port: 443} }
+func (c opErrConn) SetDeadline(time.Time) error      { return c.fail("set") }
+func (c opErrConn) SetReadDeadline(time.Time) error  { return c.fail("set") }
+func (c opErrConn) SetWriteDeadline(time.Time) error { return c.fail("set") }
+
+// Every error of a connection dialVetted returns is free of addresses, and
+// keeps its operation, its cause and its timeout flag.
+func TestConnectionOperationErrorsCarryNoAddress(t *testing.T) {
+	s := &Sender{DialContext: func(context.Context, string, string) (net.Conn, error) { return opErrConn{}, nil }}
+	conn, err := s.dialVetted(context.Background(), "tcp", addrs(t, publicIP), "443")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, rerr := conn.Read(make([]byte, 1))
+	_, werr := conn.Write([]byte("x"))
+	ops := map[string]error{
+		"read": rerr, "write": werr, "close": conn.Close(),
+		"set": conn.SetDeadline(time.Now()), "set read": conn.SetReadDeadline(time.Now()), "set write": conn.SetWriteDeadline(time.Now()),
+	}
+	for name, err := range ops {
+		if err == nil {
+			t.Fatalf("%s: no error", name)
+		}
+		assertNoAddress(t, name+" error", err.Error())
+		var ne net.Error
+		if !errors.Is(err, os.ErrDeadlineExceeded) || !errors.As(err, &ne) || !ne.Timeout() {
+			t.Fatalf("%s error %v lost its cause or its timeout flag", name, err)
+		}
+		if op := strings.SplitN(name, " ", 2)[0]; !strings.HasPrefix(err.Error(), op+" tcp: ") {
+			t.Fatalf("%s error %q, want it to start with %q", name, err, op+" tcp: ")
+		}
+	}
+}
+
+// clean is the last guard: an IP address, or an address with its port, that
+// reached the error text some other way is removed. Text that only looks
+// like an address is kept.
+func TestCleanDropsAddresses(t *testing.T) {
+	u, _ := url.Parse(testURL)
+	cases := map[string]string{
+		"read tcp 10.1.2.3:51515->93.184.216.34:443: connection reset":              "connection reset",
+		"dial tcp [2606:4700:4700::1111]:443: connect: connection refused":          "connection refused",
+		"dial tcp 2606:4700:4700::1111: connect: no route to host":                  "no route to host",
+		"x509: certificate is valid for 10.0.0.7, ::ffff:10.0.0.8, not example.com": "certificate is valid for",
+		"x509: certificate is valid for abcd::ef, not example.com":                  "not example.com",
+	}
+	for msg, keep := range cases {
+		got := clean(errors.New(msg), u)
+		assertNoAddress(t, "clean", got, "10.0.0.7", "10.0.0.8", "abcd::ef")
+		if !strings.Contains(got, keep) {
+			t.Fatalf("clean(%q) = %q, lost %q", msg, got, keep)
+		}
+	}
+	const plain = "receiver returned HTTP 503; x509: deadbeef; at 12:34:56; v1.2.3; ::"
+	if got := clean(errors.New(plain), u); got != plain {
+		t.Fatalf("clean(%q) = %q, want it unchanged", plain, got)
+	}
+}
+
+// The URL parts are removed both before and after the control characters,
+// so neither a decoded path that holds one nor a control character inserted
+// into a URL part lets the part through.
+func TestCleanRemovesURLAroundControlCharacters(t *testing.T) {
+	u, _ := url.Parse("https://" + testHost + "/services/T0/B0/PATH%0ASECRET")
+	if got := clean(errors.New("receiver said: /services/T0/B0/PATH\nSECRET was refused"), u); strings.Contains(got, "SECRET") || strings.Contains(got, "/services/") || !strings.Contains(got, "was refused") {
+		t.Fatalf("decoded path with a control character: %q", got)
+	}
+	u, _ = url.Parse(testURL)
+	if got := clean(errors.New("refused: /services/T000/B000/PATH\x00SECRET"), u); strings.Contains(got, "PATHSECRET") || strings.Contains(got, "/services/") {
+		t.Fatalf("path split by a control character: %q", got)
 	}
 }

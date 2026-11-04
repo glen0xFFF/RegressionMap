@@ -925,6 +925,160 @@ func TestScrubURL(t *testing.T) {
 	if n := utf8.RuneCountInString(scrubURL(strings.Repeat("é", 600), secretNotifyURL)); n != 500 {
 		t.Fatalf("scrubURL keeps %d characters, want 500", n)
 	}
+	// The URL parts are removed before and after the control characters: a
+	// decoded path can hold one, and one inserted into a part would
+	// otherwise hide it.
+	got = scrubURL("receiver said: /services/T0/B0/PATH\nSECRET was refused", "https://hooks.example.com/services/T0/B0/PATH%0ASECRET")
+	if strings.Contains(got, "SECRET") || strings.Contains(got, "/services/") || !strings.Contains(got, "was refused") {
+		t.Fatalf("decoded path with a control character: %q", got)
+	}
+	got = scrubURL("refused: /services/T000/B000/PATH\x00SECRET", secretNotifyURL)
+	assertNoLeak(t, "scrubURL of a path split by a control character", got)
+}
+
+// last_error never contains a resolved address: with the real Sender, a
+// receiver that resets the connection during the TLS handshake gives an
+// error without either end of the connection, in GET, DATA_DIR and the log.
+func TestNotifyConnectionErrorCarriesNoAddress(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			buf := make([]byte, 512)
+			c.Read(buf) // the ClientHello
+			c.(*net.TCPConn).SetLinger(0)
+			c.Close() // RST
+		}
+	}()
+	logs := captureJSONLog(t)
+	data := t.TempDir()
+	sender := &notify.Sender{
+		Secret:   []byte(testWebhookSecret),
+		Resolver: staticResolver{"hooks.example.com": {netip.MustParseAddr("93.184.216.34")}},
+		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			var d net.Dialer
+			return d.DialContext(ctx, "tcp", ln.Addr().String())
+		},
+		Sleep: func(context.Context, time.Duration) error { return nil },
+	}
+	s, srv, _, shas := newServer(t, []string{"r1"}, func(c *Config) {
+		c.DataDir = data
+		c.Commands = []Command{slowCmd(50)}
+		c.WebhookSecret = testWebhookSecret
+		c.Notifier = sender
+	})
+	var a Analysis
+	if code := do(t, "POST", srv.URL+"/api/analyses", notifyBody("r1", shas["r1"].Baseline, "slow", secretNotifyURL, "json"), &a); code != 202 {
+		t.Fatalf("POST %d", code)
+	}
+	got := waitNotification(t, srv.URL, a.ID, "failed")
+	waitIdle(t, s)
+	if n := got.Notification; n.Attempts != 3 || n.LastError == "" {
+		t.Fatalf("notification %+v, want 3 failed attempts", n)
+	}
+	raw, err := os.ReadFile(filepath.Join(data, "analyses", a.ID+".json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Both ends of this connection are 127.0.0.1; in production they are
+	// the server's own address and the vetted address.
+	for where, text := range map[string]string{"last_error": got.Notification.LastError, "persisted file": string(raw), "log": logs.String()} {
+		for _, addr := range []string{"127.0.0.1", "93.184.216.34", ln.Addr().String()} {
+			if strings.Contains(text, addr) {
+				t.Fatalf("%s carries the address %s:\n%s", where, addr, text)
+			}
+		}
+	}
+}
+
+// panicTransport panics on every request, so the model step of an
+// analysis panics with a value the test chooses.
+type panicTransport struct{ value string }
+
+func (p panicTransport) RoundTrip(*http.Request) (*http.Response, error) { panic(p.value) }
+
+// A panicking analysis ends as error with "internal error", and its panic
+// is logged as one JSON record whose text has no control characters.
+func TestAnalysisPanicIsLoggedWithoutControlCharacters(t *testing.T) {
+	logs := captureJSONLog(t)
+	s, srv, _, shas := newServer(t, []string{"r1"}, func(c *Config) {
+		c.Commands = []Command{slowCmd(50)}
+		c.Model = &model.Client{BaseURL: "http://model.invalid", APIKey: "k", Model: "m",
+			HTTP: &http.Client{Transport: panicTransport{"boom\n{\"level\":\"INFO\",\"msg\":\"forged\"}\r\x1b[0m\u0085end"}}}
+	})
+	var a Analysis
+	if code := do(t, "POST", srv.URL+"/api/analyses", startBody("r1", shas["r1"].Baseline, "slow"), &a); code != 202 {
+		t.Fatalf("POST %d", code)
+	}
+	if got := pollDone(t, srv.URL, a.ID); got.Status != "error" || got.Error != "internal error" {
+		t.Fatalf("after a panic: status %q error %q", got.Status, got.Error)
+	}
+	waitIdle(t, s)
+	var panics []map[string]any
+	for _, r := range jsonLines(t, logs.String()) {
+		if r["msg"] == "analysis panicked" {
+			panics = append(panics, r)
+		}
+		if r["msg"] == "forged" {
+			t.Fatalf("the panic text forged a log record:\n%s", logs.String())
+		}
+	}
+	const want = `boom{"level":"INFO","msg":"forged"}[0mend`
+	if len(panics) != 1 || panics[0]["level"] != "ERROR" || panics[0]["analysis"] != a.ID || panics[0]["panic"] != want {
+		t.Fatalf("panic log records %v, want one with panic %q\n%s", panics, want, logs.String())
+	}
+}
+
+// blockTransport holds every request until release is closed and ignores
+// the request's context, like a model call that does not stop in time.
+type blockTransport struct {
+	entered chan struct{}
+	release chan struct{}
+	once    *sync.Once
+}
+
+func (b blockTransport) RoundTrip(*http.Request) (*http.Response, error) {
+	b.once.Do(func() { close(b.entered) })
+	<-b.release
+	return nil, errors.New("released")
+}
+
+// When the budget runs out, Drain's error says what it was still waiting
+// for: here an analysis run that has not stopped, and no notification.
+func TestDrainErrorNamesWhatIsLeft(t *testing.T) {
+	bt := blockTransport{entered: make(chan struct{}), release: make(chan struct{}), once: &sync.Once{}}
+	s, srv, _, shas := newServer(t, []string{"r1"}, func(c *Config) {
+		c.Commands = []Command{slowCmd(50)}
+		c.Model = &model.Client{BaseURL: "http://model.invalid", APIKey: "k", Model: "m", HTTP: &http.Client{Transport: bt}}
+	})
+	var once sync.Once
+	t.Cleanup(func() { once.Do(func() { close(bt.release) }) })
+	var a Analysis
+	if code := do(t, "POST", srv.URL+"/api/analyses", startBody("r1", shas["r1"].Baseline, "slow"), &a); code != 202 {
+		t.Fatalf("POST %d", code)
+	}
+	select {
+	case <-bt.entered:
+	case <-time.After(60 * time.Second):
+		t.Fatal("the model step never started")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	err := s.Drain(ctx)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Drain = %v, want context.DeadlineExceeded", err)
+	}
+	const want = "1 analysis run(s) still stopping, 0 notification(s) still being sent"
+	if !strings.Contains(err.Error(), want) {
+		t.Fatalf("Drain error %q, want it to contain %q", err, want)
+	}
 }
 
 type panicNotifier struct{ value any }
@@ -1101,6 +1255,9 @@ func TestDrainReturnsWhenContextEnds(t *testing.T) {
 	err := s.Drain(ctx)
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("Drain = %v, want context.DeadlineExceeded", err)
+	}
+	if want := "0 analysis run(s) still stopping, 1 notification(s) still being sent"; !strings.Contains(err.Error(), want) {
+		t.Fatalf("Drain error %q, want it to contain %q", err, want)
 	}
 	if el := time.Since(start); el < 250*time.Millisecond || el > 5*time.Second {
 		t.Fatalf("Drain returned after %v, want about 300ms", el)

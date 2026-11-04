@@ -613,20 +613,24 @@ func (s *Server) deliver(id string, pn pendingNotify, p notify.Payload, host str
 	}
 }
 
-// scrubURL removes control characters and then the notify URL, its path
-// and its query from msg, as a second guard behind the Notifier, and caps
-// its length at 500 characters.
+// scrubURL removes the notify URL, its path and its query from msg, before
+// and after removing control characters (a decoded path can hold one, and
+// one inserted into a part would otherwise hide it), as a second guard
+// behind the Notifier, and caps its length at 500 characters.
 func scrubURL(msg, raw string) string {
-	msg = notify.StripControl(msg)
 	parts := []string{raw}
 	if u, err := url.Parse(raw); err == nil {
 		parts = append(parts, u.RawQuery, u.EscapedPath(), u.Path)
 	}
-	for _, p := range parts {
-		if len(p) > 1 {
-			msg = strings.ReplaceAll(msg, p, "")
+	remove := func(msg string) string {
+		for _, p := range parts {
+			if len(p) > 1 {
+				msg = strings.ReplaceAll(msg, p, "")
+			}
 		}
+		return msg
 	}
+	msg = remove(notify.StripControl(remove(msg)))
 	if r := []rune(msg); len(r) > 500 {
 		msg = string(r[:500])
 	}
@@ -637,9 +641,11 @@ func scrubURL(msg, raw string) string {
 // has stopped taking requests. It ends every running analysis with status
 // error and msgInterrupted, which starts its notification, stops their test
 // processes, and then waits until no analysis is running and no
-// notification is being delivered. It returns ctx.Err() if ctx ends first;
-// a delivery cut off then stays "pending" in DATA_DIR, which the next
-// process reports as failed with msgDeliveryInterrupted.
+// notification is being delivered. If ctx ends first it returns an error
+// that wraps ctx.Err() and counts the analysis runs still stopping and the
+// notifications still being sent; a delivery cut off then stays "pending"
+// in DATA_DIR, which the next process reports as failed with
+// msgDeliveryInterrupted.
 func (s *Server) Drain(ctx context.Context) error {
 	for {
 		s.mu.Lock()
@@ -674,7 +680,10 @@ func (s *Server) Drain(ctx context.Context) error {
 		select {
 		case <-changed:
 		case <-ctx.Done():
-			return ctx.Err()
+			s.mu.Lock()
+			runs, deliveries := len(s.runs), len(s.delivering)
+			s.mu.Unlock()
+			return fmt.Errorf("%d analysis run(s) still stopping, %d notification(s) still being sent: %w", runs, deliveries, ctx.Err())
 		}
 	}
 }

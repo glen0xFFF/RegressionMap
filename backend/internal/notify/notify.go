@@ -2,7 +2,8 @@
 // "Completion notifications (v3)").
 //
 // A notify URL is treated as a secret: errors produced here never contain its
-// path or query. Delivery resolves the host itself, refuses the whole
+// path or query, nor an IP address (neither a resolved address nor the
+// server's own). Delivery resolves the host itself, refuses the whole
 // delivery if any resolved address is not public, and then dials one of the
 // vetted addresses, so a DNS rebind between the check and the connection
 // cannot redirect it. TLS still verifies the certificate against the
@@ -24,6 +25,7 @@ import (
 	"net/http"
 	"net/netip"
 	"net/url"
+	"regexp"
 	"strings"
 	"syscall"
 	"time"
@@ -209,7 +211,8 @@ func SlackText(p Payload) string {
 	return b.String()
 }
 
-// Result is the outcome of one delivery. Err never contains the URL path or query.
+// Result is the outcome of one delivery. Err never contains the URL path or
+// query, an IP address or a control character.
 type Result struct {
 	Delivered  bool
 	Attempts   int
@@ -305,6 +308,8 @@ func (s *Sender) vet(ctx context.Context, host string) ([]netip.Addr, error) {
 
 // dialVetted dials the vetted ips in order. Without the DialContext seam it
 // uses a net.Dialer whose Control re-checks every address at connect time.
+// Neither its errors nor those of the connection it returns name an
+// address (v3 addendum: last_error never contains a resolved address).
 func (s *Sender) dialVetted(ctx context.Context, network string, ips []netip.Addr, port string) (net.Conn, error) {
 	dial := s.DialContext
 	if dial == nil {
@@ -315,11 +320,47 @@ func (s *Sender) dialVetted(ctx context.Context, network string, ips []netip.Add
 	for _, ip := range ips {
 		conn, err := dial(ctx, network, net.JoinHostPort(ip.Unmap().String(), port))
 		if err == nil {
-			return conn, nil
+			return addrFreeConn{conn}, nil
 		}
-		errs = append(errs, err)
+		errs = append(errs, addrFree(err))
 	}
 	return nil, errors.Join(errs...)
+}
+
+// addrFree drops the addresses a *net.OpError names: the vetted address it
+// dialled or talks to, and the server's own address. The operation, the
+// network and the cause stay, so errors.Is and Timeout still work.
+func addrFree(err error) error {
+	oe, ok := err.(*net.OpError)
+	if !ok {
+		return err
+	}
+	return &net.OpError{Op: oe.Op, Net: oe.Net, Err: oe.Err}
+}
+
+// addrFreeConn is a connection whose errors never name an address. A reset
+// or a timeout during the TLS handshake or the request is reported by the
+// operation that failed.
+type addrFreeConn struct{ net.Conn }
+
+func (c addrFreeConn) Read(b []byte) (int, error) {
+	n, err := c.Conn.Read(b)
+	return n, addrFree(err)
+}
+
+func (c addrFreeConn) Write(b []byte) (int, error) {
+	n, err := c.Conn.Write(b)
+	return n, addrFree(err)
+}
+
+func (c addrFreeConn) Close() error { return addrFree(c.Conn.Close()) }
+
+func (c addrFreeConn) SetDeadline(t time.Time) error { return addrFree(c.Conn.SetDeadline(t)) }
+
+func (c addrFreeConn) SetReadDeadline(t time.Time) error { return addrFree(c.Conn.SetReadDeadline(t)) }
+
+func (c addrFreeConn) SetWriteDeadline(t time.Time) error {
+	return addrFree(c.Conn.SetWriteDeadline(t))
 }
 
 // scrubDNS keeps a DNS error's message without its server address.
@@ -441,25 +482,54 @@ func (s *Sender) attempt(ctx context.Context, c *http.Client, u *url.URL, body [
 	return resp.StatusCode, nil
 }
 
-// clean renders err without the URL: *url.Error is unwrapped (its message
-// embeds the full URL), control characters are removed (the text can come
-// from the receiver, for example a certificate name) and any remaining path
-// or query text is removed.
+// clean renders err without the URL and without addresses: *url.Error is
+// unwrapped (its message embeds the full URL), any remaining URL, path or
+// query text is removed before and after the control characters (the text
+// can come from the receiver, for example a certificate name), and any IP
+// address left in it is removed.
 func clean(err error, u *url.URL) string {
 	var ue *url.Error
 	if errors.As(err, &ue) {
 		err = ue.Err
 	}
-	msg := StripControl(err.Error())
-	for _, part := range []string{u.String(), u.RawQuery, u.Query().Encode(), u.EscapedPath(), u.Path, u.Fragment} {
-		if len(part) > 1 {
-			msg = strings.ReplaceAll(msg, part, "")
-		}
-	}
+	parts := []string{u.String(), u.RawQuery, u.Query().Encode(), u.EscapedPath(), u.Path, u.Fragment}
+	// Before: a decoded path can hold a control character. After: one
+	// inserted into a part would otherwise hide it.
+	msg := removeParts(StripControl(removeParts(err.Error(), parts)), parts)
+	msg = dropAddresses(msg)
 	if msg == "" {
 		msg = "delivery failed"
 	}
 	return msg
+}
+
+func removeParts(msg string, parts []string) string {
+	for _, p := range parts {
+		if len(p) > 1 {
+			msg = strings.ReplaceAll(msg, p, "")
+		}
+	}
+	return msg
+}
+
+// addrText matches a run of the characters an IP address, or an address
+// with its port, is written with.
+var addrText = regexp.MustCompile(`[0-9A-Fa-f.:\[\]]+`)
+
+// dropAddresses removes every IP address, and every address with its port,
+// from msg. It is the last guard behind addrFree, for an address that
+// reached the error text some other way.
+func dropAddresses(msg string) string {
+	return addrText.ReplaceAllStringFunc(msg, func(run string) string {
+		core := strings.TrimRight(run, ".:")
+		if _, err := netip.ParseAddrPort(core); err == nil {
+			return run[len(core):]
+		}
+		if _, err := netip.ParseAddr(core); err == nil {
+			return run[len(core):]
+		}
+		return run
+	})
 }
 
 // StripControl removes the C0 and C1 control characters (U+0000 to U+001F

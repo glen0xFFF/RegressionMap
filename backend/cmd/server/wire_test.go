@@ -5,6 +5,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"go/ast"
+	"go/format"
+	"go/parser"
+	"go/token"
 	"io"
 	"log/slog"
 	"net"
@@ -257,13 +261,15 @@ func TestServeAndDrainWaitsForNotifications(t *testing.T) {
 
 type blockingDrainer struct{ called chan struct{} }
 
+// Drain returns what api.Server.Drain returns when its budget runs out.
 func (b blockingDrainer) Drain(ctx context.Context) error {
 	close(b.called)
 	<-ctx.Done()
-	return ctx.Err()
+	return fmt.Errorf("1 analysis run(s) still stopping, 0 notification(s) still being sent: %w", ctx.Err())
 }
 
-// The drain stops waiting when its budget runs out, and says so.
+// The drain stops waiting when its budget runs out, and logs what it was
+// still waiting for, as Drain reports it, instead of a fixed guess.
 func TestDrainGivesUpAfterItsBudget(t *testing.T) {
 	var logs bytes.Buffer
 	lg := slog.New(slog.NewTextHandler(&logs, nil))
@@ -280,6 +286,60 @@ func TestDrainGivesUpAfterItsBudget(t *testing.T) {
 	}
 	if !strings.Contains(logs.String(), "level=WARN") || !strings.Contains(logs.String(), "drain") {
 		t.Fatalf("an incomplete drain must be logged as a warning: %s", logs.String())
+	}
+	const want = `level=WARN msg="drain incomplete" error="1 analysis run(s) still stopping, 0 notification(s) still being sent: context deadline exceeded"`
+	if !strings.Contains(logs.String(), want) {
+		t.Fatalf("the warning must carry Drain's error\n got: %s\nwant: %s", logs.String(), want)
+	}
+}
+
+// run cannot be started by a test (it waits for SIGINT or SIGTERM), so its
+// two shutdown and logging wires are checked on main.go's syntax tree: lg
+// becomes the slog default, so internal/api and the log package write
+// through it, and run ends with serveAndDrain over the api server.
+func TestRunWiresSlogDefaultAndDrain(t *testing.T) {
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, "main.go", nil, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var run *ast.FuncDecl
+	for _, d := range f.Decls {
+		if fd, ok := d.(*ast.FuncDecl); ok && fd.Recv == nil && fd.Name.Name == "run" {
+			run = fd
+		}
+	}
+	if run == nil {
+		t.Fatal("main.go has no func run")
+	}
+	src := func(n ast.Node) string {
+		var b bytes.Buffer
+		if err := format.Node(&b, fset, n); err != nil {
+			t.Fatal(err)
+		}
+		return b.String()
+	}
+	setDefault, drained := -1, -1
+	for i, st := range run.Body.List {
+		switch st := st.(type) {
+		case *ast.ExprStmt:
+			if src(st) == "slog.SetDefault(lg)" {
+				setDefault = i
+			}
+		case *ast.ReturnStmt:
+			if len(st.Results) == 1 && strings.HasPrefix(src(st.Results[0]), "serveAndDrain(") && strings.HasSuffix(src(st.Results[0]), ", lg, apiSrv)") {
+				drained = i
+			}
+		}
+	}
+	if setDefault < 0 {
+		t.Error("run does not call slog.SetDefault(lg)")
+	}
+	if drained < 0 {
+		t.Error("run does not end with serveAndDrain(..., lg, apiSrv)")
+	}
+	if setDefault >= 0 && drained >= 0 && setDefault > drained {
+		t.Error("slog.SetDefault(lg) comes after serveAndDrain")
 	}
 }
 

@@ -28,9 +28,7 @@
 //	server keys list
 //	server keys revoke ID
 //
-// SIGINT/SIGTERM trigger a graceful shutdown: up to 10s for open requests,
-// then running analyses end as error and up to 25s more for completion
-// notifications still being sent.
+// SIGINT/SIGTERM trigger a graceful shutdown (10s).
 package main
 
 import (

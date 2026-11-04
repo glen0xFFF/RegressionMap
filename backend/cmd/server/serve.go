@@ -29,14 +29,16 @@ func serveAndDrain(ctx context.Context, srv *http.Server, ln net.Listener, lg *s
 	return err
 }
 
-// drain calls d.Drain with a budget of timeout. A notification that has not
-// finished by then is reported as failed by the next process.
+// drain calls d.Drain with a budget of timeout. If the budget runs out, the
+// warning carries Drain's error, which counts the analysis runs still
+// stopping and the notifications still being sent; such a notification is
+// reported as failed by the next process.
 func drain(d drainer, lg *slog.Logger, timeout time.Duration) {
 	lg.Info("draining", "timeout", timeout.String())
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	if err := d.Drain(ctx); err != nil {
-		lg.Warn("drain incomplete: notifications still being sent are reported as failed", "timeout", timeout.String())
+		lg.Warn("drain incomplete", "error", err.Error(), "timeout", timeout.String())
 		return
 	}
 	lg.Info("drained")
