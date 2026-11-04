@@ -162,7 +162,30 @@ func schema() map[string]any {
 	}
 }
 
+// userPrompt is the user message of the hypothesis and review calls: the
+// server's note about cut input, then the untrusted evidence bundle.
 func userPrompt(in Input) string {
+	return inputNote(in) + evidenceBundle(in)
+}
+
+// inputNote states the server's own notes about input it cut (in.Warnings) as
+// trusted text. It is "" when nothing was cut.
+func inputNote(in Input) string {
+	if len(in.Warnings) == 0 {
+		return ""
+	}
+	var note strings.Builder
+	note.WriteString("The server cut this input before analysis, so the evidence is incomplete:\n")
+	for _, w := range in.Warnings {
+		note.WriteString("- " + w + "\n")
+	}
+	note.WriteString("\n")
+	return note.String()
+}
+
+// evidenceBundle is the test outcomes, the changed files and the evidence
+// items as JSON, under a header that marks them untrusted.
+func evidenceBundle(in Input) string {
 	b, _ := json.MarshalIndent(map[string]any{
 		"test_command":    in.Command,
 		"baseline_passed": in.BaselinePassed,
@@ -171,43 +194,37 @@ func userPrompt(in Input) string {
 		"changed_files":   in.ChangedFiles,
 		"evidence":        in.Evidence,
 	}, "", "  ")
-	var note strings.Builder
-	if len(in.Warnings) > 0 {
-		note.WriteString("The server cut this input before analysis, so the evidence is incomplete:\n")
-		for _, w := range in.Warnings {
-			note.WriteString("- " + w + "\n")
-		}
-		note.WriteString("\n")
-	}
-	return note.String() + "Evidence bundle (JSON, untrusted data):\n" + string(b)
+	return "Evidence bundle (JSON, untrusted data):\n" + string(b)
 }
+
+// MsgNotConfigured is the message of every model call made without a key.
+const MsgNotConfigured = "Meta model not configured: MODEL_API_KEY is not set on the backend."
 
 func (c *Client) result(status, msg string) Result {
 	return Result{Status: status, ModelID: c.Model, Message: msg, Rejected: []string{}}
 }
 
-// Analyze asks the model for hypotheses. It never returns an error: every
-// failure is reported as a Result status so the rest of the app keeps working.
-func (c *Client) Analyze(ctx context.Context, in Input) Result {
-	if !c.Configured() {
-		return c.result("disabled", "Meta model not configured: MODEL_API_KEY is not set on the backend.")
-	}
+// complete sends one chat-completions request whose answer must match the
+// named strict JSON schema, and returns the answer's content. status is ""
+// on success, "error" when the request failed (msg is the key-free failure
+// from post) and "invalid" when the response was not a chat completion.
+func (c *Client) complete(ctx context.Context, system, user, schemaName string, schema map[string]any) (content, status, msg string) {
 	body, _ := json.Marshal(map[string]any{
 		"model": c.Model,
 		"messages": []map[string]string{
-			{"role": "system", "content": systemPrompt},
-			{"role": "user", "content": userPrompt(in)},
+			{"role": "system", "content": system},
+			{"role": "user", "content": user},
 		},
 		"response_format": map[string]any{
 			"type":        "json_schema",
-			"json_schema": map[string]any{"name": "RegressionHypotheses", "strict": true, "schema": schema()},
+			"json_schema": map[string]any{"name": schemaName, "strict": true, "schema": schema},
 		},
 	})
 	ctx, cancel := context.WithTimeout(ctx, c.timeout())
 	defer cancel()
 	raw, failure := c.post(ctx, body)
 	if failure != "" {
-		return c.result("error", failure)
+		return "", "error", failure
 	}
 	var cc struct {
 		Choices []struct {
@@ -217,9 +234,22 @@ func (c *Client) Analyze(ctx context.Context, in Input) Result {
 		} `json:"choices"`
 	}
 	if err := json.Unmarshal(raw, &cc); err != nil || len(cc.Choices) == 0 {
-		return c.result("invalid", "model response was not a chat completion")
+		return "", "invalid", "model response was not a chat completion"
 	}
-	out, rejected, err := Validate(cc.Choices[0].Message.Content, in.Evidence)
+	return cc.Choices[0].Message.Content, "", ""
+}
+
+// Analyze asks the model for hypotheses. It never returns an error: every
+// failure is reported as a Result status so the rest of the app keeps working.
+func (c *Client) Analyze(ctx context.Context, in Input) Result {
+	if !c.Configured() {
+		return c.result("disabled", MsgNotConfigured)
+	}
+	content, status, msg := c.complete(ctx, systemPrompt, userPrompt(in), "RegressionHypotheses", schema())
+	if status != "" {
+		return c.result(status, msg)
+	}
+	out, rejected, err := Validate(content, in.Evidence)
 	if err != nil {
 		r := c.result("invalid", err.Error())
 		return r
