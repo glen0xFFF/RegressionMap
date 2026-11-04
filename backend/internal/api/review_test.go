@@ -974,3 +974,23 @@ func TestFinishWithoutModelClient(t *testing.T) {
 		})
 	}
 }
+
+// The review messages and warnings are the contract's text, word for word
+// (docs/API_CONTRACT.md, "Muse change review (v4)", rules 4, 6 and 7 and
+// the commit item rules). The other tests compare with the constants, so
+// this test is what pins their wording.
+func TestReviewMessagesAreTheContractText(t *testing.T) {
+	for _, c := range []struct{ name, got, want string }{
+		{"msgReviewDeadline", msgReviewDeadline, "review stopped at the analysis deadline"},
+		{"msgCheckDeadline", msgCheckDeadline, "check stopped at the analysis deadline"},
+		{"msgNoTimeLeft", msgNoTimeLeft, "no time was left for the review"},
+		{"msgReviewEnded", msgReviewEnded, "the analysis ended before the review finished"},
+		{"msgReviewSkipped", msgReviewSkipped, "the analysis ended before the change could be reviewed"},
+		{"warnCommitsUnread", warnCommitsUnread, "commit messages could not be read: the evidence holds no commit items"},
+		{"warnCommitsCut", warnCommitsCut, "commit messages larger than 1 MiB: only the commits that fit were read"},
+	} {
+		if c.got != c.want {
+			t.Errorf("%s is %q, want the contract's %q", c.name, c.got, c.want)
+		}
+	}
+}
