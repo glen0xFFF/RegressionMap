@@ -384,6 +384,134 @@ func TestOverallTimeoutAcrossAttempts(t *testing.T) {
 	}
 }
 
+// cutOffServer answers each request with 200 and the start of a chat
+// completion, flushes it, then sends nothing more until the client goes away
+// or the test ends. It drains the request body first: the server notices a
+// client that has gone only once the body is read, and Close waits for the
+// handler. n counts the requests when it is not nil.
+func cutOffServer(t *testing.T, n *atomic.Int32) *httptest.Server {
+	t.Helper()
+	release := make(chan struct{})
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if n != nil {
+			n.Add(1)
+		}
+		io.Copy(io.Discard, r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"{\"summary\":`))
+		w.(http.Flusher).Flush()
+		select {
+		case <-r.Context().Done():
+		case <-release:
+		}
+	}))
+	t.Cleanup(func() { close(release); s.Close() })
+	return s
+}
+
+// shortBodyServer hijacks the connection of each of the first short requests,
+// writes a 200 whose Content-Length is larger than the bytes it sends, and
+// closes it, so the client's read of the body fails. Later requests get a
+// whole answer with one valid hypothesis. n counts the requests.
+func shortBodyServer(t *testing.T, n *atomic.Int32, short int) *httptest.Server {
+	t.Helper()
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.Copy(io.Discard, r.Body)
+		if int(n.Add(1)) > short {
+			json.NewEncoder(w).Encode(map[string]any{"choices": []any{map[string]any{"message": map[string]any{
+				"role": "assistant", "content": content(hyp(1, "src/pagination.ts", 10, 10, "E1", "E2"))}}}})
+			return
+		}
+		conn, buf, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			t.Errorf("hijack: %v", err)
+			return
+		}
+		defer conn.Close()
+		part := `{"choices":[{"message":{"role":"assistant","content":`
+		fmt.Fprintf(buf, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n%s", len(part)+100, part)
+		buf.Flush()
+	}))
+	t.Cleanup(s.Close)
+	return s
+}
+
+// A 200 whose body the deadline cuts off is a request that failed, not an
+// answer that is invalid: it ends as a request that got no response does
+// (contract, corrections of record to v4, entry 3).
+func TestCutOffResponseTimesOut(t *testing.T) {
+	var n atomic.Int32
+	s := cutOffServer(t, &n)
+	fs := &fakeSleeper{}
+	c := retryClient(s.URL, fs)
+	c.Timeout = 300 * time.Millisecond
+	start := time.Now()
+	r := c.Analyze(context.Background(), Input{Evidence: ev})
+	if el := time.Since(start); el > 5*time.Second {
+		t.Fatalf("took %v: the deadline did not end the read", el)
+	}
+	if r.Status != "error" || r.Message != "model request timed out after 1 attempt" || r.Result != nil {
+		t.Fatalf("got %+v", r)
+	}
+	if n.Load() != 1 || len(fs.delays) != 0 {
+		t.Fatalf("requests %d, delays %v: want 1 and none", n.Load(), fs.delays)
+	}
+}
+
+// A cancellation that ends the read gives the cancel message of a request
+// that got no response. The transport cancels as soon as the response
+// headers have arrived, so only the read of the body can see it.
+func TestCutOffResponseCancelled(t *testing.T) {
+	s := cutOffServer(t, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	c := retryClient(s.URL, &fakeSleeper{})
+	c.HTTP = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		resp, err := http.DefaultTransport.RoundTrip(req)
+		if err == nil {
+			cancel()
+		}
+		return resp, err
+	})}
+	r := c.Analyze(ctx, Input{Evidence: ev})
+	if r.Status != "error" || r.Message != "model request cancelled after 1 attempt" || r.Result != nil {
+		t.Fatalf("got %+v", r)
+	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) { return f(req) }
+
+// Any other read error is retried like a transport error, with backoff, and
+// its text carries no key.
+func TestShortResponseBodyIsRetried(t *testing.T) {
+	var n atomic.Int32
+	s := shortBodyServer(t, &n, 1000)
+	fs := &fakeSleeper{}
+	r := retryClient(s.URL, fs).Analyze(context.Background(), Input{Evidence: ev})
+	if r.Status != "error" || n.Load() != 3 || r.Result != nil {
+		t.Fatalf("status=%s requests=%d msg=%s", r.Status, n.Load(), r.Message)
+	}
+	if !strings.HasPrefix(r.Message, "model request failed after 3 attempts: ") || !strings.Contains(r.Message, "unexpected EOF") ||
+		strings.Contains(r.Message, "secret-key-123") {
+		t.Fatalf("message %q", r.Message)
+	}
+	want := []time.Duration{50 * time.Millisecond, 100 * time.Millisecond}
+	if fmt.Sprint(fs.delays) != fmt.Sprint(want) {
+		t.Fatalf("delays %v, want %v", fs.delays, want)
+	}
+	// A whole answer after a short one is used.
+	var n2 atomic.Int32
+	s2 := shortBodyServer(t, &n2, 1)
+	fs2 := &fakeSleeper{}
+	r = retryClient(s2.URL, fs2).Analyze(context.Background(), Input{Evidence: ev})
+	if r.Status != "ok" || n2.Load() != 2 || len(fs2.delays) != 1 {
+		t.Fatalf("status=%s requests=%d delays=%v msg=%s", r.Status, n2.Load(), fs2.delays, r.Message)
+	}
+}
+
 // The production wait (no injected sleep) must really wait between retries,
 // otherwise a 429ing API would get a retry storm.
 func TestRealBackoffWaitsBetweenRetries(t *testing.T) {
