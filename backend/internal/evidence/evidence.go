@@ -9,6 +9,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"unicode"
 	"unicode/utf8"
 )
 
@@ -257,9 +258,76 @@ type ReadFunc func(path string) (src string, truncated bool, err error)
 // of the API contract.
 const notRead = "(source larger than 1 MiB, not read)"
 
-// Build assembles the bundle. Items are emitted in a fixed order: test
-// failures, stack frames, diff hunks, then source of changed non-test files.
+// CommitMessage is one commit for the commit evidence items.
+type CommitMessage struct {
+	SHA     string // the title uses its first 7 characters
+	Message string
+}
+
+// Bounds of the commit items (docs/API_CONTRACT.md, v4): at most maxCommits
+// commits, each excerpt cut at maxCommitExcerpt bytes before the mark, and at
+// most maxCommitTotal bytes for all their excerpts, marks included.
+const (
+	maxCommits       = 10
+	maxCommitExcerpt = 1000
+	maxCommitTotal   = 4000
+)
+
+// cutExcerpt cuts s to at most n bytes and adds truncMark. It backs off to
+// the start of the character the cut falls in; bytes that cannot belong to
+// a character (more than UTFMax-1 continuation bytes) are cut where n says.
+func cutExcerpt(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	cut := n
+	for cut > n-(utf8.UTFMax-1) && cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	if !utf8.RuneStart(s[cut]) {
+		cut = n
+	}
+	return s[:cut] + truncMark
+}
+
+// buildCommitItems turns commits, newest first, into commit items without
+// ids, and returns them with the bytes of their excerpts. It stops at the
+// first commit whose excerpt would bring the excerpts above limit, and
+// leaves that commit and every older one out.
+func buildCommitItems(commits []CommitMessage, limit int) ([]Item, int) {
+	items := []Item{}
+	total := 0
+	for i, c := range commits {
+		if i == maxCommits {
+			break
+		}
+		msg := strings.TrimRightFunc(c.Message, unicode.IsSpace)
+		subject, _, _ := strings.Cut(msg, "\n")
+		subject = strings.TrimSuffix(subject, "\r")
+		excerpt := cutExcerpt(Redact(msg), maxCommitExcerpt)
+		if total+len(excerpt) > limit {
+			break
+		}
+		total += len(excerpt)
+		items = append(items, Item{Type: "commit", Title: capTitle(Redact("commit " + c.SHA[:min(7, len(c.SHA))] + ": " + subject)), Excerpt: excerpt})
+	}
+	return items, total
+}
+
+// Build assembles the bundle with no commit items: it is BuildWithCommits
+// with no commits.
 func Build(failures []Failure, hunks []Hunk, readFile ReadFunc, lim Limits) []Item {
+	return BuildWithCommits(failures, hunks, nil, readFile, lim)
+}
+
+// BuildWithCommits assembles the bundle. Items are emitted in a fixed order:
+// test failures, stack frames, diff hunks, source of changed non-test files,
+// then one "commit" item per commit, newest first. The commit excerpts are
+// set aside from MaxTotal before the other items are added, so a large diff
+// cannot push them out; coming last, they leave the other ids unchanged.
+func BuildWithCommits(failures []Failure, hunks []Hunk, commits []CommitMessage, readFile ReadFunc, lim Limits) []Item {
+	cItems, reserved := buildCommitItems(commits, min(maxCommitTotal, lim.MaxTotal))
+	lim.MaxTotal -= reserved
 	var items []Item
 	total := 0
 	// add appends it; cut marks an excerpt that is already incomplete, so it
@@ -358,6 +426,11 @@ func Build(failures []Failure, hunks []Hunk, readFile ReadFunc, lim Limits) []It
 			it.LineStart, it.LineEnd, it.Excerpt, truncated = 0, 0, notRead, false
 		}
 		add(it, truncated)
+	}
+
+	for _, it := range cItems {
+		it.ID = "E" + itoa(len(items)+1)
+		items = append(items, it)
 	}
 	return items
 }

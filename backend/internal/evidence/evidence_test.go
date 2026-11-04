@@ -1,7 +1,10 @@
 package evidence
 
 import (
+	"encoding/json"
+	"fmt"
 	"os"
+	"reflect"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -342,5 +345,188 @@ func TestRedactPathMatchesBuildFile(t *testing.T) {
 		if len(ev) != 1 || ev[0].File != RedactPath(in) {
 			t.Errorf("Build File for %q = %+v, want RedactPath result %q", in, ev, RedactPath(in))
 		}
+	}
+}
+
+// testSHA is a 40-hex sha whose first 7 characters are i in hex.
+func testSHA(i int) string { return fmt.Sprintf("%07x%033x", i, i) }
+
+// fixtureInputs are the failures, hunks and files of the pagination fixture.
+func fixtureInputs(t *testing.T) ([]Failure, []Hunk, ReadFunc) {
+	t.Helper()
+	src := "l1\nl2\nl3\nl4\nl5\nl6\nl7\ntest(\"first\", () => {\n  assert.deepEqual(paginate(items, 1, 3).items, [1, 2, 3]);\n});\nl11\nl12\n  assert.deepEqual(x);\nl14\n"
+	read := fakeRead(map[string]string{
+		"test/pagination.test.ts": src,
+		"src/pagination.ts":       "export function paginate() {}\n",
+		"src/format.ts":           "export function formatTitle() {}\n",
+	})
+	return ParseNodeTest(load(t, "node_test_fail.txt"), "C:/work/pagination-demo"), ParseDiff(load(t, "diff.txt")), read
+}
+
+func commitItems(ev []Item) []Item {
+	out := []Item{}
+	for _, e := range ev {
+		if e.Type == "commit" {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+func TestBuildWithoutCommitsIsUnchanged(t *testing.T) {
+	f, h, r := fixtureInputs(t)
+	lim := Limits{MaxExcerpt: 2000, MaxTotal: 50000}
+	if got, want := BuildWithCommits(f, h, nil, r, lim), Build(f, h, r, lim); !reflect.DeepEqual(got, want) {
+		t.Fatalf("BuildWithCommits with no commits:\n%+v\nwant Build:\n%+v", got, want)
+	}
+}
+
+func TestCommitItemsComeLastAndKeepOtherIDs(t *testing.T) {
+	f, h, r := fixtureInputs(t)
+	lim := Limits{MaxExcerpt: 2000, MaxTotal: 50000}
+	base := Build(f, h, r, lim)
+	commits := []CommitMessage{
+		{SHA: "0123456789abcdef0123456789abcdef01234567", Message: "subject\n\nbody line  \n\n"},
+		{SHA: "fedcba9876543210fedcba9876543210fedcba98", Message: "older one\t"},
+	}
+	ev := BuildWithCommits(f, h, commits, r, lim)
+	if len(base) == 0 || len(ev) != len(base)+2 {
+		t.Fatalf("got %d items, want the %d of Build plus 2", len(ev), len(base))
+	}
+	if !reflect.DeepEqual(ev[:len(base)], base) {
+		t.Fatalf("the other items changed:\n%+v\nwant:\n%+v", ev[:len(base)], base)
+	}
+	want := []Item{
+		{ID: "E" + itoa(len(base)+1), Type: "commit", Title: "commit 0123456: subject", Excerpt: "subject\n\nbody line"},
+		{ID: "E" + itoa(len(base)+2), Type: "commit", Title: "commit fedcba9: older one", Excerpt: "older one"},
+	}
+	for i, w := range want {
+		if got := ev[len(base)+i]; got != w {
+			t.Errorf("commit item %d = %+v, want %+v", i, got, w)
+		}
+	}
+}
+
+func TestCommitItemsAreRedacted(t *testing.T) {
+	msg := "add key sk-abcdefghijklmnopqrstu\n\ntoken: hunter22secret\n"
+	ev := BuildWithCommits(nil, nil, []CommitMessage{{SHA: testSHA(1), Message: msg}}, fakeRead(nil), Limits{MaxExcerpt: 2000, MaxTotal: 50000})
+	if len(ev) != 1 {
+		t.Fatalf("want 1 item, got %+v", ev)
+	}
+	it := ev[0]
+	if it.Title != "commit 0000001: add key [REDACTED]" {
+		t.Errorf("title = %q", it.Title)
+	}
+	if it.Excerpt != "add key [REDACTED]\n\ntoken: [REDACTED]" {
+		t.Errorf("excerpt = %q", it.Excerpt)
+	}
+	for _, leak := range []string{"sk-abcdefghijklmnopqrstu", "hunter22secret"} {
+		if strings.Contains(it.Title, leak) || strings.Contains(it.Excerpt, leak) {
+			t.Errorf("leaked %q: %+v", leak, it)
+		}
+	}
+}
+
+func TestCommitTitleIsCapped(t *testing.T) {
+	const mark = "…[truncated]"
+	msg := strings.Repeat("s", 300) + "\n\nbody"
+	ev := BuildWithCommits(nil, nil, []CommitMessage{{SHA: testSHA(2), Message: msg}}, fakeRead(nil), Limits{MaxExcerpt: 2000, MaxTotal: 50000})
+	if len(ev) != 1 {
+		t.Fatalf("want 1 item, got %+v", ev)
+	}
+	title := ev[0].Title
+	if len(title) > 200+len(mark) || !strings.HasSuffix(title, mark) || !strings.HasPrefix(title, "commit 0000002: sss") {
+		t.Fatalf("title %d bytes: %q", len(title), title)
+	}
+	if strings.Contains(title, "body") || ev[0].Excerpt != msg {
+		t.Fatalf("title holds more than the first line, or the excerpt changed: %+v", ev[0])
+	}
+}
+
+// The cut lands inside an "é": it backs off to the start of that character.
+// Invalid bytes and escape sequences are kept as they are, and the items
+// still marshal.
+func TestCommitExcerptCutKeepsCharacters(t *testing.T) {
+	msg := "abcdefg" + strings.Repeat("é\xff\x1b[31m", 186) + "hello"
+	if len(msg) != 1500 || utf8.RuneStart(msg[1000]) {
+		t.Fatalf("set-up: %d bytes, byte 1000 must be inside a character", len(msg))
+	}
+	// Also a run of bytes that are never a character start: the cut does not
+	// walk back through all of it.
+	cont := strings.Repeat("\x80", 1500)
+	for _, m := range []string{msg, cont} {
+		ev := BuildWithCommits(nil, nil, []CommitMessage{{SHA: testSHA(3), Message: m}}, fakeRead(nil), Limits{MaxExcerpt: 3000, MaxTotal: 40000})
+		if len(ev) != 1 {
+			t.Fatalf("want 1 item, got %d", len(ev))
+		}
+		ex := ev[0].Excerpt
+		if !strings.HasSuffix(ex, truncMark) || len(ex) > 1000+len(truncMark) {
+			t.Fatalf("excerpt %d bytes, ends %q", len(ex), ex[max(0, len(ex)-20):])
+		}
+		kept := strings.TrimSuffix(ex, truncMark)
+		if !strings.HasPrefix(m, kept) || len(kept) < 1000-(utf8.UTFMax-1) {
+			t.Fatalf("kept part is not the start of the message: %d bytes", len(kept))
+		}
+		if m == msg && !utf8.RuneStart(m[len(kept)]) {
+			t.Fatalf("kept part ends inside a character: cut at byte %d", len(kept))
+		}
+		if _, err := json.Marshal(ev); err != nil {
+			t.Fatalf("items do not marshal: %v", err)
+		}
+	}
+}
+
+func TestCommitItemsStopAtTheTotal(t *testing.T) {
+	var cs []CommitMessage
+	for i := 0; i < 6; i++ {
+		cs = append(cs, CommitMessage{SHA: testSHA(i), Message: strings.Repeat(string(rune('a'+i)), 900)})
+	}
+	cs = append(cs, CommitMessage{SHA: testSHA(6), Message: "0123456789"})
+	ev := BuildWithCommits(nil, nil, cs, fakeRead(nil), Limits{MaxExcerpt: 3000, MaxTotal: 40000})
+	total := 0
+	for i, e := range ev {
+		if e.Type != "commit" || !strings.HasPrefix(e.Title, "commit "+testSHA(i)[:7]+": "+cs[i].Message[:10]) || e.Excerpt != cs[i].Message {
+			t.Errorf("item %d = %q %q", i, e.Type, e.Title)
+		}
+		total += len(e.Excerpt)
+	}
+	if len(ev) != 4 || total != 3600 {
+		t.Fatalf("got %d commit items, %d bytes; want 4 and 3600", len(ev), total)
+	}
+}
+
+func TestCommitItemsAtMostTen(t *testing.T) {
+	var cs []CommitMessage
+	for i := 0; i < 12; i++ {
+		cs = append(cs, CommitMessage{SHA: testSHA(i), Message: fmt.Sprintf("m%04d", i)})
+	}
+	ev := BuildWithCommits(nil, nil, cs, fakeRead(nil), Limits{MaxExcerpt: 3000, MaxTotal: 40000})
+	if len(ev) != 10 || ev[0].Excerpt != "m0000" || ev[9].Excerpt != "m0009" || ev[9].ID != "E10" {
+		t.Fatalf("got %d items: %+v", len(ev), ev)
+	}
+}
+
+// The commit excerpts are set aside first: the source item that would fill
+// the budget is dropped instead of the commits.
+func TestCommitSpaceIsReservedFromTheBudget(t *testing.T) {
+	lim := Limits{MaxExcerpt: 3000, MaxTotal: 5000}
+	hunks := []Hunk{{File: "src/a.ts", NewStart: 1, NewCount: 1, Text: strings.Repeat("h", 2500)}}
+	read := fakeRead(map[string]string{"src/a.ts": strings.Repeat("s", 2500)})
+	if ev := Build(nil, hunks, read, lim); len(ev) != 2 || ev[1].Type != "source" {
+		t.Fatalf("set-up: without commits the source item must fit: %d items", len(ev))
+	}
+	cs := []CommitMessage{{SHA: testSHA(1), Message: strings.Repeat("c", 300)}, {SHA: testSHA(2), Message: strings.Repeat("d", 300)}}
+	ev := BuildWithCommits(nil, hunks, cs, read, lim)
+	types := []string{}
+	total := 0
+	for _, e := range ev {
+		types = append(types, e.Type)
+		total += len(e.Excerpt)
+	}
+	if strings.Join(types, ",") != "diff_hunk,commit,commit" || total > 5000 {
+		t.Fatalf("types %v, %d bytes; want diff_hunk,commit,commit within 5000", types, total)
+	}
+	if len(commitItems(ev)) != 2 || ev[1].ID != "E2" || ev[2].ID != "E3" {
+		t.Fatalf("commit items: %+v", commitItems(ev))
 	}
 }
