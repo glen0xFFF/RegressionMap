@@ -156,8 +156,8 @@ type Server struct {
 	changed  chan struct{} // closed when active, runs or delivering shrinks; nil while nobody waits
 
 	// loadStoredHook is a test seam, nil in production. loadStored calls it
-	// between its two steps, the in-flight snapshot and the read of the
-	// stored file, so a test can end a delivery in between.
+	// after it has read the stored file and before it rewrites a stored
+	// "pending", so a test can end a delivery in between.
 	loadStoredHook func(id string)
 }
 
@@ -388,12 +388,12 @@ func (s *Server) loadStored(id string) (Analysis, bool) {
 	s.mu.Lock()
 	_, inFlight := s.delivering[id]
 	s.mu.Unlock()
-	if s.loadStoredHook != nil {
-		s.loadStoredHook(id)
-	}
 	b, err := s.store.Load(id)
 	if err != nil {
 		return Analysis{}, false
+	}
+	if s.loadStoredHook != nil {
+		s.loadStoredHook(id)
 	}
 	var a Analysis
 	if err := json.Unmarshal(b, &a); err != nil || a.ID != id {

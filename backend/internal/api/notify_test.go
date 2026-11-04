@@ -747,12 +747,14 @@ func TestNotifyPendingWhileDeliveringAfterEviction(t *testing.T) {
 	}
 }
 
-// A GET of an evicted analysis runs while its delivery records the outcome
-// and leaves the in-flight set. loadStored takes its in-flight snapshot
-// before it reads the stored copy, and deliver records the outcome before
-// it leaves the set, so the GET shows "pending" or the recorded outcome,
-// never a delivered webhook as failed with msgDeliveryInterrupted. The seam
-// holds the GET between those two steps while the delivery ends.
+// A GET of an evicted analysis reads the stored copy, "pending", while the
+// delivery is in flight; the delivery then records "delivered" and leaves
+// the in-flight set before the GET decides what that "pending" means. The
+// seam holds the GET after its read until the delivery has ended. loadStored
+// took its in-flight snapshot before the read, so the GET serves "pending"
+// or "delivered", never a delivered webhook as failed with
+// msgDeliveryInterrupted. A snapshot taken after the read would miss the
+// delivery and serve "failed".
 func TestGetWhileDeliveryEndsNeverShowsItInterrupted(t *testing.T) {
 	data := t.TempDir()
 	fake := newFake(true, notify.Result{Delivered: true, Attempts: 1, StatusCode: 200})
@@ -781,9 +783,13 @@ func TestGetWhileDeliveryEndsNeverShowsItInterrupted(t *testing.T) {
 	if inMemory {
 		t.Fatal("fixture: A must have been evicted by B")
 	}
+	if st, ok := loadStoredAnalysis(t, data, a.ID); !ok || st.Notification == nil || st.Notification.Status != "pending" {
+		t.Fatalf("fixture: the GET must read a stored \"pending\", stored %+v", st.Notification)
+	}
 
-	// The first loadStored of A (the GET's) waits between its two steps
-	// until resume is closed; later ones (deliver's own load) go on.
+	// The first loadStored of A (the GET's) waits after its read of the
+	// stored copy until resume is closed; later ones (deliver's own load,
+	// later GETs) go on.
 	paused, resume := make(chan struct{}), make(chan struct{})
 	var loads atomic.Int32
 	s.loadStoredHook = func(id string) {
@@ -845,8 +851,13 @@ func TestGetWhileDeliveryEndsNeverShowsItInterrupted(t *testing.T) {
 	if r.err != nil || r.code != 200 {
 		t.Fatalf("GET A: %d %v", r.code, r.err)
 	}
-	if n := r.a.Notification; n == nil || n.Status != "delivered" || n.Attempts != 1 || n.LastStatusCode != 200 || n.LastError != "" {
-		t.Fatalf("a GET while a successful delivery ended served %+v, want delivered", r.a.Notification)
+	if n := r.a.Notification; n == nil || (n.Status != "pending" && n.Status != "delivered") || n.LastError != "" {
+		t.Fatalf("a GET that read the stored copy while the delivery was in flight served %+v, want pending or delivered", r.a.Notification)
+	}
+	t.Logf("the held GET served %q", r.a.Notification.Status)
+	fin := waitNotification(t, srv.URL, a.ID, "delivered")
+	if n := fin.Notification; n.Attempts != 1 || n.LastStatusCode != 200 || n.LastError != "" {
+		t.Fatalf("a later GET served %+v, want delivered", n)
 	}
 }
 
