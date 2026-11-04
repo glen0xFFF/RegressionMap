@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -86,6 +88,92 @@ func TestJSONLogEscapesC1FormatAndSeparatorCharacters(t *testing.T) {
 	g, _ := decodeLogLine(t, lines[1])["g"].(map[string]any)
 	if g["pre"] != logBadEscaped || g["inner"] != logBadEscaped {
 		t.Errorf("group attributes %+q, want both %+q", g, logBadEscaped)
+	}
+}
+
+// derefErr's Error reads its receiver, so a typed-nil *derefErr panics in
+// Error() with a nil pointer dereference.
+type derefErr struct{ text string }
+
+func (e *derefErr) Error() string { return e.text }
+
+// panicErr's Error always panics with the same value.
+type panicErr struct{}
+
+func (panicErr) Error() string { panic("panicErr: fixed panic value") }
+
+// nilSafeErr's Error handles a nil receiver and returns text holding U+0085.
+type nilSafeErr struct{}
+
+func (e *nilSafeErr) Error() string {
+	if e == nil {
+		return "nil receiver a\U00000085b"
+	}
+	return "non-nil receiver"
+}
+
+// logErrorLine logs one record with err as its "error" attribute through lg,
+// which writes to buf, and returns that line decoded, without its "time"
+// key. A panic in the logging call fails the test.
+func logErrorLine(t *testing.T, name string, lg *slog.Logger, buf *bytes.Buffer, err error) map[string]any {
+	t.Helper()
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				t.Fatalf("%s: logging the error panicked: %v", name, r)
+			}
+		}()
+		lg.Error("failed", "error", err)
+	}()
+	rec := decodeLogLine(t, strings.TrimSuffix(buf.String(), "\n"))
+	delete(rec, "time")
+	return rec
+}
+
+// An error whose Error() panics, a typed-nil pointer whose Error() reads its
+// receiver or a value whose Error() panics outright, is written with
+// LOG_FORMAT=json exactly as the JSON handler writes it without
+// escapeLogAttr ("<nil>", or "!PANIC: " and the panic value), and the
+// logging call does not panic.
+func TestJSONLogErrorWhoseErrorPanicsMatchesPlainHandler(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+		want string
+	}{
+		{"typed-nil pointer", (*derefErr)(nil), "<nil>"},
+		{"panicking Error", panicErr{}, "!PANIC: panicErr: fixed panic value"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var b, b2 bytes.Buffer
+			lg, err := newLogger(&b, "json")
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := logErrorLine(t, "newLogger json", lg, &b, tc.err)
+			want := logErrorLine(t, "plain JSON handler", slog.New(slog.NewJSONHandler(&b2, nil)), &b2, tc.err)
+			if want["error"] != tc.want {
+				t.Fatalf("fixture: the plain JSON handler wrote error %+q, want %+q", want["error"], tc.want)
+			}
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("newLogger json wrote %+q, the plain JSON handler %+q", got, want)
+			}
+		})
+	}
+}
+
+// A typed-nil pointer whose Error() handles a nil receiver does not panic,
+// so its text is escaped like that of any other error.
+func TestJSONLogEscapesTextOfNilSafeError(t *testing.T) {
+	var b bytes.Buffer
+	lg, err := newLogger(&b, "json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := logErrorLine(t, "newLogger json", lg, &b, (*nilSafeErr)(nil))
+	assertNoRawLogBad(t, b.String())
+	if want := "nil receiver a\\u0085b"; rec["error"] != want {
+		t.Fatalf("error = %+q, want %+q", rec["error"], want)
 	}
 }
 
