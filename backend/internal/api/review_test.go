@@ -497,6 +497,58 @@ func TestReviewChangeDeadlines(t *testing.T) {
 	})
 }
 
+// deadlineRecorder records the deadline each model request carries.
+type deadlineRecorder struct {
+	mu        sync.Mutex
+	deadlines []time.Time
+}
+
+func (d *deadlineRecorder) RoundTrip(r *http.Request) (*http.Response, error) {
+	if at, ok := r.Context().Deadline(); ok {
+		d.mu.Lock()
+		d.deadlines = append(d.deadlines, at)
+		d.mu.Unlock()
+	}
+	return http.DefaultTransport.RoundTrip(r)
+}
+
+// The review chain stops 15 s before the job deadline (docs/API_CONTRACT.md,
+// "Muse change review (v4)", rule 4). TestReviewChangeDeadlines shortens the
+// margin, so this test is what pins its value: both calls of the chain
+// carry the job deadline less exactly 15 s.
+func TestReviewChainDeadlineIsFifteenSecondsBeforeTheJob(t *testing.T) {
+	if reviewMargin != 15*time.Second {
+		t.Fatalf("reviewMargin is %v, want the contract's 15s", reviewMargin)
+	}
+	m := newChainModel(t)
+	rec := &deadlineRecorder{}
+	mc := m.client()
+	mc.HTTP = &http.Client{Transport: rec}
+	s := New(Config{Root: t.TempDir(), Model: mc})
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	t.Cleanup(cancel)
+	job, _ := ctx.Deadline()
+	in := model.Input{Command: "node --test", Evidence: []evidence.Item{{ID: "E1", Type: "diff_hunk", Title: "Change in src/pagination.ts",
+		File: "src/pagination.ts", LineStart: 7, LineEnd: 13, Excerpt: "-  const end = start + pageSize;"}}}
+	rv := s.reviewChange(ctx, "a1", in)
+	if rv.Status != "ok" || rv.CheckStatus != "ok" {
+		t.Fatalf("review %+v, want ok with check_status ok", rv)
+	}
+	if n := m.Names(); !slices.Equal(n, []string{"ChangeReview", "FindingChecks"}) {
+		t.Fatalf("model calls %v, want the review and the check", n)
+	}
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	if len(rec.deadlines) != 2 {
+		t.Fatalf("%d requests carried a deadline, want 2", len(rec.deadlines))
+	}
+	for i, at := range rec.deadlines {
+		if got := job.Sub(at); got != 15*time.Second {
+			t.Errorf("request %d ends %v before the job deadline, want 15s", i+1, got)
+		}
+	}
+}
+
 // drainNow drains s and fails the test if that takes more than 30 s.
 func drainNow(t *testing.T, s *Server) {
 	t.Helper()
