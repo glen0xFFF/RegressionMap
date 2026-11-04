@@ -601,3 +601,44 @@ The `json` body adds `review` as its last field. It is `null` when the analysis 
 ### Not in v4
 
 Gating on findings (exit codes and analysis statuses do not change), rerunning a review on demand, dismissing or editing findings, a pull-request description as input for the feature lens, reviews of analyses stored before v4, and another model or provider.
+
+## Public demo mode (v4, 2026-11-04)
+
+Optional. It lets a hosted demo run without the sign-in step. It is off unless the operator turns it on.
+
+### Server configuration
+
+- `PUBLIC_DEMO=1` turns it on. Any other value, or no value, leaves it off.
+- The startup log line adds `"public_demo": true|false`. When it is on, the server also logs a warning that `/api` requests without a key run as the public demo identity.
+
+### Who needs a key (change)
+
+With `PUBLIC_DEMO=1`, a request to `/api/*` that is not local and carries no `Authorization` header is served as the public demo identity, which has the `analyze` scope. A request that carries an `Authorization` header is checked as before: a malformed, unknown or revoked key still gets `401 unauthorized`. Local requests do not change.
+
+### What the public demo identity can do
+
+- Everything the `analyze` scope allows: list repositories, commits, commands and analyses, start and read analyses, and run verifications.
+- `GET /api/keys`, `POST /api/keys` and `DELETE /api/keys/{id}` answer `403 forbidden_scope`, as for an `analyze` key.
+- `POST /api/analyses`: all public demo requests share one rate-limit bucket of `RATE_LIMIT_PER_HOUR` per sliding hour. Over the limit: `429 rate_limited` with `Retry-After`, as for a key.
+
+### GET /api/health (change)
+
+With `PUBLIC_DEMO=1`, `auth_required` is `false` for every caller, because a caller that is not local can use the API without a key.
+
+### GET /api/me (addition)
+
+The public demo identity gets:
+
+```json
+{ "mode": "public" }
+```
+
+### Web UI
+
+When `GET /api/health` says `auth_required` `false`, the UI shows no sign-in card. For `{ "mode": "public" }` it offers no API key management and no sign-out. A key stored in the tab is still sent and checked.
+
+### Security notes
+
+- Anyone who can reach the server can start analyses and verifications. Each analysis makes up to three model calls with the server's key, so the model cost is bounded by the shared rate limit and the job limits only.
+- The existing limits still apply: one analysis or verification per repository at a time, and at most two analyses running at once.
+- API key management still needs an admin key or a local request.
