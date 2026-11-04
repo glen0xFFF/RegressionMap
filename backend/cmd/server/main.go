@@ -64,7 +64,7 @@ func main() {
 // security headers.
 func buildHandler(cfg config, lg *slog.Logger) (http.Handler, *api.Server, error) {
 	mc := &model.Client{BaseURL: cfg.ModelBaseURL, APIKey: cfg.Key, Model: cfg.ModelID}
-	apiSrv := api.New(api.Config{Root: cfg.Root, Model: mc, DataDir: cfg.DataDir, WebhookSecret: cfg.WebhookSecret})
+	apiSrv := api.New(api.Config{Root: cfg.Root, Model: mc, DataDir: cfg.DataDir, WebhookSecret: cfg.WebhookSecret, TestEnvAllow: cfg.TestEnvAllow})
 	h, err := newHandler(apiSrv, cfg.WebDir)
 	if err != nil {
 		return nil, nil, err

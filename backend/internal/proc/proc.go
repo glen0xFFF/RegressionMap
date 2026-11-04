@@ -8,6 +8,7 @@ import (
 	"errors"
 	"os"
 	"os/exec"
+	"sort"
 	"strings"
 	"time"
 )
@@ -19,6 +20,10 @@ type Spec struct {
 	Env       []string // extra KEY=VALUE pairs, appended to the filtered parent env
 	Timeout   time.Duration
 	MaxOutput int // per stream, in bytes
+	// Allow names variables passed although their names end in a secret
+	// suffix (TEST_ENV_ALLOW), in any letter case. It never re-admits the
+	// server's own secrets (AlwaysWithheld).
+	Allow []string
 }
 
 // Result is what actually happened. Passed is derived from the exit status only.
@@ -43,21 +48,57 @@ var secretEnv = []string{"MODEL_API_KEY", "MODEL_API_KEY_FILE", "WEBHOOK_SECRET"
 // GH_TOKEN, DB_PASSWORD, ...) that the explicit list cannot anticipate.
 var secretSuffixes = []string{"_KEY", "_SECRET", "_TOKEN", "_PASSWORD"}
 
-// isSecretEnv reports whether the variable name must be withheld from
-// children. Names compare case-insensitively (Windows env names are).
-func isSecretEnv(name string) bool {
-	n := strings.ToUpper(name)
+// AlwaysWithheld reports whether name is one of the server's own secrets,
+// which no child receives and no allow list can re-admit. Names compare
+// case-insensitively (Windows env names are).
+func AlwaysWithheld(name string) bool {
 	for _, s := range secretEnv {
-		if n == s {
-			return true
-		}
-	}
-	for _, suf := range secretSuffixes {
-		if strings.HasSuffix(n, suf) {
+		if strings.EqualFold(name, s) {
 			return true
 		}
 	}
 	return false
+}
+
+// isSecretEnv reports whether the variable name must be withheld from
+// children when nothing is allowed.
+func isSecretEnv(name string) bool { return withheld(name, nil) }
+
+// withheld reports whether a child must not receive the variable name:
+// always for the server's secrets, and for a secret-suffixed name unless
+// allow names it.
+func withheld(name string, allow []string) bool {
+	if AlwaysWithheld(name) {
+		return true
+	}
+	n := strings.ToUpper(name)
+	for _, suf := range secretSuffixes {
+		if strings.HasSuffix(n, suf) {
+			for _, a := range allow {
+				if strings.EqualFold(a, name) {
+					return false
+				}
+			}
+			return true
+		}
+	}
+	return false
+}
+
+// WithheldNames returns, sorted and without values, the names of the
+// variables in this process's environment that a test run given allow does
+// not receive. The server logs them at startup.
+func WithheldNames(allow []string) []string {
+	seen := map[string]bool{}
+	names := []string{}
+	for _, kv := range os.Environ() {
+		if n := envName(kv); withheld(n, allow) && !seen[n] {
+			seen[n] = true
+			names = append(names, n)
+		}
+	}
+	sort.Strings(names)
+	return names
 }
 
 // envName returns the name part of a KEY=VALUE entry. Windows keeps
@@ -92,12 +133,13 @@ func (c *capped) Write(p []byte) (int, error) {
 // SafeEnv returns the parent environment without any secret variable, plus
 // extra KEY=VALUE pairs. Every package that starts a program which can run
 // repository-controlled code (test runners here, git hooks in gitx) uses it.
-func SafeEnv(extra ...string) []string { return childEnv(extra) }
+// It takes no allow list: git never receives TEST_ENV_ALLOW names.
+func SafeEnv(extra ...string) []string { return childEnv(extra, nil) }
 
-func childEnv(extra []string) []string {
+func childEnv(extra, allow []string) []string {
 	var env []string
 	for _, kv := range os.Environ() {
-		if !isSecretEnv(envName(kv)) {
+		if !withheld(envName(kv), allow) {
 			env = append(env, kv)
 		}
 	}
@@ -114,7 +156,7 @@ func Run(ctx context.Context, spec Spec) Result {
 
 	cmd := exec.CommandContext(ctx, spec.Argv[0], spec.Argv[1:]...)
 	cmd.Dir = spec.Dir
-	cmd.Env = childEnv(spec.Env)
+	cmd.Env = childEnv(spec.Env, spec.Allow)
 	cmd.WaitDelay = 2 * time.Second
 	out := &capped{max: spec.MaxOutput}
 	errb := &capped{max: spec.MaxOutput}

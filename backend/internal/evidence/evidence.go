@@ -248,13 +248,23 @@ func isTestFile(p string) bool {
 	return strings.Contains(p, ".test.") || strings.Contains(p, ".spec.") || strings.HasPrefix(p, "test/") || strings.Contains(p, "/test/")
 }
 
-// Build assembles the bundle. readFile reads a repo-relative path from the
-// current revision. Items are emitted in a fixed order: test failures, stack
-// frames, diff hunks, then source of changed non-test files.
-func Build(failures []Failure, hunks []Hunk, readFile func(string) (string, error), lim Limits) []Item {
+// ReadFunc reads a repo-relative path from the current revision. truncated
+// means src holds only the start of the file, cut after a complete line.
+type ReadFunc func(path string) (src string, truncated bool, err error)
+
+// notRead is the excerpt of a stack frame past the part of a file that was
+// read. The 1 MiB is gitx's read cap (gitx.MaxOutputBytes); the text is part
+// of the API contract.
+const notRead = "(source larger than 1 MiB, not read)"
+
+// Build assembles the bundle. Items are emitted in a fixed order: test
+// failures, stack frames, diff hunks, then source of changed non-test files.
+func Build(failures []Failure, hunks []Hunk, readFile ReadFunc, lim Limits) []Item {
 	var items []Item
 	total := 0
-	add := func(it Item) {
+	// add appends it; cut marks an excerpt that is already incomplete, so it
+	// ends with truncMark even when it fits MaxExcerpt.
+	add := func(it Item, cut bool) {
 		// Title and File reach the model too. A path embedded in the title is
 		// swapped for its segment-redacted form so both stay consistent and
 		// usable; everything else in the title goes through Redact.
@@ -268,6 +278,8 @@ func Build(failures []Failure, hunks []Hunk, readFile func(string) (string, erro
 		it.Excerpt = Redact(it.Excerpt)
 		if len(it.Excerpt) > lim.MaxExcerpt {
 			it.Excerpt = it.Excerpt[:lim.MaxExcerpt] + truncMark
+		} else if cut {
+			it.Excerpt += truncMark
 		}
 		if total+len(it.Excerpt) > lim.MaxTotal {
 			return
@@ -279,7 +291,7 @@ func Build(failures []Failure, hunks []Hunk, readFile func(string) (string, erro
 
 	for _, f := range failures {
 		add(Item{Type: "test_failure", Title: "Failing test: " + f.Name, File: f.File,
-			LineStart: f.Line, LineEnd: f.Line, Excerpt: f.Name + "\n" + f.Message})
+			LineStart: f.Line, LineEnd: f.Line, Excerpt: f.Name + "\n" + f.Message}, false)
 	}
 
 	seen := map[string]bool{}
@@ -291,19 +303,28 @@ func Build(failures []Failure, hunks []Hunk, readFile func(string) (string, erro
 			}
 			seen[key] = true
 			it := Item{Type: "stack_frame", Title: key, File: fr.File}
-			if src, err := readFile(fr.File); err == nil {
+			if src, truncated, err := readFile(fr.File); err == nil {
 				lines := strings.Split(strings.ReplaceAll(src, "\r\n", "\n"), "\n")
-				if fr.Line >= 1 && fr.Line <= len(lines) {
+				if truncated {
+					// src ends after a complete line: what follows the last
+					// line break belongs to the line that was cut.
+					lines = lines[:len(lines)-1]
+				}
+				switch {
+				case fr.Line >= 1 && fr.Line <= len(lines):
 					lo, hi := max(1, fr.Line-2), min(len(lines), fr.Line+2)
 					it.LineStart, it.LineEnd = lo, hi
 					it.Excerpt = strings.Join(lines[lo-1:hi], "\n")
+				case truncated && fr.Line > len(lines):
+					it.LineStart, it.LineEnd = fr.Line, fr.Line
+					it.Excerpt = notRead
 				}
 			}
 			if it.Excerpt == "" {
 				it.LineStart, it.LineEnd = fr.Line, fr.Line
 				it.Excerpt = "(source not readable)"
 			}
-			add(it)
+			add(it, false)
 		}
 	}
 
@@ -315,7 +336,7 @@ func Build(failures []Failure, hunks []Hunk, readFile func(string) (string, erro
 			end = h.NewStart
 		}
 		add(Item{Type: "diff_hunk", Title: "Change in " + h.File, File: h.File,
-			LineStart: h.NewStart, LineEnd: max(end, h.NewStart), Excerpt: h.Text})
+			LineStart: h.NewStart, LineEnd: max(end, h.NewStart), Excerpt: h.Text}, false)
 		if !isChanged[h.File] {
 			isChanged[h.File] = true
 			changed = append(changed, h.File)
@@ -326,13 +347,17 @@ func Build(failures []Failure, hunks []Hunk, readFile func(string) (string, erro
 		if isTestFile(p) {
 			continue
 		}
-		src, err := readFile(p)
+		src, truncated, err := readFile(p)
 		if err != nil {
 			continue
 		}
 		src = strings.TrimRight(strings.ReplaceAll(src, "\r\n", "\n"), "\n")
-		n := strings.Count(src, "\n") + 1
-		add(Item{Type: "source", Title: "Current source of " + p, File: p, LineStart: 1, LineEnd: n, Excerpt: src})
+		it := Item{Type: "source", Title: "Current source of " + p, File: p, LineStart: 1, LineEnd: strings.Count(src, "\n") + 1, Excerpt: src}
+		if truncated && src == "" {
+			// Not one complete line fitted the read cap.
+			it.LineStart, it.LineEnd, it.Excerpt, truncated = 0, 0, notRead, false
+		}
+		add(it, truncated)
 	}
 	return items
 }
