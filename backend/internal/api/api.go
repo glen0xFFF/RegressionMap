@@ -155,10 +155,13 @@ type Server struct {
 	stopping bool          // Drain has begun
 	changed  chan struct{} // closed when active, runs or delivering shrinks; nil while nobody waits
 
-	// loadStoredHook is a test seam, nil in production. loadStored calls it
-	// after it has read the stored file and before it rewrites a stored
-	// "pending", so a test can end a delivery in between.
-	loadStoredHook func(id string)
+	// loadStoredRead is a test seam, nil in production. When it is set,
+	// loadStored calls it in place of s.store.Load to read the stored file,
+	// so a test can wrap the real read and hold it after the bytes are read
+	// and before it returns. Anything loadStored does after the read, such
+	// as the stored-"pending" rewrite, then runs after what the test did
+	// while the read was held (ending a delivery, say).
+	loadStoredRead func(id string) ([]byte, error)
 }
 
 type pendingNotify struct{ url, format string }
@@ -381,19 +384,24 @@ func (s *Server) loadStored(id string) (Analysis, bool) {
 	if s.store == nil || !store.ValidID(id) {
 		return Analysis{}, false
 	}
+	read := s.store.Load
+	if s.loadStoredRead != nil {
+		read = s.loadStoredRead
+	}
 	// The in-flight snapshot is taken before the file is read. deliver
 	// records the outcome before it leaves the in-flight set, so when the
 	// snapshot says not in flight, the read below already sees any outcome
-	// this process recorded.
+	// this process recorded. A snapshot taken at any point after the read
+	// could miss a delivery that ended after the read and turn the "pending"
+	// it read into "failed". TestGetWhileDeliveryEndsNeverShowsItInterrupted
+	// holds the read through loadStoredRead, after the bytes are read, until
+	// such a delivery has ended, so it fails for any such later snapshot.
 	s.mu.Lock()
 	_, inFlight := s.delivering[id]
 	s.mu.Unlock()
-	b, err := s.store.Load(id)
+	b, err := read(id)
 	if err != nil {
 		return Analysis{}, false
-	}
-	if s.loadStoredHook != nil {
-		s.loadStoredHook(id)
 	}
 	var a Analysis
 	if err := json.Unmarshal(b, &a); err != nil || a.ID != id {
