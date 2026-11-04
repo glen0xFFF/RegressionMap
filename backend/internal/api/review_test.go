@@ -362,25 +362,31 @@ func TestReviewRunsWhateverHypothesesReturn(t *testing.T) {
 	}
 }
 
-// While the review runs, GET shows the analysis running with its
-// hypotheses and review null.
+// While the review call or the check call runs, GET shows the analysis
+// running with its hypotheses and review null.
 func TestHypothesesShowWhileReviewRuns(t *testing.T) {
 	m := newChainModel(t)
 	_, srv, base := chainServer(t, m, nil)
-	release := m.hold(t, "ChangeReview")
+	releaseReview := m.hold(t, "ChangeReview")
+	releaseCheck := m.hold(t, "FindingChecks")
 	var a Analysis
 	if code := do(t, "POST", srv.URL+"/api/analyses", startBody("r1", base, "slow"), &a); code != 202 {
 		t.Fatalf("POST %d", code)
 	}
-	m.waitFor(t, "ChangeReview")
-	got := rawAnalysis(t, srv.URL, a.ID)
-	var mr struct{ Status string }
-	json.Unmarshal(got["model"], &mr)
-	if field(got, "status") != `"running"` || mr.Status != "ok" || field(got, "review") != "null" {
-		t.Fatalf("while the review runs: status %s, model %s, review %s; want running, ok model and null",
-			field(got, "status"), field(got, "model"), field(got, "review"))
+	for _, step := range []struct {
+		name    string
+		release func()
+	}{{"ChangeReview", releaseReview}, {"FindingChecks", releaseCheck}} {
+		m.waitFor(t, step.name)
+		got := rawAnalysis(t, srv.URL, a.ID)
+		var mr struct{ Status string }
+		json.Unmarshal(got["model"], &mr)
+		if field(got, "status") != `"running"` || mr.Status != "ok" || field(got, "review") != "null" {
+			t.Fatalf("while %s runs: status %s, model %s, review %s; want running, ok model and null",
+				step.name, field(got, "status"), field(got, "model"), field(got, "review"))
+		}
+		step.release()
 	}
-	release()
 	done := pollDone(t, srv.URL, a.ID)
 	if done.Status != "done" || done.Review == nil || done.Review.Status != "ok" || done.Review.CheckStatus != "ok" {
 		t.Fatalf("after the review: status %q review %+v", done.Status, done.Review)
