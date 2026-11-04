@@ -281,13 +281,19 @@ func newLogger(w io.Writer, format string) (*slog.Logger, error) {
 
 // escapeLogAttr applies escapeLogText to every string value the json
 // handler writes: attribute values of kind string, error values after
-// Error(), and the message (the built-in "msg" attribute). Other values are
-// left alone. ReplaceAttr runs outside the panic recovery the handler
-// applies when it writes a value, so when Error() panics (a typed-nil
-// pointer whose Error() reads its receiver, say), the panic is recovered
-// here and the attribute is returned unchanged. The handler then calls
-// Error() again and writes what it writes without escapeLogAttr: "<nil>"
-// for a nil pointer, otherwise "!PANIC: " and the panic value.
+// Error(), and the message (the built-in "msg" attribute). The handler
+// calls ReplaceAttr on each attribute inside a group and on the value a
+// LogValuer resolves to, so those strings are escaped too. Other values,
+// such as slices, maps and structs, are left alone. ReplaceAttr runs
+// outside the panic recovery the handler applies when it writes a value,
+// so when Error() panics (a typed-nil pointer whose Error() reads its
+// receiver, say), the panic is recovered here and the attribute is
+// returned unchanged. The handler then writes what it writes without
+// escapeLogAttr: "<nil>" for a nil pointer, otherwise "!PANIC: " and the
+// panic value, or, for an error that also implements json.Marshaler, its
+// json.Marshal output. Such a marshaler whose Error() text holds a
+// character to escape is written as that escaped text rather than its
+// json.Marshal output.
 func escapeLogAttr(_ []string, a slog.Attr) slog.Attr {
 	switch a.Value.Kind() {
 	case slog.KindString:
