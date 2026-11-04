@@ -101,21 +101,31 @@ type Analysis struct {
 	Evidence      []evidence.Item    `json:"evidence"`
 	Warnings      []string           `json:"warnings,omitempty"` // one sentence per input the server cut
 	Model         *model.Result      `json:"model"`
+	Review        *model.Review      `json:"review"` // null until the review chain has ended
 	Verifications []Verification     `json:"verifications"`
 	CreatedAt     string             `json:"created_at"`
 	FinishedAt    string             `json:"finished_at,omitempty"`
 	Notification  *Notification      `json:"notification"`
+
+	// A saved Review is replaced, never changed in place, so copies of the
+	// analysis may share it. reviewOwed is set with the evidence: from then
+	// on an analysis that ends owes a review. reviewDone is the latest
+	// outcome of the review chain, kept as soon as it exists; its CheckStatus
+	// is "" while the check runs. Neither is in the JSON or ever saved.
+	reviewOwed bool
+	reviewDone *model.Review
 }
 
 // Summary is one row of GET /api/analyses.
 type Summary struct {
-	ID            string `json:"id"`
-	Repo          string `json:"repo"`
-	Status        string `json:"status"`
-	Baseline      string `json:"baseline"`
-	Current       string `json:"current"`
-	CreatedAt     string `json:"created_at"`
-	CurrentPassed *bool  `json:"current_passed"`
+	ID            string              `json:"id"`
+	Repo          string              `json:"repo"`
+	Status        string              `json:"status"`
+	Baseline      string              `json:"baseline"`
+	Current       string              `json:"current"`
+	CreatedAt     string              `json:"created_at"`
+	CurrentPassed *bool               `json:"current_passed"`
+	ReviewCounts  *model.ReviewCounts `json:"review_counts"`
 }
 
 func (a *Analysis) summary() Summary {
@@ -123,6 +133,10 @@ func (a *Analysis) summary() Summary {
 	if a.CurrentRun != nil {
 		p := a.CurrentRun.Passed
 		s.CurrentPassed = &p
+	}
+	if a.Review != nil {
+		n := a.Review.Counts
+		s.ReviewCounts = &n
 	}
 	return s
 }
@@ -517,8 +531,10 @@ func (s *Server) progress(id string, f func(a *Analysis)) {
 
 // finish moves a running analysis to its final state and frees its repo and
 // global slots in the same critical section, so a client that sees the final
-// status can immediately start new work on that repo. It then starts the
-// completion notification, if one was requested, without waiting for it.
+// status can immediately start new work on that repo. An analysis that f
+// leaves without a review gets the one closeReview gives it, so the
+// notification carries it too. finish then starts the completion
+// notification, if one was requested, without waiting for it.
 func (s *Server) finish(id string, f func(a *Analysis)) {
 	var (
 		pn      pendingNotify
@@ -531,6 +547,9 @@ func (s *Server) finish(id string, f func(a *Analysis)) {
 			return false
 		}
 		f(a)
+		if a.Review == nil {
+			a.Review = s.closeReview(a)
+		}
 		a.FinishedAt = time.Now().UTC().Format(time.RFC3339)
 		if s.running[a.Repo] == id {
 			delete(s.running, a.Repo)
@@ -579,6 +598,16 @@ func payloadOf(a *Analysis) notify.Payload {
 				p.TopHypothesis = &notify.Hypothesis{Rank: top.Rank, Title: top.Title, File: top.File,
 					LineStart: top.LineStart, LineEnd: top.LineEnd, ConfidenceLabel: top.ConfidenceLabel}
 			}
+		}
+	}
+	// The review carries no detail, suggestion, reason, evidence or summary.
+	if rv := a.Review; rv != nil {
+		n := rv.Counts
+		p.Review = &notify.ReviewSummary{Status: rv.Status, Confirmed: n.Confirmed, Disputed: n.Disputed,
+			Refuted: n.Refuted, Unchecked: n.Unchecked}
+		if f := model.TopFinding(rv.Findings); f != nil {
+			p.Review.TopFinding = &notify.ReviewFinding{ID: f.ID, Lens: f.Lens, Severity: f.Severity, Title: f.Title,
+				File: f.File, LineStart: f.LineStart, LineEnd: f.LineEnd, Verdict: f.Check.Verdict}
 		}
 	}
 	return p
@@ -949,9 +978,25 @@ func (s *Server) run(ctx context.Context, id, dir string, cmd Command, base, cur
 	if cut {
 		warnings = append(warnings, "diff larger than 8 MiB: only the first 8 MiB were analysed")
 	}
+	// The commit messages of the change become commit items. A failure to
+	// list them is not fatal: the analysis goes on without them, and its
+	// cause goes to the log, because the warning does not name it.
+	var commits []evidence.CommitMessage
+	msgs, cut, err := commitMessages(ctx, dir, base, cur, maxCommitMessages)
+	if err != nil {
+		slog.Warn("commit messages could not be read", "analysis", id, "error", notify.StripControl(err.Error()))
+		warnings = append(warnings, warnCommitsUnread)
+	} else {
+		if cut {
+			warnings = append(warnings, warnCommitsCut)
+		}
+		for _, m := range msgs {
+			commits = append(commits, evidence.CommitMessage{SHA: m.SHA, Message: m.Message})
+		}
+	}
 	partial := map[string]bool{} // files read only in part
 	failures := evidence.ParseNodeTest(curRun.Stdout, curWT)
-	ev := evidence.Build(failures, evidence.ParseDiff(diff), func(p string) (string, bool, error) {
+	ev := evidence.BuildWithCommits(failures, evidence.ParseDiff(diff), commits, func(p string) (string, bool, error) {
 		src, cut, err := gitx.ShowFile(ctx, dir, cur, p)
 		if cut {
 			partial[p] = true
@@ -962,8 +1007,9 @@ func (s *Server) run(ctx context.Context, id, dir string, cmd Command, base, cur
 		warnings = append(warnings, fmt.Sprintf("%d file(s) larger than 1 MiB were read only in part", len(partial)))
 	}
 
+	// From here on an analysis that ends owes a review (closeReview).
 	s.progress(id, func(a *Analysis) {
-		a.ChangedFiles, a.Evidence, a.Warnings = files, ev, warnings
+		a.ChangedFiles, a.Evidence, a.Warnings, a.reviewOwed = files, ev, warnings, true
 	})
 
 	// The model gets the same path redaction as the evidence, so no secret
@@ -973,14 +1019,22 @@ func (s *Server) run(ctx context.Context, id, dir string, cmd Command, base, cur
 	for i, f := range files {
 		paths[i] = evidence.RedactPath(f.Path)
 	}
-	mr := s.cfg.Model.Analyze(ctx, model.Input{
+	in := model.Input{
 		Command: strings.Join(cmd.Argv, " "), BaselinePassed: baseRun.Passed, CurrentPassed: curRun.Passed,
 		CurrentExit: curRun.ExitCode, ChangedFiles: paths, Evidence: ev, Warnings: warnings,
-	})
+	}
+	mr := s.cfg.Model.Analyze(ctx, in)
 	if stop(nil) {
 		return
 	}
-	s.finish(id, func(a *Analysis) { a.Model, a.Status = &mr, "done" })
+	// The hypotheses are saved and shown while the review chain runs, with
+	// the analysis still running and its review null.
+	s.progress(id, func(a *Analysis) { a.Model = &mr })
+	rv := s.reviewChange(ctx, id, in)
+	if stop(nil) {
+		return
+	}
+	s.finish(id, func(a *Analysis) { a.Review, a.Status = &rv, "done" })
 }
 
 func (s *Server) get(w http.ResponseWriter, r *http.Request) {

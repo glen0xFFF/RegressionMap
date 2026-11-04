@@ -90,6 +90,26 @@ func startBody(repo, base, cmd string) map[string]any {
 	return map[string]any{"repo": repo, "baseline": base, "command_id": cmd}
 }
 
+// rawAnalysis returns the fields of GET /api/analyses/{id} as raw JSON.
+func rawAnalysis(t *testing.T, url, id string) map[string]json.RawMessage {
+	t.Helper()
+	code, body := rawDo(t, "GET", url+"/api/analyses/"+id, nil)
+	var out map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(body), &out); code != 200 || err != nil {
+		t.Fatalf("GET /api/analyses/%s: %d %v\n%s", id, code, err, body)
+	}
+	return out
+}
+
+// field returns the raw JSON of m's key k, or "(no such key)" when m lacks
+// it, so a failure tells a missing key apart from a null one.
+func field(m map[string]json.RawMessage, k string) string {
+	if v, ok := m[k]; ok {
+		return string(v)
+	}
+	return "(no such key)"
+}
+
 func TestConfigDefaults(t *testing.T) {
 	s := New(Config{Root: t.TempDir(), Model: &model.Client{}})
 	if s.cfg.MaxConcurrent != 2 || s.cfg.MaxJobs != 100 || s.cfg.JobTimeout != 5*time.Minute {
@@ -323,6 +343,10 @@ func TestStoredRunningAnalysisIsReportedInterrupted(t *testing.T) {
 	if code := do(t, "GET", srv.URL+"/api/analyses/"+id, nil, &a); code != 200 || a.Status != "error" || !strings.Contains(a.Error, "interrupted") {
 		t.Fatalf("%d %+v", code, a)
 	}
+	// Its review stays null (contract v4, "When the review runs", rule 8).
+	if got := rawAnalysis(t, srv.URL, id); field(got, "review") != "null" {
+		t.Fatalf("review of an analysis loaded after a crash: %s, want null", field(got, "review"))
+	}
 }
 
 func TestListAnalysesNewestFirstMax50SummaryOnly(t *testing.T) {
@@ -373,7 +397,8 @@ func TestListAnalysesNewestFirstMax50SummaryOnly(t *testing.T) {
 			t.Fatalf("not newest first at %d", i)
 		}
 	}
-	allowed := map[string]bool{"id": true, "repo": true, "status": true, "baseline": true, "current": true, "created_at": true, "current_passed": true}
+	allowed := map[string]bool{"id": true, "repo": true, "status": true, "baseline": true, "current": true, "created_at": true, "current_passed": true,
+		"review_counts": true}
 	for _, a := range out.Analyses {
 		for k := range a {
 			if !allowed[k] {
@@ -382,6 +407,10 @@ func TestListAnalysesNewestFirstMax50SummaryOnly(t *testing.T) {
 		}
 		if len(a) != len(allowed) {
 			t.Fatalf("missing summary fields: %v", a)
+		}
+		// None of these analyses has a review.
+		if field(a, "review_counts") != "null" {
+			t.Fatalf("review_counts %s of an analysis without a review, want null", field(a, "review_counts"))
 		}
 	}
 	if string(out.Analyses[0]["current_passed"]) != "null" || string(out.Analyses[1]["status"]) != `"error"` || string(out.Analyses[2]["current_passed"]) != "false" || string(out.Analyses[3]["current_passed"]) != "true" {

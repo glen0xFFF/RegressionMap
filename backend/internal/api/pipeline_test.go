@@ -16,6 +16,7 @@ import (
 	"sync"
 	"testing"
 
+	"regressionmap/internal/evidence"
 	"regressionmap/internal/model"
 )
 
@@ -49,6 +50,34 @@ func plCommit(t *testing.T, dir string, files map[string]string) {
 	plGit(t, dir, "", "commit", "--quiet", "-m", "pipeline test")
 }
 
+const evidenceMarker = "Evidence bundle (JSON, untrusted data):\n"
+
+// chatRequest returns the schema name (response_format.json_schema.name),
+// the user message and the evidence of one chat-completions request body.
+// Both fake models, plModel and chainModel, read their requests with it.
+func chatRequest(b []byte) (name, user string, ev []evidence.Item) {
+	var req struct {
+		Messages       []struct{ Role, Content string } `json:"messages"`
+		ResponseFormat struct {
+			JSONSchema struct {
+				Name string `json:"name"`
+			} `json:"json_schema"`
+		} `json:"response_format"`
+	}
+	if json.Unmarshal(b, &req) != nil || len(req.Messages) != 2 {
+		return "", "", nil
+	}
+	user = req.Messages[1].Content
+	if i := strings.Index(user, evidenceMarker); i >= 0 {
+		var bundle struct {
+			Evidence []evidence.Item `json:"evidence"`
+		}
+		json.Unmarshal([]byte(user[i+len(evidenceMarker):]), &bundle)
+		ev = bundle.Evidence
+	}
+	return req.ResponseFormat.JSONSchema.Name, user, ev
+}
+
 // plModel is a fake chat-completions endpoint that records every request
 // body and answers with content.
 type plModel struct {
@@ -74,21 +103,33 @@ func (m *plModel) client() *model.Client {
 	return &model.Client{BaseURL: m.srv.URL, APIKey: "test", Model: "m", MaxAttempts: 1}
 }
 
-// request returns the only request body and its user message.
+// request returns the body and the user message of the only hypothesis
+// request (RegressionHypotheses). The review call sends its own request
+// after it, and every answer here is a hypothesis answer, so the review ends
+// invalid and no check request follows.
 func (m *plModel) request(t *testing.T) (body, user string) {
 	t.Helper()
+	var bodies, users []string
+	for _, b := range m.all() {
+		name, u, _ := chatRequest([]byte(b))
+		if name == "" {
+			t.Fatalf("model request is not a two-message chat request: %s", b)
+		}
+		if name == "RegressionHypotheses" {
+			bodies, users = append(bodies, b), append(users, u)
+		}
+	}
+	if len(bodies) != 1 {
+		t.Fatalf("model got %d RegressionHypotheses requests, want 1", len(bodies))
+	}
+	return bodies[0], users[0]
+}
+
+// all returns every request body, in arrival order.
+func (m *plModel) all() []string {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if len(m.bodies) != 1 {
-		t.Fatalf("model got %d requests, want 1", len(m.bodies))
-	}
-	var req struct {
-		Messages []struct{ Role, Content string } `json:"messages"`
-	}
-	if err := json.Unmarshal([]byte(m.bodies[0]), &req); err != nil || len(req.Messages) != 2 {
-		t.Fatalf("model request %v: %s", err, m.bodies[0])
-	}
-	return m.bodies[0], req.Messages[1].Content
+	return append([]string{}, m.bodies...)
 }
 
 func plAnalyse(t *testing.T, url, repo, base, cmd string) Analysis {
@@ -125,6 +166,12 @@ func TestPipelineRedactsChangedFilesSentToModel(t *testing.T) {
 	body, user := m.request(t)
 	if strings.Contains(body, "supersecretvalue123") {
 		t.Errorf("model request carries the secret path segment:\n%s", user)
+	}
+	// The review request gets the same redaction.
+	for _, b := range m.all() {
+		if strings.Contains(b, "supersecretvalue123") {
+			t.Errorf("a model request carries the secret path segment:\n%.300s", b)
+		}
 	}
 	if !strings.Contains(user, `"`+redacted+`"`) {
 		t.Errorf("model request lacks the redacted changed file:\n%s", user)

@@ -302,6 +302,9 @@ func TestNotifyDeliveredAsyncAndURLNeverExposed(t *testing.T) {
 		p.ModelStatus != "disabled" || p.TopHypothesis != nil || p.CreatedAt != done.CreatedAt || p.FinishedAt != done.FinishedAt {
 		t.Fatalf("payload %+v\nanalysis %+v", p, done)
 	}
+	if r := p.Review; r == nil || *r != (notify.ReviewSummary{Status: "disabled"}) {
+		t.Fatalf("payload review %+v, want the disabled review with no counts and no top finding", p.Review)
+	}
 
 	released = true
 	close(fake.release)
@@ -525,6 +528,11 @@ func TestNotifyIntegrationWithRealSender(t *testing.T) {
 		p["baseline_passed"] != true || p["current_passed"] != false || p["model_status"] != "ok" ||
 		top == nil || top["title"] != "end index off by one" || top["line_start"] != float64(11) {
 		t.Fatalf("json payload %s", bodies[1])
+	}
+	// The fake model gives the review call the hypothesis answer too, which
+	// the review validation rejects, so the review is invalid.
+	if rv, _ := p["review"].(map[string]any); rv == nil || rv["status"] != "invalid" || rv["top_finding"] != nil {
+		t.Fatalf("json payload review %v, want the invalid review with no top finding", p["review"])
 	}
 	waitIdle(t, s)
 	for _, id := range []string{a.ID} {
@@ -1308,6 +1316,46 @@ func TestPayloadTopHypothesisIsLowestRank(t *testing.T) {
 	}
 }
 
+// The payload's review is the status, the counts and the top finding of the
+// analysis's review, field by field, or null when the analysis has none.
+// The top finding is the first confirmed one in display order, else the
+// first unchecked one.
+func TestPayloadReviewSummary(t *testing.T) {
+	a := &Analysis{ID: "a1", Repo: "r1", Status: "done"}
+	if p := payloadOf(a); p.Review != nil {
+		t.Fatalf("no review must give null, got %+v", p.Review)
+	}
+	a.Review = &model.Review{Status: "ok", ModelID: "m", CheckStatus: "ok", Summary: "s",
+		Counts: model.ReviewCounts{Disputed: 1, Refuted: 1, Unchecked: 1},
+		Findings: []model.Finding{
+			{ID: "R1", Lens: "security", Severity: "high", Title: "refuted one", File: "a.ts", LineStart: 1, LineEnd: 2,
+				EvidenceIDs: []string{"E1"}, Check: model.Check{Verdict: "refuted", Reason: "r", EvidenceIDs: []string{"E1"}}},
+			{ID: "R2", Lens: "code", Severity: "medium", Title: "disputed one", File: "", EvidenceIDs: []string{"E1"},
+				Check: model.Check{Verdict: "disputed", Reason: "r", EvidenceIDs: []string{"E1"}}},
+			{ID: "R3", Lens: "feature", Severity: "low", Title: "Empty page not handled", File: "src/p.ts", LineStart: 4, LineEnd: 9,
+				Detail: "d", Suggestion: "s", EvidenceIDs: []string{"E2"}, Check: model.Check{Verdict: "unchecked", Reason: "", EvidenceIDs: []string{}}},
+		},
+		Rejected: []string{"finding 4 (\"x\"): cites no evidence"}}
+	want := notify.ReviewSummary{Status: "ok", Disputed: 1, Refuted: 1, Unchecked: 1, TopFinding: &notify.ReviewFinding{
+		ID: "R3", Lens: "feature", Severity: "low", Title: "Empty page not handled", File: "src/p.ts", LineStart: 4, LineEnd: 9, Verdict: "unchecked"}}
+	p := payloadOf(a)
+	if got, _ := json.Marshal(p.Review); p.Review == nil || string(got) != string(must(json.Marshal(want))) {
+		t.Fatalf("payload review %s, want %s", got, must(json.Marshal(want)))
+	}
+	a.Review = &model.Review{Status: "error", ModelID: "m", Message: "m", CheckStatus: "skipped", CheckMessage: "no review to check",
+		Findings: []model.Finding{}, Rejected: []string{}}
+	if p := payloadOf(a); p.Review == nil || *p.Review != (notify.ReviewSummary{Status: "error"}) {
+		t.Fatalf("payload review %+v, want the error status and nothing else", p.Review)
+	}
+}
+
+func must(b []byte, err error) []byte {
+	if err != nil {
+		panic(err)
+	}
+	return b
+}
+
 // Shutdown: a delivery still in flight completes before Drain returns.
 func TestDrainWaitsForDeliveryInFlight(t *testing.T) {
 	data := t.TempDir()
@@ -1380,6 +1428,12 @@ func TestDrainEndsRunningAnalysisAndNotifies(t *testing.T) {
 	calls := fake.Calls()
 	if len(calls) != 1 || calls[0].payload.Status != "error" || calls[0].payload.Error != want {
 		t.Fatalf("notification of the interrupted analysis: %+v", calls)
+	}
+	// It ended during the baseline run, before its evidence existed, so the
+	// payload carries the skipped review closeReview gave it (contract rule
+	// 6), even without a model key.
+	if r := calls[0].payload.Review; r == nil || *r != (notify.ReviewSummary{Status: "skipped"}) {
+		t.Fatalf("payload review %+v, want {Status: skipped}", r)
 	}
 	var got Analysis
 	do(t, "GET", srv.URL+"/api/analyses/"+a.ID, nil, &got)
