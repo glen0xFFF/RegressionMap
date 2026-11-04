@@ -262,6 +262,11 @@ func TestValidateReviewRejections(t *testing.T) {
 		{"no ids", one(with("evidence_ids", []string{})), `finding 1 ("t"): cites no evidence`},
 		{"unknown id", one(with("evidence_ids", []string{"E99"})), `finding 1 ("t"): cites unknown evidence id E99`},
 		{"only a test failure", one(with("evidence_ids", []string{"E1"})), `finding 1 ("t"): cites no diff_hunk or source evidence`},
+		// A commit message can steer the review: it never stands as the
+		// evidence of a finding on its own.
+		{"only a commit", one(with("evidence_ids", []string{"E5"})), `finding 1 ("t"): cites no diff_hunk or source evidence`},
+		{"only a commit, no file", one(finding("feature", "high", "", 0, 0, "E5")), `finding 1 ("t"): cites no diff_hunk or source evidence`},
+		{"a commit and a test failure", one(with("evidence_ids", []string{"E5", "E1"})), `finding 1 ("t"): cites no diff_hunk or source evidence`},
 		{"range without file", one(finding("code", "high", "", 3, 4, "E2")), `finding 1 ("t"): has a line range but no file`},
 		{"traversal", one(with("file", "../x")), `finding 1 ("t"): invalid file path "../x"`},
 		{"file not in evidence", one(with("file", "src/other.ts")), `finding 1 ("t"): file src/other.ts is not in the evidence`},
