@@ -532,9 +532,9 @@ export function defineCases(runner) {
         'Lenses: security 1, code 0, feature 1. Verdicts: 0 confirmed, 2 unchecked, 0 disputed, 0 refuted.',
         checkLine,
         '',
-        '- R1 [security · high · unchecked] **Token compared with ==** — `src/auth.ts:12` — evidence: E3',
+        '- R1 [security · high · Not checked] **Token compared with ==** — `src/auth.ts:12` — evidence: E3',
         '  Timing leak in the token check.',
-        '- R2 [feature · low · unchecked] **Empty page not handled** — evidence: none',
+        '- R2 [feature · low · Not checked] **Empty page not handled** — evidence: none',
         ...tail(0, 0),
       ];
       const counts = { ...zero, unchecked: 2 };
@@ -619,7 +619,7 @@ export function defineCases(runner) {
           reviewSection([
             'Lenses: security 1, code 0, feature 0. Verdicts: 1 confirmed, 0 unchecked, 0 disputed, 0 refuted.',
             '',
-            '- R1 [security · high · confirmed] **Token compared with ==** — `src/auth.ts:12` — evidence: E3',
+            '- R1 [security · high · Confirmed by Muse check] **Token compared with ==** — `src/auth.ts:12` — evidence: E3',
             '  Timing leak in the token check.',
             '  Muse check: E3 shows a plain == comparison.',
             ...tail(0, 0),
@@ -677,7 +677,7 @@ export function defineCases(runner) {
         await withServer({ gets: [done({ ...over, review: rv })] }, async (srv) => {
           const r = await runner.run({ url: srv.url });
           eq(r.code, code, r.debug);
-          has(r.stdout, '\n- R1 [security · high · confirmed] **Token compared with ==** — `src/auth.ts:12` — evidence: E3\n', r.debug);
+          has(r.stdout, '\n- R1 [security · high · Confirmed by Muse check] **Token compared with ==** — `src/auth.ts:12` — evidence: E3\n', r.debug);
         });
       }
     });

@@ -293,7 +293,9 @@ func cutExcerpt(s string, n int) string {
 // buildCommitItems turns commits, newest first, into commit items without
 // ids, and returns them with the bytes of their excerpts. It stops at the
 // first commit whose excerpt would bring the excerpts above limit, and
-// leaves that commit and every older one out.
+// leaves that commit and every older one out. The whole message is redacted
+// before the title takes its first line, so a secret that starts on that
+// line and ends on a later one is gone from the title too.
 func buildCommitItems(commits []CommitMessage, limit int) ([]Item, int) {
 	items := []Item{}
 	total := 0
@@ -301,10 +303,10 @@ func buildCommitItems(commits []CommitMessage, limit int) ([]Item, int) {
 		if i == maxCommits {
 			break
 		}
-		msg := strings.TrimRightFunc(c.Message, unicode.IsSpace)
+		msg := Redact(strings.TrimRightFunc(c.Message, unicode.IsSpace))
 		subject, _, _ := strings.Cut(msg, "\n")
 		subject = strings.TrimSuffix(subject, "\r")
-		excerpt := cutExcerpt(Redact(msg), maxCommitExcerpt)
+		excerpt := cutExcerpt(msg, maxCommitExcerpt)
 		if total+len(excerpt) > limit {
 			break
 		}

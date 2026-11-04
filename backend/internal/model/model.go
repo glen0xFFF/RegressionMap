@@ -268,8 +268,12 @@ func (c *Client) Analyze(ctx context.Context, in Input) Result {
 // post sends the chat-completions request, retrying on HTTP 429/500/502/503/504
 // and on transport errors with exponential backoff and full jitter (or the
 // server's Retry-After, capped by BackoffCap). Other statuses and context
-// cancellation end the loop at once. On failure it returns a key-free message
-// that states how many attempts were made.
+// cancellation end the loop at once. A response body that cannot be read to
+// the end is a failed request, never an answer: when the deadline or a
+// cancellation ended the read it ends the loop as a request that got no
+// response does, and any other read error is retried as a transport error.
+// On failure it returns a key-free message that states how many attempts
+// were made.
 func (c *Client) post(ctx context.Context, body []byte) ([]byte, string) {
 	hc := c.HTTP
 	if hc == nil {
@@ -286,18 +290,20 @@ func (c *Client) post(ctx context.Context, body []byte) ([]byte, string) {
 		req.Header.Set("Authorization", "Bearer "+c.APIKey)
 		req.Header.Set("Content-Type", "application/json")
 		resp, err := hc.Do(req)
+		var raw []byte
+		if err == nil {
+			raw, err = io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+			resp.Body.Close()
+		}
 		if err != nil {
 			if ctx.Err() != nil {
 				return nil, c.stopped(ctx, attempt)
 			}
 			failure = fmt.Sprintf("model request failed after %s: %s", attempts(attempt), scrub(err.Error(), c.APIKey))
 			wait = c.backoff(attempt)
+		} else if resp.StatusCode == http.StatusOK {
+			return raw, ""
 		} else {
-			raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-			resp.Body.Close()
-			if resp.StatusCode == http.StatusOK {
-				return raw, ""
-			}
 			failure = fmt.Sprintf("model API returned HTTP %d after %s: %s", resp.StatusCode, attempts(attempt), apiMessage(raw, c.APIKey))
 			if !retryableStatus(resp.StatusCode) {
 				return nil, failure

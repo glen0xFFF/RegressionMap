@@ -346,6 +346,11 @@ function Is-Exactly($v, [string]$want) {
 function With-Verdict($fs, [string]$v) {
   return , @(foreach ($f in $fs) { if (Is-Exactly (P (O (P $f 'check')) 'verdict') $v) { $f } })
 }
+# Each finding in $fs with $label, the contract label of the verdict it
+# matched exactly, so no model text reaches the verdict slot.
+function With-Label($fs, [string]$label) {
+  return , @(foreach ($f in $fs) { [pscustomobject]@{ Finding = $f; Label = $label } })
+}
 function Count-Lens($fs, [string]$x) {
   $c = 0
   foreach ($f in $fs) { if (Is-Exactly (P $f 'lens') $x) { $c++ } }
@@ -444,12 +449,14 @@ if ($rv) {
       $o.Add($line)
     }
     $o.Add('')
-    $shown = @($confirmed) + @($unchecked) + @($disputed)
+    $shown = (With-Label $confirmed 'Confirmed by Muse check') + (With-Label $unchecked 'Not checked') +
+             (With-Label $disputed 'Disputed by Muse check')
     if ($shown.Count -eq 0) { $o.Add('No confirmed, unchecked or disputed findings.') }
-    foreach ($f in $shown) {
+    foreach ($s in $shown) {
+      $f = $s.Finding
       $chk = O (P $f 'check')
       $line = '- ' + (Md-Text (P $f 'id') 12) + ' [' + (Md-Text (P $f 'lens') 12) + " $Dot " + (Md-Text (P $f 'severity') 12) +
-              " $Dot " + (Md-Text (P $chk 'verdict') 12) + '] **' + (Md-Text (P $f 'title') 200) + '**'
+              " $Dot " + $s.Label + '] **' + (Md-Text (P $f 'title') 200) + '**'
       $l = Loc $f
       if ($l) { $line += " $Dash " + $l }
       $ev = Ids (P $f 'evidence_ids'); if (-not $ev) { $ev = 'none' }

@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 	"unicode/utf8"
 
 	"regressionmap/internal/evidence"
@@ -889,6 +890,49 @@ func TestEndCheckAndValidateChecksCopyEvidenceIDs(t *testing.T) {
 	if after, _ := json.Marshal(rv); string(after) != string(before) {
 		t.Fatalf("a change to the ValidateChecks result reached its input:\nbefore %s\nafter  %s", before, after)
 	}
+}
+
+// A review or check answer that the deadline cuts off ends as the timeout of
+// a request that got no response, so the deadline rules of the contract
+// apply (corrections of record to v4, entry 3).
+func TestReviewAndCheckCutOffResponseTimesOut(t *testing.T) {
+	rv := owed(t, three()[:2]...)
+	var n atomic.Int32
+	s := cutOffServer(t, &n)
+	c := retryClient(s.URL, &fakeSleeper{})
+	c.Timeout = 300 * time.Millisecond
+	got := c.Review(context.Background(), Input{Evidence: evR})
+	if got.Status != "error" || got.Message != "model request timed out after 1 attempt" ||
+		got.CheckStatus != "skipped" || got.CheckMessage != "no review to check" || len(got.Findings) != 0 {
+		t.Errorf("review: got %+v", got)
+	}
+	out := c.Check(context.Background(), Input{Evidence: evR}, rv)
+	if out.Status != "ok" || out.CheckStatus != "error" || out.CheckMessage != "model request timed out after 1 attempt" ||
+		len(out.Findings) != 2 || out.Counts != (ReviewCounts{Unchecked: 2}) {
+		t.Fatalf("check: got %+v", out)
+	}
+	allUnchecked(t, out.Findings)
+	if n.Load() != 2 {
+		t.Fatalf("%d requests, want 1 per call", n.Load())
+	}
+}
+
+// A review or check answer whose body cannot be read to the end for another
+// reason is retried like a transport error, and the call ends as an error.
+func TestReviewAndCheckShortResponseBodyIsRetried(t *testing.T) {
+	rv := owed(t, three()[:2]...)
+	var n atomic.Int32
+	s := shortBodyServer(t, &n, 1000)
+	c := retryClient(s.URL, &fakeSleeper{})
+	got := c.Review(context.Background(), Input{Evidence: evR})
+	if got.Status != "error" || !strings.HasPrefix(got.Message, "model request failed after 3 attempts: ") || n.Load() != 3 {
+		t.Errorf("review: %d requests, got %+v", n.Load(), got)
+	}
+	out := c.Check(context.Background(), Input{Evidence: evR}, rv)
+	if out.CheckStatus != "error" || !strings.HasPrefix(out.CheckMessage, "model request failed after 3 attempts: ") || n.Load() != 6 {
+		t.Fatalf("check: %d requests, got %+v", n.Load(), out)
+	}
+	allUnchecked(t, out.Findings)
 }
 
 func TestReviewErrorDoesNotLeakKey(t *testing.T) {

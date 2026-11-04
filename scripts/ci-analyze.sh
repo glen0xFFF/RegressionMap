@@ -285,11 +285,18 @@ if (cmd === 'request') {
         o.push('Muse check not available: ' + rv.check_status + (cm ? ' — ' + cm : ''));
       }
       o.push('');
-      const shown = [...verdict('confirmed'), ...verdict('unchecked'), ...verdict('disputed')];
+      // Each listed finding goes with the contract label of the verdict it
+      // matched exactly, so no model text reaches the verdict slot.
+      const withLabel = (fs, label) => fs.map((f) => ({ f, label }));
+      const shown = [
+        ...withLabel(verdict('confirmed'), 'Confirmed by Muse check'),
+        ...withLabel(verdict('unchecked'), 'Not checked'),
+        ...withLabel(verdict('disputed'), 'Disputed by Muse check'),
+      ];
       if (shown.length === 0) o.push('No confirmed, unchecked or disputed findings.');
-      for (const f of shown) {
+      for (const { f, label } of shown) {
         let line = '- ' + md(f.id, 12) + ' [' + md(f.lens, 12) + ' · ' + md(f.severity, 12) + ' · ' +
-          md(check(f).verdict, 12) + '] **' + md(f.title, 200) + '**';
+          label + '] **' + md(f.title, 200) + '**';
         const l = loc(f);
         if (l) line += ' — ' + l;
         line += ' — evidence: ' + (ids(f.evidence_ids) || 'none');

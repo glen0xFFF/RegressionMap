@@ -427,6 +427,51 @@ func TestCommitItemsAreRedacted(t *testing.T) {
 	}
 }
 
+// A private key that starts on the first line of the message and ends on a
+// later one is redacted in the whole message before the title takes that
+// line, so no key bytes reach the title (contract, corrections of record to
+// v4, entry 2).
+func TestCommitTitleDropsASecretThatEndsOnALaterLine(t *testing.T) {
+	begin := func(kind string) string { return "-----BEGIN " + kind + "PRIVATE KEY-----" }
+	end := func(kind string) string { return "-----END " + kind + "PRIVATE KEY-----" }
+	keyBytes := []string{"MIIEpAIBAAKCAQEAfirstKEYline", "secondKEYlineQ29uZmlkZW50aWFs", "lastKEYlineAAAA"}
+	cases := []struct {
+		name, msg, title, excerpt string
+	}{
+		{
+			name: "header joined to key bytes",
+			msg: begin("RSA ") + keyBytes[0] + "\n" + keyBytes[1] + "\n" + keyBytes[2] + "\n" + end("RSA ") +
+				"\n\nrotate the deploy key\n",
+			title:   "commit 0000001: [REDACTED]",
+			excerpt: "[REDACTED]\n\nrotate the deploy key",
+		},
+		{
+			name: "key after subject text",
+			msg: "add the deploy key " + begin("OPENSSH ") + keyBytes[0] + "\r\n" + keyBytes[1] + "\r\n" + keyBytes[2] + end("OPENSSH ") +
+				" to the fixtures\r\n\r\nbody line\r\n",
+			title:   "commit 0000001: add the deploy key [REDACTED] to the fixtures",
+			excerpt: "add the deploy key [REDACTED] to the fixtures\r\n\r\nbody line",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			ev := BuildWithCommits(nil, nil, []CommitMessage{{SHA: testSHA(1), Message: c.msg}}, fakeRead(nil), Limits{MaxExcerpt: 2000, MaxTotal: 50000})
+			if len(ev) != 1 {
+				t.Fatalf("want 1 item, got %+v", ev)
+			}
+			it := ev[0]
+			for _, leak := range append([]string{"PRIVATE KEY"}, keyBytes...) {
+				if strings.Contains(it.Title, leak) || strings.Contains(it.Excerpt, leak) {
+					t.Errorf("leaked %q: title %q, excerpt %q", leak, it.Title, it.Excerpt)
+				}
+			}
+			if it.Title != c.title || it.Excerpt != c.excerpt {
+				t.Errorf("title %q, excerpt %q; want %q and %q", it.Title, it.Excerpt, c.title, c.excerpt)
+			}
+		})
+	}
+}
+
 func TestCommitTitleIsCapped(t *testing.T) {
 	const mark = "…[truncated]"
 	msg := strings.Repeat("s", 300) + "\n\nbody"
