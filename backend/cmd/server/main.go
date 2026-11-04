@@ -28,7 +28,9 @@
 //	server keys list
 //	server keys revoke ID
 //
-// SIGINT/SIGTERM trigger a graceful shutdown (10s).
+// SIGINT/SIGTERM trigger a graceful shutdown: up to 10s for open requests,
+// then running analyses end as error and up to 25s more for completion
+// notifications still being sent.
 package main
 
 import (
@@ -91,6 +93,9 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	// internal/api and the log package write through lg, so with
+	// LOG_FORMAT=json every line is JSON.
+	slog.SetDefault(lg)
 
 	h, apiSrv, err := buildHandler(cfg, lg)
 	if err != nil {
@@ -108,5 +113,5 @@ func run() error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	return serve(ctx, newServer(cfg.Addr, h), ln, lg)
+	return serveAndDrain(ctx, newServer(cfg.Addr, h), ln, lg, apiSrv)
 }
