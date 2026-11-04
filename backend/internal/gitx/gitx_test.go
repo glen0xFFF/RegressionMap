@@ -281,6 +281,141 @@ func TestCommitsOverCapIsError(t *testing.T) {
 	}
 }
 
+// gitT runs git in dir for a test, with a fixed identity and no signing.
+func gitT(t *testing.T, dir, stdin string, args ...string) string {
+	t.Helper()
+	cmd := exec.Command("git", append([]string{"-C", dir, "-c", "user.name=t", "-c", "user.email=t@example.com", "-c", "commit.gpgsign=false"}, args...)...)
+	cmd.Stdin = strings.NewReader(stdin)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %v: %v\n%s", args, err, out)
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// msgRepo builds a repository with one empty commit per message, oldest
+// first, each stored verbatim. It returns the shas in the same order.
+func msgRepo(t *testing.T, msgs ...string) (string, []string) {
+	t.Helper()
+	dir := t.TempDir()
+	gitT(t, dir, "", "init", "--quiet")
+	shas := []string{}
+	for _, m := range msgs {
+		gitT(t, dir, m, "commit", "--quiet", "--allow-empty", "--cleanup=verbatim", "-F", "-")
+		shas = append(shas, gitT(t, dir, "", "rev-parse", "HEAD"))
+	}
+	return dir, shas
+}
+
+func TestCommitMessagesNewestFirst(t *testing.T) {
+	dir, s := repo(t)
+	got, truncated, err := CommitMessages(context.Background(), dir, s.Baseline, s.Bug, 10)
+	want := []CommitMessage{
+		{SHA: s.Bug, Message: "refactor: clarify page end index"},
+		{SHA: s.Refactor, Message: "feat: collapse whitespace in titles"},
+	}
+	if err != nil || truncated || len(got) != len(want) {
+		t.Fatalf("got %+v truncated=%v err=%v, want %+v", got, truncated, err, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("item %d = %+v, want %+v", i, got[i], want[i])
+		}
+	}
+}
+
+// The message comes back byte for byte: control characters, a line that
+// looks like a sha and a literal %H are message text, not record breaks.
+func TestCommitMessagesKeepsBodies(t *testing.T) {
+	msg := "subj\n\nbody line 1\nbody \x1f\x1e line 2\n0123456789012345678901234567890123456789\n%H\n"
+	dir, shas := msgRepo(t, "base\n", msg)
+	got, truncated, err := CommitMessages(context.Background(), dir, shas[0], shas[1], 10)
+	if err != nil || truncated || len(got) != 1 {
+		t.Fatalf("got %+v truncated=%v err=%v, want one commit", got, truncated, err)
+	}
+	if want := strings.TrimSuffix(msg, "\n"); got[0].SHA != shas[1] || got[0].Message != want {
+		t.Fatalf("got %q %q, want %q %q", got[0].SHA, got[0].Message, shas[1], want)
+	}
+}
+
+func TestCommitMessagesLimit(t *testing.T) {
+	dir, s := repo(t)
+	got, truncated, err := CommitMessages(context.Background(), dir, s.Baseline, s.Bug, 1)
+	if err != nil || truncated || len(got) != 1 || got[0].SHA != s.Bug {
+		t.Fatalf("got %+v truncated=%v err=%v, want only the Bug commit", got, truncated, err)
+	}
+}
+
+func TestCommitMessagesEmptyRange(t *testing.T) {
+	dir, s := repo(t)
+	got, truncated, err := CommitMessages(context.Background(), dir, s.Bug, s.Bug, 10)
+	if err != nil || truncated || got == nil || len(got) != 0 {
+		t.Fatalf("got %#v truncated=%v err=%v, want a non-nil empty slice", got, truncated, err)
+	}
+}
+
+// A baseline that is not an ancestor of HEAD (here: after it) gives the
+// commits HEAD has and the baseline has not, which is none. No error.
+func TestCommitMessagesBaselineAfterHead(t *testing.T) {
+	dir, s := repo(t)
+	got, truncated, err := CommitMessages(context.Background(), dir, s.Bug, s.Baseline, 10)
+	if err != nil || truncated || got == nil || len(got) != 0 {
+		t.Fatalf("got %#v truncated=%v err=%v, want an empty slice and no error", got, truncated, err)
+	}
+}
+
+// The directory is not a repository: an error from git would name git, so
+// the requireSHA error shows that no git ran.
+func TestCommitMessagesRejectsNonSHA(t *testing.T) {
+	dir := t.TempDir()
+	sha := strings.Repeat("a", 40)
+	got, _, err := CommitMessages(context.Background(), dir, "HEAD", sha, 10)
+	if err == nil || got != nil || !strings.Contains(err.Error(), "is not a resolved commit id") {
+		t.Fatalf("got %v err=%v, want the requireSHA error", got, err)
+	}
+}
+
+func TestCommitMessagesOverCapDropsCutCommit(t *testing.T) {
+	big := strings.Repeat("0123456789abcde\n", 256) // 4 KiB
+	dir, shas := msgRepo(t, "base\n", big, "small\n")
+	ctx := context.Background()
+	all, truncated, err := CommitMessages(ctx, dir, shas[0], shas[2], 10)
+	if err != nil || truncated || len(all) != 2 {
+		t.Fatalf("uncapped: %d commits truncated=%v err=%v, want 2 false nil", len(all), truncated, err)
+	}
+	lowerCap(t, 2048)
+	got, truncated, err := CommitMessages(ctx, dir, shas[0], shas[2], 10)
+	if err != nil || !truncated || len(got) != 1 || got[0].SHA != shas[2] || got[0].Message != "small" {
+		t.Fatalf("got %+v truncated=%v err=%v, want only the small commit and true", got, truncated, err)
+	}
+}
+
+// Every record git wrote whole within the cap is kept, wherever the cap
+// cuts the next one, even inside its sha line; output of exactly the cap
+// is complete. A record is "<sha>\n<message>\n" and a NUL.
+func TestCommitMessagesKeepsEveryWholeRecordUnderTheCap(t *testing.T) {
+	dir, s := repo(t)
+	ctx := context.Background()
+	first := 41 + len("refactor: clarify page end index") + 2
+	total := first + 41 + len("feat: collapse whitespace in titles") + 2
+	for _, c := range []struct {
+		limit     int
+		n         int
+		truncated bool
+	}{
+		{total, 2, false},
+		{first + 20, 1, true}, // inside the second sha line
+		{first, 1, true},      // right after the first record
+		{first - 1, 0, true},  // the NUL of the first record is cut
+	} {
+		lowerCap(t, c.limit)
+		got, truncated, err := CommitMessages(ctx, dir, s.Baseline, s.Bug, 10)
+		if err != nil || truncated != c.truncated || len(got) != c.n || (c.n > 0 && got[0].SHA != s.Bug) {
+			t.Errorf("cap %d: got %+v truncated=%v err=%v, want %d commits and %v", c.limit, got, truncated, err, c.n, c.truncated)
+		}
+	}
+}
+
 func TestCappedBufferBoundsStderr(t *testing.T) {
 	b := &capBuf{max: 8}
 	n, err := b.Write([]byte("0123456789abcdef"))

@@ -462,7 +462,7 @@ func TestJSONDeliverySignedAndExact(t *testing.T) {
 		`"baseline":"` + strings.Repeat("b", 40) + `","current":"` + strings.Repeat("c", 40) + `",` +
 		`"baseline_passed":true,"current_passed":false,"model_status":"ok",` +
 		`"top_hypothesis":{"rank":1,"title":"end index off by one","file":"src/pagination.ts","line_start":7,"line_end":13,"confidence_label":"high"},` +
-		`"created_at":"2026-11-04T10:00:00Z","finished_at":"2026-11-04T10:01:00Z"}`
+		`"created_at":"2026-11-04T10:00:00Z","finished_at":"2026-11-04T10:01:00Z","review":null}`
 	if string(got.body) != want {
 		t.Fatalf("body\n got %s\nwant %s", got.body, want)
 	}
@@ -643,12 +643,12 @@ func TestSlackDelivery(t *testing.T) {
 		t.Fatalf("slack body %s: %v", body, err)
 	}
 	text, _ := msg["text"].(string)
-	for _, want := range []string{"pagination-demo", "done", "Baseline PASS", "HEAD FAIL", "end index off by one", "src/pagination.ts:7", "confidence high"} {
+	for _, want := range []string{"pagination-demo", "done", "Baseline PASS", "HEAD FAIL", "end index off by one", "`src/pagination.ts:7`", "confidence high"} {
 		if !strings.Contains(text, want) {
 			t.Errorf("text lacks %q: %s", want, text)
 		}
 	}
-	if !strings.HasSuffix(text, "AI-generated hypothesis, not verified.") {
+	if !strings.HasSuffix(text, "AI-generated hypothesis and review, not verified.") {
 		t.Fatalf("text must end with the disclaimer: %s", text)
 	}
 	if strings.Contains(text, "\n") {
@@ -664,7 +664,7 @@ func TestSlackTextEdgeCases(t *testing.T) {
 	p.TopHypothesis = nil
 	p.Status, p.CurrentRan, p.BaselineRan = "error", false, false
 	text := SlackText(p)
-	if !strings.HasSuffix(text, "AI-generated hypothesis, not verified.") || !strings.Contains(text, "error") || !strings.Contains(text, "not run") {
+	if !strings.HasSuffix(text, "AI-generated hypothesis and review, not verified.") || !strings.Contains(text, "error") || !strings.Contains(text, "not run") {
 		t.Fatalf("text %s", text)
 	}
 	// Model output is untrusted: Slack control sequences are escaped and
@@ -674,6 +674,96 @@ func TestSlackTextEdgeCases(t *testing.T) {
 	text = SlackText(p)
 	if strings.ContainsAny(text, "<>\n") || !strings.Contains(text, "&lt;!channel&gt;") || !strings.Contains(text, "&amp;") {
 		t.Fatalf("not escaped: %s", text)
+	}
+	if !strings.HasSuffix(text, "AI-generated hypothesis and review, not verified.") {
+		t.Fatalf("text must end with the disclaimer: %s", text)
+	}
+}
+
+func TestJSONBodyCarriesReviewLast(t *testing.T) {
+	p := samplePayload()
+	p.Review = &ReviewSummary{Status: "ok", Confirmed: 1, Refuted: 2, TopFinding: &ReviewFinding{
+		ID: "R1", Lens: "security", Severity: "high", Title: "Token compared with ==",
+		File: "src/auth.ts", LineStart: 12, LineEnd: 12, Verdict: "confirmed"}}
+	b, err := JSONBody(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `"finished_at":"2026-11-04T10:01:00Z","review":{"status":"ok","confirmed":1,"disputed":0,"refuted":2,"unchecked":0,` +
+		`"top_finding":{"id":"R1","lens":"security","severity":"high","title":"Token compared with ==","file":"src/auth.ts",` +
+		`"line_start":12,"line_end":12,"verdict":"confirmed"}}}`
+	if !strings.HasSuffix(string(b), want) {
+		t.Fatalf("body\n got %s\nwant suffix %s", b, want)
+	}
+	p.Review.TopFinding = nil
+	if b, err = JSONBody(p); err != nil || !strings.HasSuffix(string(b), `"unchecked":0,"top_finding":null}}`) {
+		t.Fatalf("nil top finding: %s %v", b, err)
+	}
+}
+
+func TestSlackTextContractExample(t *testing.T) {
+	p := samplePayload()
+	p.Review = &ReviewSummary{Status: "ok", Confirmed: 1, Disputed: 1, TopFinding: &ReviewFinding{
+		Lens: "code", Severity: "high", Title: "Last page drops one item", File: "src/pagination.ts", LineStart: 7}}
+	want := "RegressionMap analysis of pagination-demo finished with status done. Baseline PASS, HEAD FAIL. " +
+		"Top hypothesis: `end index off by one` (`src/pagination.ts:7`, confidence high). " +
+		"Muse review: 1 confirmed, 1 disputed. Top: [code, high] `Last page drops one item` (`src/pagination.ts:7`). " +
+		"AI-generated hypothesis and review, not verified."
+	if got := SlackText(p); got != want {
+		t.Fatalf("slack text\n got %s\nwant %s", got, want)
+	}
+}
+
+func TestSlackTextReviewSentence(t *testing.T) {
+	const head = "RegressionMap analysis of pagination-demo finished with status done. Baseline PASS, HEAD FAIL. " +
+		"Top hypothesis: `end index off by one` (`src/pagination.ts:7`, confidence high)."
+	const tail = " AI-generated hypothesis and review, not verified."
+	for _, c := range []struct {
+		name   string
+		review *ReviewSummary
+		want   string
+	}{
+		{"counts in display order and a top finding with no file",
+			&ReviewSummary{Status: "ok", Confirmed: 2, Refuted: 3, Unchecked: 1,
+				TopFinding: &ReviewFinding{Lens: "security", Severity: "high", Title: "x"}},
+			" Muse review: 2 confirmed, 1 unchecked, 3 refuted. Top: [security, high] `x`."},
+		{"only refuted", &ReviewSummary{Status: "ok", Refuted: 3}, " Muse review: 3 refuted."},
+		{"no findings", &ReviewSummary{Status: "ok"}, " Muse review: no findings."},
+		{"not available", &ReviewSummary{Status: "error"}, " Muse review: not available (error)."},
+		{"no review", nil, ""},
+	} {
+		p := samplePayload()
+		p.Review = c.review
+		if got := SlackText(p); got != head+c.want+tail {
+			t.Errorf("%s:\n got %s\nwant %s", c.name, got, head+c.want+tail)
+		}
+	}
+}
+
+// Every model-written string and every location sits in a closed code span
+// with its backticks removed, so Slack makes no link and no mention of it.
+func TestSlackTextReviewCodeSpans(t *testing.T) {
+	p := samplePayload()
+	p.TopHypothesis.Title = "a`b <https://evil.example|x> & http://evil.example"
+	p.Review = &ReviewSummary{Status: "ok", Confirmed: 1, TopFinding: &ReviewFinding{
+		Lens: "security", Severity: "high", Title: "<!channel>", File: "src/a`b.ts", LineStart: 7}}
+	text := SlackText(p)
+	for _, want := range []string{
+		"Top hypothesis: `ab &lt;https://evil.example|x&gt; &amp; http://evil.example` (`src/pagination.ts:7`, confidence high).",
+		"Top: [security, high] `&lt;!channel&gt;` (`src/ab.ts:7`).",
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("text lacks %q:\n%s", want, text)
+		}
+	}
+	if n := strings.Count(text, "`"); n != 8 || strings.ContainsAny(text, "<>\n") {
+		t.Fatalf("%d backticks, want 8 (four closed spans), and no < > or newline:\n%s", n, text)
+	}
+
+	p.Review.TopFinding.Title = " ``\n "
+	text = SlackText(p)
+	if !strings.Contains(text, "Top: [security, high] untitled (`src/ab.ts:7`).") || strings.Count(text, "`") != 6 {
+		t.Fatalf("an empty title must be the plain word untitled:\n%s", text)
 	}
 }
 

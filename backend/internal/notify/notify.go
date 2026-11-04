@@ -44,7 +44,7 @@ const (
 	DefaultTimeout = 5 * time.Second // per attempt
 	MaxAttempts    = 3
 
-	disclaimer = "AI-generated hypothesis, not verified."
+	disclaimer = "AI-generated hypothesis and review, not verified."
 )
 
 // backoff[i] is the wait before attempt i+2.
@@ -164,22 +164,47 @@ type Hypothesis struct {
 	ConfidenceLabel string `json:"confidence_label"`
 }
 
+// ReviewFinding is the top finding of the Muse review in a json payload.
+type ReviewFinding struct {
+	ID        string `json:"id"`
+	Lens      string `json:"lens"`
+	Severity  string `json:"severity"`
+	Title     string `json:"title"`
+	File      string `json:"file"`
+	LineStart int    `json:"line_start"`
+	LineEnd   int    `json:"line_end"`
+	Verdict   string `json:"verdict"`
+}
+
+// ReviewSummary is the Muse review in a json payload (v4): its status, its
+// counts by verdict and its top finding. It carries no detail, suggestion,
+// reason, evidence or summary.
+type ReviewSummary struct {
+	Status     string         `json:"status"`
+	Confirmed  int            `json:"confirmed"`
+	Disputed   int            `json:"disputed"`
+	Refuted    int            `json:"refuted"`
+	Unchecked  int            `json:"unchecked"`
+	TopFinding *ReviewFinding `json:"top_finding"`
+}
+
 // Payload is the json body. Field order is the wire order of the contract.
 // BaselineRan/CurrentRan only steer the Slack text ("not run").
 type Payload struct {
-	Event          string      `json:"event"`
-	ID             string      `json:"id"`
-	Repo           string      `json:"repo"`
-	Status         string      `json:"status"`
-	Error          string      `json:"error"`
-	Baseline       string      `json:"baseline"`
-	Current        string      `json:"current"`
-	BaselinePassed bool        `json:"baseline_passed"`
-	CurrentPassed  bool        `json:"current_passed"`
-	ModelStatus    string      `json:"model_status"`
-	TopHypothesis  *Hypothesis `json:"top_hypothesis"`
-	CreatedAt      string      `json:"created_at"`
-	FinishedAt     string      `json:"finished_at"`
+	Event          string         `json:"event"`
+	ID             string         `json:"id"`
+	Repo           string         `json:"repo"`
+	Status         string         `json:"status"`
+	Error          string         `json:"error"`
+	Baseline       string         `json:"baseline"`
+	Current        string         `json:"current"`
+	BaselinePassed bool           `json:"baseline_passed"`
+	CurrentPassed  bool           `json:"current_passed"`
+	ModelStatus    string         `json:"model_status"`
+	TopHypothesis  *Hypothesis    `json:"top_hypothesis"`
+	CreatedAt      string         `json:"created_at"`
+	FinishedAt     string         `json:"finished_at"`
+	Review         *ReviewSummary `json:"review"`
 
 	BaselineRan bool `json:"-"`
 	CurrentRan  bool `json:"-"`
@@ -201,8 +226,67 @@ func slackEscape(s string, max int) string {
 	return strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;").Replace(s)
 }
 
+// slackCode puts model-written text in an inline code span, where Slack
+// makes no links: backticks are removed, so the text cannot close the span,
+// and slackEscape still applies. Text that is empty after that becomes the
+// plain word untitled.
+func slackCode(s string, max int) string {
+	s = slackEscape(strings.ReplaceAll(s, "`", ""), max)
+	if s == "" {
+		return "untitled"
+	}
+	return "`" + s + "`"
+}
+
+// slackLoc is a location in a code span: the file without backticks, cut at
+// 300 characters, plus ":<line>" when line is above 0. It is "" when no file
+// is left, and the caller then leaves the location out.
+func slackLoc(file string, line int) string {
+	loc := slackEscape(strings.ReplaceAll(file, "`", ""), 300)
+	if loc == "" {
+		return ""
+	}
+	if line > 0 {
+		loc = fmt.Sprintf("%s:%d", loc, line)
+	}
+	return "`" + loc + "`"
+}
+
+// slackReview is the review sentence of the Slack text, with a leading
+// space, or "" when the analysis has no review.
+func slackReview(r *ReviewSummary) string {
+	switch {
+	case r == nil:
+		return ""
+	case r.Status != "ok":
+		return fmt.Sprintf(" Muse review: not available (%s).", slackEscape(r.Status, 20))
+	}
+	var counts []string
+	for _, c := range []struct {
+		n     int
+		label string
+	}{{r.Confirmed, "confirmed"}, {r.Unchecked, "unchecked"}, {r.Disputed, "disputed"}, {r.Refuted, "refuted"}} {
+		if c.n > 0 {
+			counts = append(counts, fmt.Sprintf("%d %s", c.n, c.label))
+		}
+	}
+	if len(counts) == 0 {
+		return " Muse review: no findings."
+	}
+	s := " Muse review: " + strings.Join(counts, ", ") + "."
+	if f := r.TopFinding; f != nil {
+		s += fmt.Sprintf(" Top: [%s, %s] %s", slackEscape(f.Lens, 10), slackEscape(f.Severity, 10), slackCode(f.Title, 200))
+		if loc := slackLoc(f.File, f.LineStart); loc != "" {
+			s += " (" + loc + ")"
+		}
+		s += "."
+	}
+	return s
+}
+
 // SlackText is the one-paragraph Slack summary. It carries no evidence
-// excerpts and no source code, and always ends with the disclaimer.
+// excerpts and no source code, and always ends with the disclaimer. Every
+// model-written title and every location sits in an inline code span.
 func SlackText(p Payload) string {
 	pf := func(ran, passed bool) string {
 		switch {
@@ -217,14 +301,15 @@ func SlackText(p Payload) string {
 	fmt.Fprintf(&b, "RegressionMap analysis of %s finished with status %s. Baseline %s, HEAD %s.",
 		slackEscape(p.Repo, 100), slackEscape(p.Status, 20), pf(p.BaselineRan, p.BaselinePassed), pf(p.CurrentRan, p.CurrentPassed))
 	if h := p.TopHypothesis; h != nil {
-		loc := slackEscape(h.File, 300)
-		if h.LineStart > 0 {
-			loc = fmt.Sprintf("%s:%d", loc, h.LineStart)
+		loc := slackLoc(h.File, h.LineStart)
+		if loc != "" {
+			loc += ", "
 		}
-		fmt.Fprintf(&b, " Top hypothesis: %s (%s, confidence %s).", slackEscape(h.Title, 200), loc, slackEscape(h.ConfidenceLabel, 10))
+		fmt.Fprintf(&b, " Top hypothesis: %s (%sconfidence %s).", slackCode(h.Title, 200), loc, slackEscape(h.ConfidenceLabel, 10))
 	} else {
 		b.WriteString(" Top hypothesis: none.")
 	}
+	b.WriteString(slackReview(p.Review))
 	b.WriteString(" " + disclaimer)
 	return b.String()
 }
