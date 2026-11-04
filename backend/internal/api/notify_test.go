@@ -199,6 +199,45 @@ func TestNotifyRequestValidation(t *testing.T) {
 	}
 }
 
+// A notify_url whose host holds a control, format or space character, raw
+// or percent-encoded, or is not valid UTF-8, is refused as invalid_notify_url
+// before anything is stored or sent, so such a host never reaches
+// notification.host, DATA_DIR or the log.
+func TestNotifyURLHostWithControlOrFormatCharacterIsRefused(t *testing.T) {
+	data := t.TempDir()
+	fake := newFake(false, notify.Result{Delivered: true, Attempts: 1, StatusCode: 200})
+	_, srv, _, shas := newServer(t, []string{"r1"}, func(c *Config) {
+		c.DataDir = data
+		c.Commands = []Command{slowCmd(50)}
+		c.WebhookSecret = testWebhookSecret
+		c.Notifier = fake
+	})
+	for _, u := range []string{
+		"https://h\u0085ooks.example.com/x",
+		"https://h%C2%85ooks.example.com/x",
+		"https://h\u009b2Kooks.example.com/x",
+		"https://h%E2%80%AEooks.example.com/x",
+		"https://h%FFooks.example.com/x",
+	} {
+		code, body := rawDo(t, "POST", srv.URL+"/api/analyses", notifyBody("r1", shas["r1"].Baseline, "slow", u, "json"))
+		var er apiErr
+		json.Unmarshal([]byte(body), &er)
+		if code != 400 || er.Error.Code != "invalid_notify_url" || er.Error.Message != "notify_url is not a valid URL" {
+			t.Errorf("%+q: %d %s, want 400 invalid_notify_url", u, code, body)
+		}
+	}
+	if ids, err := store.New(data).List(); err != nil || len(ids) != 0 {
+		t.Fatalf("refused requests stored %d analysis(es) (%v)", len(ids), err)
+	}
+	var list struct{ Analyses []Summary }
+	if code := do(t, "GET", srv.URL+"/api/analyses", nil, &list); code != 200 || len(list.Analyses) != 0 {
+		t.Fatalf("GET /api/analyses after refused requests: %d %+v", code, list.Analyses)
+	}
+	if n := len(fake.Calls()); n != 0 {
+		t.Fatalf("refused requests must not notify, got %d calls", n)
+	}
+}
+
 func TestNotifyDeliveredAsyncAndURLNeverExposed(t *testing.T) {
 	logs := captureLog(t)
 	data := t.TempDir()

@@ -64,8 +64,9 @@ type Resolver interface {
 func ValidFormat(f string) bool { return f == FormatJSON || f == FormatSlack }
 
 // Validate checks a notify URL against the contract: https only, at most
-// MaxURLLength characters, a host, no user info, port 443 or none. Its
-// errors never echo the URL.
+// MaxURLLength characters, a host, no user info, port 443 or none. A host
+// that holds a control, format or space character, or that is not valid
+// UTF-8, is not a valid URL (see badHostRune). Its errors never echo the URL.
 func Validate(raw string) (*url.URL, error) {
 	if raw == "" {
 		return nil, errors.New("notify_url is empty")
@@ -76,6 +77,11 @@ func Validate(raw string) (*url.URL, error) {
 	u, err := url.Parse(raw)
 	if err != nil {
 		return nil, errors.New("notify_url is not a valid URL")
+	}
+	for _, r := range u.Hostname() {
+		if badHostRune(r) {
+			return nil, errors.New("notify_url is not a valid URL")
+		}
 	}
 	if u.Scheme != "https" {
 		return nil, errors.New("notify_url must use https://")
@@ -90,6 +96,18 @@ func Validate(raw string) (*url.URL, error) {
 		return nil, errors.New("notify_url must use port 443 or no port")
 	}
 	return u, nil
+}
+
+// badHostRune reports whether r may not appear in a notify host, which
+// url.Parse has already percent-decoded: a control character (C0 and C1), a
+// format character (Cf, such as U+202E or U+FEFF), a space or separator
+// character (such as U+00A0, U+2028 or U+3000), or utf8.RuneError, which
+// ranging over a string yields for invalid UTF-8. The host is stored as
+// notification.host and logged, so such a character would reach DATA_DIR,
+// GET and the log. Other non-ASCII letters (IDN hosts) stay accepted.
+func badHostRune(r rune) bool {
+	return r == utf8.RuneError || unicode.IsControl(r) || unicode.Is(unicode.Cf, r) ||
+		unicode.IsSpace(r) || unicode.In(r, unicode.Zs, unicode.Zl, unicode.Zp)
 }
 
 // blockedPrefixes are non-public ranges not covered by the netip predicates.
