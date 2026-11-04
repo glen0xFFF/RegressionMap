@@ -807,6 +807,86 @@ func TestDisplayOrderAndTopFindingCopyEvidenceIDs(t *testing.T) {
 	}
 }
 
+// The repeat key is the lens, the file, the range and the title (contract
+// rule 2): a finding that differs from an earlier kept one in any of them is
+// kept too.
+func TestValidateReviewRepeatKey(t *testing.T) {
+	base := func() map[string]any { return finding("code", "high", "src/pagination.ts", 7, 8, "E2") }
+	cases := []struct {
+		name string
+		fs   []map[string]any
+		want []string
+	}{
+		{"another file", []map[string]any{base(), finding("code", "high", "src/format.ts", 1, 2, "E3")}, []string{}},
+		{"another range", []map[string]any{base(), finding("code", "high", "src/pagination.ts", 9, 10, "E2")}, []string{}},
+		{"another lens", []map[string]any{base(), finding("security", "high", "src/pagination.ts", 7, 8, "E2")}, []string{}},
+		{"exact repeat", []map[string]any{base(), base()}, []string{`finding 2 ("t"): repeats finding 1`}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			_, kept, rejected, err := ValidateReview(reviewContent(c.fs...), evR)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(rejected, c.want) || len(kept) != len(c.fs)-len(c.want) {
+				t.Fatalf("kept %d, rejected %q; want %q", len(kept), rejected, c.want)
+			}
+		})
+	}
+}
+
+// The overlap reason is checked only when a cited item of the finding's file
+// has a known line range: an item with LineStart 0 gives no range to miss.
+func TestValidateReviewRangeWithOnlyAnUnknownRange(t *testing.T) {
+	evU := append(append([]evidence.Item{}, evR...),
+		evidence.Item{ID: "E6", Type: "source", File: "src/lib.ts", Excerpt: "export const x = 1;"})
+	_, kept, rejected, err := ValidateReview(reviewContent(finding("code", "high", "src/lib.ts", 40, 41, "E6")), evU)
+	if err != nil || len(rejected) != 0 || len(kept) != 1 {
+		t.Fatalf("err=%v kept=%+v rejected=%q", err, kept, rejected)
+	}
+	if k := kept[0]; k.File != "src/lib.ts" || k.LineStart != 40 || k.LineEnd != 41 {
+		t.Fatalf("kept %+v, want src/lib.ts 40-41", k)
+	}
+}
+
+// "unchecked" is not a verdict Muse may give: the check is rejected and the
+// finding stays unchecked with no reason and no evidence.
+func TestCheckRejectsUncheckedVerdict(t *testing.T) {
+	rv := owed(t, three()[:1]...)
+	out := checkWith(t, 200, checksContent(ck{"R1", "unchecked", "r", []string{"E2"}}), rv, nil)
+	if out.CheckStatus != "ok" || verdicts(out.Findings) != "R1:unchecked" {
+		t.Fatalf("got %+v", out)
+	}
+	allUnchecked(t, out.Findings)
+	if !reflect.DeepEqual(out.Rejected, []string{`check for R1: unknown verdict "unchecked"`}) || out.Counts != (ReviewCounts{Unchecked: 1}) {
+		t.Fatalf("rejected %q, counts %+v", out.Rejected, out.Counts)
+	}
+}
+
+// EndCheck and ValidateChecks copy each finding's evidence id list, so a
+// change to their result never reaches the receiver or the input findings.
+func TestEndCheckAndValidateChecksCopyEvidenceIDs(t *testing.T) {
+	rv := owed(t, finding("code", "high", "src/pagination.ts", 7, 8, "E2", "E4"))
+	before, _ := json.Marshal(rv)
+
+	ended := rv.EndCheck("error", "m")
+	ended.Findings[0].EvidenceIDs[0] = "MUTATED"
+	if after, _ := json.Marshal(rv); string(after) != string(before) {
+		t.Errorf("a change to the EndCheck result reached its receiver:\nbefore %s\nafter  %s", before, after)
+	}
+
+	rv = owed(t, finding("code", "high", "src/pagination.ts", 7, 8, "E2", "E4"))
+	before, _ = json.Marshal(rv)
+	checked, _, err := ValidateChecks(checksContent(ck{"R1", "confirmed", "r", []string{"E2"}}), evR, rv.Findings)
+	if err != nil {
+		t.Fatal(err)
+	}
+	checked[0].EvidenceIDs[0] = "MUTATED"
+	if after, _ := json.Marshal(rv); string(after) != string(before) {
+		t.Fatalf("a change to the ValidateChecks result reached its input:\nbefore %s\nafter  %s", before, after)
+	}
+}
+
 func TestReviewErrorDoesNotLeakKey(t *testing.T) {
 	const key = "secret-key-123"
 	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
