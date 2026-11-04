@@ -122,13 +122,19 @@ function localBackend(analysisResponse?: () => Response) {
   return fn;
 }
 
-/** A hosted demo with PUBLIC_DEMO=1: a request without a key runs as the public demo identity. */
-function publicBackend() {
+/**
+ * A hosted demo with PUBLIC_DEMO=1: a request without a key runs as the public demo identity,
+ * and any key is refused. refuseAfterMs holds each refusal back, so that /api/me can go out
+ * with the stored key before the first 401 for it arrives.
+ */
+function publicBackend(refuseAfterMs = 0) {
   const fn = vi.fn(async (url: string, init?: RequestInit) => {
     const auth = (init?.headers as Record<string, string> | undefined)?.Authorization;
     if (url === "/api/health") return json({ ok: true, model_configured: true, model_id: "m", auth_required: false });
-    if (auth !== undefined)
+    if (auth !== undefined) {
+      if (refuseAfterMs > 0) await new Promise((r) => setTimeout(r, refuseAfterMs));
       return json({ error: { code: "unauthorized", message: "missing or invalid API key" } }, 401, { "WWW-Authenticate": "Bearer" });
+    }
     if (url === "/api/me") return json({ mode: "public" });
     if (url.startsWith("/api/keys"))
       return json({ error: { code: "forbidden_scope", message: "the public demo cannot manage API keys; use an admin key" } }, 403);
@@ -166,6 +172,43 @@ describe("App public demo", () => {
     expect(fn.mock.calls.some(([url, init]) => url === "/api/analyses" && init?.method === "POST")).toBe(true);
     expect(fn.mock.calls.every(([, init]) => (init?.headers as Record<string, string> | undefined)?.Authorization === undefined)).toBe(true);
     expect(fn.mock.calls.some(([url]) => String(url).startsWith("/api/keys"))).toBe(false);
+  });
+
+  it.each([
+    ["before /api/me goes out with it", 0],
+    ["after /api/me went out with it", 50],
+  ])("drops a stored key refused %s and carries on as the public demo without a sign-in card", async (_when, refuseAfterMs) => {
+    const STALE = "rm_live_REVOKEDREVOKEDREVOKEDREVOKEDRE";
+    const authOf = (init?: RequestInit) => (init?.headers as Record<string, string> | undefined)?.Authorization;
+    setStoredKey(STALE);
+    const fn = publicBackend(refuseAfterMs);
+    render(<App />);
+
+    const start = await screen.findByTestId("analyze-btn");
+    await waitFor(() => expect(start).toBeEnabled());
+    // Let every held-back refusal arrive and render.
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, refuseAfterMs + 50));
+    });
+
+    // The stored key was sent and checked, and the 401 for it dropped it.
+    expect(fn.mock.calls.some(([, init]) => authOf(init) === `Bearer ${STALE}`)).toBe(true);
+    expect(getStoredKey()).toBeNull();
+    expect(window.sessionStorage.getItem(KEY_STORAGE)).toBeNull();
+    // The last load of each resource went out without a key.
+    for (const path of ["/api/me", "/api/repos", "/api/commands"]) {
+      const calls = fn.mock.calls.filter(([url]) => url === path);
+      const last = calls[calls.length - 1];
+      expect(last, path).toBeDefined();
+      expect(authOf(last?.[1]), path).toBeUndefined();
+    }
+    expect(screen.getByTestId("analyze-btn")).toBeEnabled();
+    expect(screen.queryByTestId("signin")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("API key")).not.toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(within(screen.getByRole("navigation")).queryByRole("button", { name: "API Keys" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /sign out/i })).not.toBeInTheDocument();
+    expect(document.querySelector(".whoami")).toBeNull();
   });
 });
 

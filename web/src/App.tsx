@@ -60,16 +60,23 @@ export default function App() {
   const [hasKey, setHasKey] = useState(() => getStoredKey() !== null);
   const [me, setMe] = useState<Me | null>(null);
 
-  // Any 401 for the key we currently hold (or for no key) means: sign in.
-  // A late 401 for a request sent before the current key was stored is ignored.
+  // A 401 for the key we currently hold drops that key and loads everything
+  // again without it; the health check then decides whether to ask for sign-in,
+  // which the public demo (auth_required false) does not. A 401 for a request
+  // sent without a key means: sign in. A late 401 for a request sent with a
+  // key we no longer hold is ignored.
   useEffect(
     () =>
       onUnauthorized((sent) => {
         if (sent !== getStoredKey()) return;
+        setMe(null);
+        if (sent === null) {
+          setAuthNeeded(true);
+          return;
+        }
         clearStoredKey();
         setHasKey(false);
-        setMe(null);
-        setAuthNeeded(true);
+        setAuthEpoch((n) => n + 1);
       }),
     [],
   );
