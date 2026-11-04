@@ -703,25 +703,99 @@ func TestUnreadableCommitsAddAWarning(t *testing.T) {
 	})
 }
 
-// Each row of GET /api/analyses carries the counts of its review.
-func TestListRowsCarryReviewCounts(t *testing.T) {
-	m := newChainModel(t)
-	_, srv, base := chainServer(t, m, nil)
-	a := plAnalyse(t, srv.URL, "r1", base, "slow")
-	if a.Review == nil {
-		t.Fatalf("no review: %+v", a)
-	}
-	want, _ := json.Marshal(a.Review.Counts)
-	for _, row := range rawRows(t, srv.URL) {
-		if string(row["id"]) == `"`+a.ID+`"` {
-			if field(row, "review_counts") != string(want) || string(want) != `{"confirmed":1,"disputed":0,"refuted":0,"unchecked":0}` {
-				t.Fatalf("review_counts %s, want %s", field(row, "review_counts"), want)
-			}
-			return
+// rowCounts returns the raw review_counts of the GET /api/analyses row of id.
+func rowCounts(t *testing.T, url, id string) string {
+	t.Helper()
+	for _, row := range rawRows(t, url) {
+		if field(row, "id") == `"`+id+`"` {
+			return field(row, "review_counts")
 		}
 	}
-	t.Fatalf("no row for %s", a.ID)
+	t.Fatalf("no row for %s", id)
+	return ""
 }
+
+// Each row of GET /api/analyses carries the counts of its review, whatever
+// the review's status: a review that is not ok has its counts too, all 0.
+// Only an analysis without a review has review_counts null.
+func TestListRowsCarryReviewCounts(t *testing.T) {
+	const zero = `{"confirmed":0,"disputed":0,"refuted":0,"unchecked":0}`
+
+	t.Run("ok review", func(t *testing.T) {
+		m := newChainModel(t)
+		_, srv, base := chainServer(t, m, nil)
+		a := plAnalyse(t, srv.URL, "r1", base, "slow")
+		if a.Review == nil || a.Review.Status != "ok" {
+			t.Fatalf("review %+v, want ok", a.Review)
+		}
+		want, _ := json.Marshal(a.Review.Counts)
+		if got := rowCounts(t, srv.URL, a.ID); got != string(want) || string(want) != `{"confirmed":1,"disputed":0,"refuted":0,"unchecked":0}` {
+			t.Fatalf("review_counts %s, want %s", got, want)
+		}
+	})
+
+	// The review every server without a model key gives.
+	t.Run("disabled review", func(t *testing.T) {
+		_, srv, _, shas := newServer(t, []string{"r1"}, func(c *Config) { c.Commands = []Command{slowCmd(50)} })
+		a := plAnalyse(t, srv.URL, "r1", shas["r1"].Baseline, "slow")
+		if a.Review == nil || a.Review.Status != "disabled" {
+			t.Fatalf("review %+v, want disabled", a.Review)
+		}
+		if got := rowCounts(t, srv.URL, a.ID); got != zero {
+			t.Fatalf("review_counts %s of a disabled review, want %s", got, zero)
+		}
+	})
+
+	// Every review status, in memory and stored, against an analysis with
+	// no review.
+	t.Run("every status", func(t *testing.T) {
+		mc := &model.Client{Model: "m"}
+		unchecked := mc.NoReview("ok", "")
+		unchecked.CheckStatus, unchecked.CheckMessage = "", ""
+		unchecked.Findings = []model.Finding{{ID: "R1", Lens: "code", Severity: "high", Title: "t", EvidenceIDs: []string{"E1"},
+			Check: model.Check{Verdict: "unchecked", Reason: "", EvidenceIDs: []string{}}}}
+		unchecked = unchecked.EndCheck("error", msgCheckDeadline)
+		reviews := []struct {
+			name string
+			rv   *model.Review
+			want string
+		}{
+			{"ok with its check stopped", &unchecked, `{"confirmed":0,"disputed":0,"refuted":0,"unchecked":1}`},
+			{"disabled", ptr(mc.NoReview("disabled", model.MsgNotConfigured)), zero},
+			{"error", ptr(mc.NoReview("error", msgReviewDeadline)), zero},
+			{"invalid", ptr(mc.NoReview("invalid", "no finding passed validation")), zero},
+			{"skipped", ptr(mc.NoReview("skipped", msgReviewSkipped)), zero},
+			{"no review", nil, "null"},
+		}
+		data := t.TempDir()
+		storedID := store.NewID()
+		storedRv := mc.NoReview("error", msgReviewEnded)
+		b, _ := json.Marshal(Analysis{ID: storedID, Status: "error", Repo: "r1", Review: &storedRv, CreatedAt: "2026-11-04T10:00:00Z"})
+		if err := store.New(data).Save(storedID, b); err != nil {
+			t.Fatal(err)
+		}
+		s := New(Config{Root: t.TempDir(), Model: mc, DataDir: data})
+		ids := make([]string, len(reviews))
+		s.mu.Lock()
+		for i, r := range reviews {
+			ids[i] = store.NewID()
+			s.insertLocked(&Analysis{ID: ids[i], Status: "done", Repo: "r1", Review: r.rv, CreatedAt: "2026-11-04T10:00:00Z"})
+		}
+		s.mu.Unlock()
+		srv := httptest.NewServer(s)
+		defer srv.Close()
+		for i, r := range reviews {
+			if got := rowCounts(t, srv.URL, ids[i]); got != r.want {
+				t.Errorf("%s: review_counts %s, want %s", r.name, got, r.want)
+			}
+		}
+		if got := rowCounts(t, srv.URL, storedID); got != zero {
+			t.Errorf("stored error review: review_counts %s, want %s", got, zero)
+		}
+	})
+}
+
+func ptr[T any](v T) *T { return &v }
 
 // An analysis stored before v4 has no review key. It loads with review
 // null, and its row has review_counts null.
