@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"log/slog"
@@ -1369,6 +1370,106 @@ func TestDrainEndsRunningAnalysisAndNotifies(t *testing.T) {
 	}
 	if st, ok := loadStoredAnalysis(t, data, a.ID); !ok || st.Status != "error" || st.Error != want || st.Notification.Status != "delivered" {
 		t.Fatalf("stored after Drain: %+v", st)
+	}
+}
+
+// waitState waits until cond, called with s.mu held, is true.
+func waitState(t *testing.T, s *Server, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		s.mu.Lock()
+		ok := cond()
+		s.mu.Unlock()
+		if ok {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s", what)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// Shutdown: an analysis created after Drain began (its request was still in
+// create when the HTTP shutdown ended) ends at once as error with the
+// addendum's message, before its test command starts; its notification is
+// sent and Drain waits for it. A's delivery stays blocked throughout, so
+// nothing else wakes Drain while B is created: only the stopping check in
+// supervise ends B.
+func TestDrainEndsAnalysisCreatedAfterItBegan(t *testing.T) {
+	data := t.TempDir()
+	marker := filepath.ToSlash(filepath.Join(t.TempDir(), "started"))
+	fake := newFake(true, notify.Result{Delivered: true, Attempts: 1, StatusCode: 200})
+	s, srv, _, shas := newServer(t, []string{"r1", "r2"}, func(c *Config) {
+		c.DataDir = data
+		c.Commands = []Command{slowCmd(50), {ID: "marker", Argv: []string{"node", "-e",
+			fmt.Sprintf(`require("fs").writeFileSync(%q,"1");setTimeout(()=>{},20000)`, marker)}, Description: "marks its start"}}
+		c.WebhookSecret = testWebhookSecret
+		c.Notifier = fake
+	})
+	release := releaser(t, fake)
+	var a Analysis
+	if code := do(t, "POST", srv.URL+"/api/analyses", notifyBody("r1", shas["r1"].Baseline, "slow", secretNotifyURL, "json"), &a); code != 202 {
+		t.Fatalf("POST A %d", code)
+	}
+	pollDone(t, srv.URL, a.ID)
+	waitCalls(t, fake, 1)
+	waitState(t, s, "A's delivery to be the only work left", func() bool {
+		return s.active == 0 && len(s.runs) == 0 && len(s.delivering) == 1
+	})
+
+	drained := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		drained <- s.Drain(ctx)
+	}()
+	waitState(t, s, "Drain to begin", func() bool { return s.stopping })
+
+	var b Analysis
+	if code := do(t, "POST", srv.URL+"/api/analyses", notifyBody("r2", shas["r2"].Baseline, "marker", secretNotifyURL, "json"), &b); code != 202 {
+		t.Fatalf("POST B %d", code)
+	}
+	created := time.Now()
+	var got Analysis
+	for {
+		got = Analysis{}
+		do(t, "GET", srv.URL+"/api/analyses/"+b.ID, nil, &got)
+		if got.Status != "running" {
+			break
+		}
+		if el := time.Since(created); el > 2*time.Second {
+			t.Fatalf("an analysis created after Drain began is still running after %v", el.Round(time.Millisecond))
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got.Status != "error" || got.Error != msgInterrupted || got.BaselineRun != nil || got.CurrentRun != nil {
+		t.Fatalf("B ended as %s %q (baseline run %v, current run %v), want error %q and no run", got.Status, got.Error, got.BaselineRun, got.CurrentRun, msgInterrupted)
+	}
+	waitCalls(t, fake, 2)
+	if p := fake.Calls()[1].payload; p.ID != b.ID || p.Status != "error" || p.Error != msgInterrupted {
+		t.Fatalf("notification of B: %+v", p)
+	}
+	select {
+	case err := <-drained:
+		t.Fatalf("Drain returned (%v) while two deliveries were blocked", err)
+	case <-time.After(200 * time.Millisecond):
+	}
+	release()
+	select {
+	case err := <-drained:
+		if err != nil {
+			t.Fatalf("Drain: %v", err)
+		}
+	case <-time.After(25 * time.Second):
+		t.Fatal("Drain did not return after the deliveries ended")
+	}
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatalf("B's test command started (marker: %v)", err)
+	}
+	if st, ok := loadStoredAnalysis(t, data, b.ID); !ok || st.Status != "error" || st.Error != msgInterrupted || st.Notification == nil || st.Notification.Status != "delivered" {
+		t.Fatalf("stored B: found=%v %+v", ok, st)
 	}
 }
 
