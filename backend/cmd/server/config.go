@@ -282,7 +282,12 @@ func newLogger(w io.Writer, format string) (*slog.Logger, error) {
 // escapeLogAttr applies escapeLogText to every string value the json
 // handler writes: attribute values of kind string, error values after
 // Error(), and the message (the built-in "msg" attribute). Other values are
-// left alone.
+// left alone. ReplaceAttr runs outside the panic recovery the handler
+// applies when it writes a value, so when Error() panics (a typed-nil
+// pointer whose Error() reads its receiver, say), the panic is recovered
+// here and the attribute is returned unchanged. The handler then calls
+// Error() again and writes what it writes without escapeLogAttr: "<nil>"
+// for a nil pointer, otherwise "!PANIC: " and the panic value.
 func escapeLogAttr(_ []string, a slog.Attr) slog.Attr {
 	switch a.Value.Kind() {
 	case slog.KindString:
@@ -291,12 +296,22 @@ func escapeLogAttr(_ []string, a slog.Attr) slog.Attr {
 		}
 	case slog.KindAny:
 		if err, ok := a.Value.Any().(error); ok && err != nil {
-			if s := err.Error(); strings.ContainsFunc(s, logEscaped) {
+			if s, ok := errorText(err); ok && strings.ContainsFunc(s, logEscaped) {
 				a.Value = slog.StringValue(escapeLogText(s))
 			}
 		}
 	}
 	return a
+}
+
+// errorText returns err.Error(), and false when Error() panics.
+func errorText(err error) (s string, ok bool) {
+	defer func() {
+		if recover() != nil {
+			s, ok = "", false
+		}
+	}()
+	return err.Error(), true
 }
 
 // logEscaped reports whether escapeLogText rewrites r: a rune in

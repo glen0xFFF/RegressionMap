@@ -750,11 +750,15 @@ func TestNotifyPendingWhileDeliveringAfterEviction(t *testing.T) {
 // A GET of an evicted analysis reads the stored copy, "pending", while the
 // delivery is in flight; the delivery then records "delivered" and leaves
 // the in-flight set before the GET decides what that "pending" means. The
-// seam holds the GET after its read until the delivery has ended. loadStored
-// took its in-flight snapshot before the read, so the GET serves "pending"
-// or "delivered", never a delivered webhook as failed with
-// msgDeliveryInterrupted. A snapshot taken after the read would miss the
-// delivery and serve "failed".
+// seam, loadStoredRead, wraps the real store read and holds the GET inside
+// its read of the stored file, after the bytes ("pending") are read and
+// before the read returns, until the delivery has recorded "delivered" and
+// left the in-flight set. This proves that loadStored takes its in-flight
+// snapshot before the read: the GET then serves "pending" or "delivered",
+// never a delivered webhook as "failed" with msgDeliveryInterrupted. A
+// snapshot taken at any point after the read returns, inside the "pending"
+// check as at 2741b38 or just after the read, sees the delivery ended and
+// serves "failed".
 func TestGetWhileDeliveryEndsNeverShowsItInterrupted(t *testing.T) {
 	data := t.TempDir()
 	fake := newFake(true, notify.Result{Delivered: true, Attempts: 1, StatusCode: 200})
@@ -787,16 +791,19 @@ func TestGetWhileDeliveryEndsNeverShowsItInterrupted(t *testing.T) {
 		t.Fatalf("fixture: the GET must read a stored \"pending\", stored %+v", st.Notification)
 	}
 
-	// The first loadStored of A (the GET's) waits after its read of the
-	// stored copy until resume is closed; later ones (deliver's own load,
-	// later GETs) go on.
+	// The first read of A's stored file from here on (the GET's) reads the
+	// bytes through the real store and then waits, before it returns them,
+	// until resume is closed; later reads (deliver's own load, later GETs)
+	// go on.
 	paused, resume := make(chan struct{}), make(chan struct{})
-	var loads atomic.Int32
-	s.loadStoredHook = func(id string) {
-		if id == a.ID && loads.Add(1) == 1 {
+	var reads atomic.Int32
+	s.loadStoredRead = func(id string) ([]byte, error) {
+		b, err := s.store.Load(id)
+		if id == a.ID && reads.Add(1) == 1 {
 			close(paused)
 			<-resume
 		}
+		return b, err
 	}
 	var resumed sync.Once
 	resumeGET := func() { resumed.Do(func() { close(resume) }) }
