@@ -330,6 +330,38 @@ func TestReviewProblemsKeepAnalysisDone(t *testing.T) {
 	}
 }
 
+// The review call runs whatever the hypothesis call returned (contract rule
+// 2): after a failed or invalid hypothesis answer the review and its check
+// still run, and the analysis is done.
+func TestReviewRunsWhateverHypothesesReturn(t *testing.T) {
+	cases := []struct {
+		name   string
+		answer chainAnswer
+		status string // model.status
+	}{
+		{"hypotheses HTTP 500", chainAnswer{status: 500}, "error"},
+		{"hypotheses content {}", chainAnswer{content: "{}"}, "invalid"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			m := newChainModel(t)
+			m.set("RegressionHypotheses", c.answer)
+			_, srv, base := chainServer(t, m, nil)
+			a := plAnalyse(t, srv.URL, "r1", base, "slow")
+			if got := strings.Join(m.Names(), ","); got != "RegressionHypotheses,ChangeReview,FindingChecks" {
+				t.Fatalf("model calls %s, want RegressionHypotheses,ChangeReview,FindingChecks", got)
+			}
+			if a.Status != "done" || a.Error != "" || a.Model == nil || a.Model.Status != c.status {
+				t.Fatalf("status %q error %q model %+v, want done with model.status %q", a.Status, a.Error, a.Model, c.status)
+			}
+			rv := a.Review
+			if rv == nil || rv.Status != "ok" || rv.CheckStatus != "ok" || rv.Counts != (model.ReviewCounts{Confirmed: 1}) {
+				t.Fatalf("review %+v, want ok with one confirmed finding", rv)
+			}
+		})
+	}
+}
+
 // While the review runs, GET shows the analysis running with its
 // hypotheses and review null.
 func TestHypothesesShowWhileReviewRuns(t *testing.T) {
