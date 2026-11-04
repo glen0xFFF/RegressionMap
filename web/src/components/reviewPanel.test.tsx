@@ -92,6 +92,38 @@ describe("ReviewPanel", () => {
     }
   });
 
+  it("ReviewPanel names a failure that has no message", () => {
+    // The fallback words of the hypothesis panel: "unknown error" for a failed call, "no details" otherwise.
+    const cases: [string, string, string][] = [
+      ["error", "card-error", "Muse review failed: unknown error"],
+      ["toString", "card-error", "Muse review failed: unknown error"],
+      ["later", "card-error", "Muse review failed: unknown error"],
+      ["disabled", "card-warn", "Muse review not available: no details"],
+      ["invalid", "card-error", "Muse review was rejected as invalid: no details"],
+      ["skipped", "card-warn", "Muse review skipped: no details"],
+    ];
+    for (const [status, cls, text] of cases) {
+      for (const message of ["", undefined]) {
+        render(panel(review({ status: status as Review["status"], message: message as string })));
+        expect(screen.getByText(text)).toHaveClass("card", cls);
+        expect(screen.queryByText(/: (undefined)?$/)).not.toBeInTheDocument();
+        cleanup();
+      }
+    }
+  });
+
+  it("ReviewPanel names a check problem that has no message", () => {
+    const findings = [finding("R1", "unchecked")];
+    const counts = { confirmed: 0, disputed: 0, refuted: 0, unchecked: 1 };
+    for (const check_status of ["error", "invalid"] as const) {
+      for (const check_message of ["", undefined]) {
+        render(panel(review({ check_status, check_message: check_message as string, findings, counts })));
+        expect(screen.getByText(`Muse check ${check_status}: no details`)).toHaveClass("card", "card-warn");
+        cleanup();
+      }
+    }
+  });
+
   it("ReviewPanel shows running and older analyses", () => {
     const { rerender } = render(panel(null, { running: true }));
     expect(screen.getByRole("heading", { name: "Muse review" })).toBeInTheDocument();
