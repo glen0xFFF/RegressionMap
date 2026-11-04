@@ -4,10 +4,10 @@ import type { Health, Loadable, Me } from "../types";
 
 export type View = "analyze" | "history" | "keys";
 
-/** Key management is offered to local callers and to admin-scope keys only. */
+/** Key management is offered to local callers and to admin-scope keys only, never to the public demo. */
 export function canManageKeys(me: Me | null | undefined): boolean {
   if (!me) return false;
-  return me.mode === "local" || me.key.scope === "admin";
+  return me.mode === "local" || (me.mode === "key" && me.key.scope === "admin");
 }
 
 function fmtDate(iso: string): string {
@@ -38,6 +38,8 @@ export function Sidebar({
   /** Present only while an API key is stored. */
   onSignOut?: () => void;
 }) {
+  // The public demo identity has no key to show and nothing to sign out of.
+  const signOut = me?.mode === "public" ? undefined : onSignOut;
   return (
     <aside className="sidebar">
       <div className="brand">
@@ -109,7 +111,7 @@ export function Sidebar({
             <span className="warn">model not configured</span>
           </span>
         )}
-        {(me?.mode === "key" || onSignOut) && (
+        {(me?.mode === "key" || signOut) && (
           <div className="whoami">
             {me?.mode === "key" && (
               <span className="whoami-id" title={`API key ${me.key.name} (${me.key.scope})`}>
@@ -117,8 +119,8 @@ export function Sidebar({
                 <code>{`${me.key.prefix}…`}</code>
               </span>
             )}
-            {onSignOut && (
-              <button type="button" className="btn-outline btn-sm" onClick={onSignOut}>
+            {signOut && (
+              <button type="button" className="btn-outline btn-sm" onClick={signOut}>
                 <LogOutIcon size={13} /> Sign out
               </button>
             )}

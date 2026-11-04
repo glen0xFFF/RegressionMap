@@ -4,7 +4,7 @@ export interface Health {
   ok: boolean;
   model_configured: boolean;
   model_id: string;
-  /** v2: true when the caller is not local and must send an API key. */
+  /** v2: true when the caller is not local and must send an API key. v4: false for every caller with PUBLIC_DEMO=1. */
   auth_required?: boolean;
 }
 
@@ -23,7 +23,9 @@ export interface ApiKey {
 
 export type Me =
   | { mode: "local" }
-  | { mode: "key"; key: Pick<ApiKey, "id" | "name" | "scope" | "prefix"> };
+  | { mode: "key"; key: Pick<ApiKey, "id" | "name" | "scope" | "prefix"> }
+  /** v4: the public demo identity (PUBLIC_DEMO=1): analyze scope, no key. */
+  | { mode: "public" };
 
 export interface CreatedKey {
   key: ApiKey;
