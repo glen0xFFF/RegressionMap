@@ -1429,6 +1429,12 @@ func TestDrainEndsRunningAnalysisAndNotifies(t *testing.T) {
 	if len(calls) != 1 || calls[0].payload.Status != "error" || calls[0].payload.Error != want {
 		t.Fatalf("notification of the interrupted analysis: %+v", calls)
 	}
+	// It ended during the baseline run, before its evidence existed, so the
+	// payload carries the skipped review closeReview gave it (contract rule
+	// 6), even without a model key.
+	if r := calls[0].payload.Review; r == nil || *r != (notify.ReviewSummary{Status: "skipped"}) {
+		t.Fatalf("payload review %+v, want {Status: skipped}", r)
+	}
 	var got Analysis
 	do(t, "GET", srv.URL+"/api/analyses/"+a.ID, nil, &got)
 	if got.Status != "error" || got.Error != want || got.Notification == nil || got.Notification.Status != "delivered" {

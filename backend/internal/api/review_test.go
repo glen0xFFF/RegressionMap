@@ -745,6 +745,7 @@ func TestCloseReview(t *testing.T) {
 		verdicts      []string
 	}{
 		{"no evidence", keyed, false, &finished, "skipped", msgReviewSkipped, "skipped", "no review to check", []string{}},
+		{"no evidence without a key", keyless, false, nil, "skipped", msgReviewSkipped, "skipped", "no review to check", []string{}},
 		{"no key", keyless, true, nil, "disabled", model.MsgNotConfigured, "skipped", "no review to check", []string{}},
 		{"review unfinished", keyed, true, nil, "error", msgReviewEnded, "skipped", "no review to check", []string{}},
 		{"check unfinished", keyed, true, &owing, "ok", "", "error", msgReviewEnded, []string{"unchecked"}},
