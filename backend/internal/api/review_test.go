@@ -644,18 +644,25 @@ func TestCommitItemsReachEvidenceAndModels(t *testing.T) {
 }
 
 // Every request of the review path, the check request included, carries
-// the changed files with the path redaction of the hypothesis request
-// (contract, "Security notes"). TestPipelineRedactsChangedFilesSentToModel
-// sees no check request: its review ends invalid.
+// the changed files with the path redaction of the hypothesis request, and
+// the commit messages with the evidence redaction (contract, "Security
+// notes": "commit messages included").
+// TestPipelineRedactsChangedFilesSentToModel sees no check request: its
+// review ends invalid.
 func TestReviewRequestsAreRedacted(t *testing.T) {
 	const secretPath = "config/token=supersecretvalue123/app.ts"
 	const redacted = "config/token=[REDACTED]/app.ts"
+	const subjectSecret, bodySecret = "subjectsecret456", "bodysecret789"
+	const wantSubject = "chore: drop api_key=[REDACTED]"
+	const wantExcerpt = wantSubject + "\n\nThe old token=[REDACTED] is gone."
 	m := newChainModel(t)
 	_, srv, root, shas := newServer(t, []string{"r1"}, func(c *Config) {
 		c.Commands = []Command{slowCmd(50)}
 		c.Model = m.client()
 	})
-	plCommit(t, filepath.Join(root, "r1"), map[string]string{secretPath: "export const x = 1;\n"})
+	dir := filepath.Join(root, "r1")
+	plCommit(t, dir, map[string]string{secretPath: "export const x = 1;\n"})
+	plGit(t, dir, "", "commit", "--quiet", "--allow-empty", "-m", "chore: drop api_key="+subjectSecret, "-m", "The old token="+bodySecret+" is gone.")
 	a := plAnalyse(t, srv.URL, "r1", shas["r1"].Baseline, "slow")
 	if a.Status != "done" || a.Review == nil || a.Review.CheckStatus != "ok" {
 		t.Fatalf("status %q review %+v, want done with a checked review", a.Status, a.Review)
@@ -667,12 +674,27 @@ func TestReviewRequestsAreRedacted(t *testing.T) {
 	bodies := append([]string{}, m.bodies...)
 	m.mu.Unlock()
 	for _, b := range bodies {
-		name, user, _ := chatRequest([]byte(b))
+		name, user, ev := chatRequest([]byte(b))
 		if strings.Contains(b, "supersecretvalue123") {
 			t.Errorf("the %s request carries the secret path segment", name)
 		}
 		if !strings.Contains(user, `"`+redacted+`"`) {
 			t.Errorf("the %s request lacks the redacted changed file", name)
+		}
+		for _, secret := range []string{subjectSecret, bodySecret} {
+			if strings.Contains(b, secret) {
+				t.Errorf("the %s request carries the commit message secret %s", name, secret)
+			}
+		}
+		// The commit item is there, with each secret replaced, not dropped.
+		var item *evidence.Item
+		for i, e := range ev {
+			if e.Type == "commit" && strings.HasSuffix(e.Title, ": "+wantSubject) {
+				item = &ev[i]
+			}
+		}
+		if item == nil || item.Excerpt != wantExcerpt {
+			t.Errorf("the %s request lacks the redacted commit item %q with excerpt %q: %+v", name, wantSubject, wantExcerpt, item)
 		}
 	}
 }
