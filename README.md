@@ -76,8 +76,8 @@ Server environment:
 | `MODEL_ID`, `MODEL_BASE_URL` | `muse-spark-1.3`, `https://api.meta.ai/v1` | |
 | `WEB_DIR` | unset | Built UI (`web/dist`, must contain `index.html`), served at `/`. See "Production build". |
 | `DATA_DIR` | unset | Persisted analyses (`analyses/*.json`) and API keys (`keys.json`, hashes only). |
-| `LOG_FORMAT` | `text` | `text` or `json` (log/slog on stderr). With `json` every log line is JSON, except the line `regressionmap: <error>` printed when the server cannot start or exits with an error. |
-| `WEBHOOK_SECRET` | unset | Enables `notify_url` (completion webhooks) and is the HMAC key of `json` deliveries. At least 32 characters, used exactly as set; a shorter value stops the server at startup. Unset: webhooks are disabled. It is never logged. See "CI and notifications". |
+| `LOG_FORMAT` | `text` | `text` or `json` (log/slog on stderr). With `json` every log line is JSON, except the line `regressionmap: <error>` printed when the server cannot start or exits with an error. In `json` lines, every string value (the message, string fields and error values) has each character from U+0080 to U+009F, each Unicode format character (category Cf, for example U+202E) and U+2028/U+2029 written as the six-character escape `\uXXXX` (four lowercase hex digits); the JSON encoder already escapes U+0000 to U+001F. `text` lines already quote these characters. |
+| `WEBHOOK_SECRET` | unset | Enables `notify_url` (completion webhooks) and is the HMAC key of `json` deliveries. At least 32 characters (Unicode characters, not bytes), used exactly as set; a shorter value stops the server at startup. Unset: webhooks are disabled. It is never logged. See "CI and notifications". |
 | `TEST_ENV_ALLOW` | unset | Comma-separated variable names that test and verification runs receive although the name rule withholds them. Git never receives them. See "Test environment". |
 
 **Test environment.** Test runs, verification runs and git get the server's environment without `MODEL_API_KEY`, `MODEL_API_KEY_FILE`, `WEBHOOK_SECRET` and every variable whose name ends in `_KEY`, `_SECRET`, `_TOKEN` or `_PASSWORD`, in any letter case. If your tests need such a variable, name it in `TEST_ENV_ALLOW`, for example `TEST_ENV_ALLOW=DB_PASSWORD,STRIPE_TEST_KEY`. Listed names reach the baseline and HEAD test runs and verification runs. Git and its hooks never get them.
@@ -92,7 +92,7 @@ Server environment:
 
 1. stops taking requests and waits up to 10 s for open ones (log lines `shutting down`, then `stopped`);
 2. ends every running analysis with status `error` and the error `analysis interrupted: the server stopped while it was running`, which stops its test processes and starts its completion notification;
-3. waits up to 25 s more for running analyses and for every notification still being sent (log lines `draining`, then `drained`, or the warning `drain incomplete: notifications still being sent are reported as failed`).
+3. waits up to 25 s more for running analyses and for every notification still being sent (log lines `draining`, then `drained`). If the 25 s run out, it logs the warning `drain incomplete` instead, with an `error` field that counts what was still open, for example `1 analysis run(s) still stopping, 1 notification(s) still being sent: context deadline exceeded`, and a `timeout` field (`25s`).
 
 A stop takes at most about 35 s. A notification that is not finished by then is never retried: the URL lived in memory only. With `DATA_DIR`, the next process shows it as `failed` with `last_error` `delivery interrupted: the server stopped before it finished`; attempts made before the stop are not kept, so `attempts` shows 0. Without `DATA_DIR`, nothing survives a restart.
 
@@ -149,7 +149,7 @@ REPO=my-repo BASELINE=<good-sha> sh scripts/ci-analyze.sh
 
 Inputs:
 
-- `REGRESSIONMAP_URL`: `https://` to any host. Plain `http://` only when the host part is exactly `127.0.0.1`, `localhost` or `[::1]`, optionally followed by `:` and a port of digits. The host part is the text after the scheme up to the first `/`. It must not contain `@` or a backslash, also with `https://`. Scheme and host must be lowercase. Trailing slashes are removed.
+- `REGRESSIONMAP_URL`: `https://` to any host. Plain `http://` only when the host part is exactly `127.0.0.1`, `localhost` or `[::1]`, optionally followed by `:` and a port of digits. The host part is the text after the scheme up to the first `/`. It must not contain `@` or a backslash, also with `https://`. The scheme must be lowercase (`HTTPS://` is refused). With `http://`, the host part must be one of the three names above exactly as written, in lowercase (`http://LOCALHOST` is refused). An `https://` host is accepted in any letter case. Trailing slashes are removed.
 - `TIMEOUT_SECONDS`: digits without a leading zero. `0` is allowed and times out after the first poll. `POLL_SECONDS`: digits above 0 without a leading zero.
 - A bad URL or number is a usage error (exit 1) before anything is sent, for example `ci-analyze: REGRESSIONMAP_URL must not contain '@' or a backslash before its path` or `ci-analyze: TIMEOUT_SECONDS must be a whole number of seconds, without leading zeros`.
 
@@ -165,7 +165,7 @@ The key is read from the environment only. The shell script writes it to a priva
 
 Exit codes: `0` analysis done (the tests can still fail: read the summary), `1` usage error, `2` analysis error, `3` timeout, `4` HTTP, network or auth error (prints the API error code and message). `docs/ci/github-actions-example.yml` is a workflow for your own repository: it runs the tests and, when they fail, downloads the script at a pinned commit and runs it.
 
-**3. Webhooks.** Add `notify_url` (and optionally `notify_format`: `json`, the default, or `slack`) to `POST /api/analyses`, or set `NOTIFY_URL` / `NOTIFY_FORMAT` for the script. The server must have `WEBHOOK_SECRET` set, at least 32 characters (Docker: see "Enable webhooks" in `deploy/README.md`). Its startup log line shows `webhooks_enabled`. The hosted demo has webhooks disabled unless its operator sets `WEBHOOK_SECRET`. A server without it answers any `notify_url` with `400 webhooks_disabled`, and the script then exits 4 without starting an analysis.
+**3. Webhooks.** Add `notify_url` (and optionally `notify_format`: `json`, the default, or `slack`) to `POST /api/analyses`, or set `NOTIFY_URL` / `NOTIFY_FORMAT` for the script. The server must have `WEBHOOK_SECRET` set, at least 32 characters (Unicode characters, not bytes; Docker: see "Enable webhooks" in `deploy/README.md`). Its startup log line shows `webhooks_enabled`. The hosted demo has webhooks disabled unless its operator sets `WEBHOOK_SECRET`. A server without it answers any `notify_url` with `400 webhooks_disabled`, and the script then exits 4 without starting an analysis.
 
 The server checks the notification fields in this order:
 
@@ -204,6 +204,8 @@ A valid signature proves only that the body came from this server. It does not p
 Per-key secrets and a signed timestamp header are not in v3.
 
 **SSRF rules.** A `notify_url` must be `https://`, at most 2048 characters (Unicode characters, not bytes), have a host, have no user info, and use port 443 or none. Otherwise the answer is `400 invalid_notify_url` with one of these messages: `notify_url is longer than 2048 characters`, `notify_url is not a valid URL`, `notify_url must use https://`, `notify_url must have a host`, `notify_url must not contain user info`, `notify_url must use port 443 or no port`.
+
+The host must not contain a control character (U+0000 to U+001F, U+007F to U+009F), a Unicode format character (category Cf, for example U+200B or U+202E), a space or line or paragraph separator (for example U+00A0 or U+2028), or invalid UTF-8. The host is checked after percent-decoding, so `h%C2%85ooks.example.com` is refused like the raw form. Such a URL gets `400 invalid_notify_url` with `notify_url is not a valid URL`. This check comes right after the URL is parsed, before the `https://` check. Other non-ASCII letters stay allowed, so an internationalised host such as `bücher.example` is accepted.
 
 At delivery time the server resolves the host and refuses to send the request if any resolved address is not public, for IPv4 and IPv6:
 

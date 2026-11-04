@@ -51,7 +51,7 @@ printf 'MODEL_API_KEY=%s\n' "$(tr -d '\r\n' < /path/to/your-model-key.txt)" > re
 
 **Enable webhooks (optional).** Without `WEBHOOK_SECRET` the server answers every `notify_url` with `400 webhooks_disabled`. To enable completion webhooks, add a second line to the same file before you copy it.
 
-- The secret must be at least 32 characters. A shorter one stops the server at startup with `WEBHOOK_SECRET must be at least 32 characters (it is the HMAC key of webhook signatures); unset it to disable webhooks`. With `restart: unless-stopped` the container then restarts in a loop, and the UI and API are down.
+- The secret must be at least 32 characters (Unicode characters, not bytes). A shorter one stops the server at startup with `WEBHOOK_SECRET must be at least 32 characters (it is the HMAC key of webhook signatures); unset it to disable webhooks`. With `restart: unless-stopped` the container then restarts in a loop, and the UI and API are down.
 - It is used exactly as written: no quotes, no spaces. `openssl rand -hex 32` gives 64 hex characters.
 - Receivers need the same value to check signatures. It is one secret for the whole server, so give it only to receivers you trust (see "CI and notifications" in the root `README.md`).
 - Keep `webhook-secret.txt` where you keep the model key file. Every later replacement of `deploy/.env` needs it again.
@@ -223,9 +223,17 @@ docker stats --no-stream regressionmap
 
 The access log records method, path, status and duration. It never records headers or bodies, so bearer keys do not reach the log. Docker keeps at most 3 × 10 MB of logs (`json-file`, `max-size`/`max-file`).
 
-Every line the server logs is JSON. The exceptions are the line `regressionmap: <error>` that the server prints when it cannot start (for example after a too-short `WEBHOOK_SECRET`), and the entrypoint's own `entrypoint: …` lines. A failed webhook delivery is a `WARN` line with the message `notification failed` and the fields `analysis`, `host`, `attempts`, `status_code` and `error`. It never holds the URL path or query.
+Every line the server logs is JSON. The exceptions are these plain-text lines:
 
-**Stop.** `docker compose ... stop`, `up -d` after an update, and `--force-recreate` send SIGTERM. The server then waits up to 10 s for open requests, ends every running analysis with status `error` (`analysis interrupted: the server stopped while it was running`), and waits up to 25 s more for running analyses and webhooks still being sent. The log shows `shutting down` and `draining`, then `drained` or the warning `drain incomplete: notifications still being sent are reported as failed`. `stop_grace_period: 40s` gives it that time before Docker kills the container. An interrupted analysis is not resumed: start it again after the restart. A webhook that could not finish shows `failed` after the restart, with `delivery interrupted: the server stopped before it finished`, and is never retried.
+- `regressionmap: <error>`, which the server prints when it cannot start (for example after a too-short `WEBHOOK_SECRET`) or exits with an error;
+- the entrypoint's own `entrypoint: …` lines;
+- on a start where `/workspace/pagination-demo` does not exist yet (the first start with a new volume), the four lines of the demo fixture builder that the entrypoint runs: `created /workspace/pagination-demo`, `baseline <sha>`, `refactor <sha>` and `bug      <sha>`. If the builder fails, it prints its error as plain text instead and the container exits.
+
+In the JSON lines, every string value (the message, string fields and error values) has each character from U+0080 to U+009F, each Unicode format character (category Cf, for example U+202E) and U+2028/U+2029 written as the six-character escape `\uXXXX` (four lowercase hex digits); the JSON encoder already escapes U+0000 to U+001F.
+
+A failed webhook delivery is a `WARN` line with the message `notification failed` and the fields `analysis`, `host`, `attempts`, `status_code` and `error`. It never holds the URL path or query.
+
+**Stop.** `docker compose ... stop`, `up -d` after an update, and `--force-recreate` send SIGTERM. The server then waits up to 10 s for open requests, ends every running analysis with status `error` (`analysis interrupted: the server stopped while it was running`), and waits up to 25 s more for running analyses and webhooks still being sent. The log shows `shutting down` and `draining`, then `drained`. If the 25 s run out, it shows the warning `drain incomplete` instead, with an `error` field that counts what was still open, for example `1 analysis run(s) still stopping, 1 notification(s) still being sent: context deadline exceeded`, and a `timeout` field (`25s`). `stop_grace_period: 40s` gives it that time before Docker kills the container. An interrupted analysis is not resumed: start it again after the restart. A webhook that could not finish shows `failed` after the restart, with `delivery interrupted: the server stopped before it finished`, and is never retried.
 
 Backup of keys and saved analyses (`keys.json` holds hashes only, not secrets):
 
@@ -261,4 +269,4 @@ These files were written and checked statically (`sh -n` on the entrypoint, labe
 - That the v2 server (`ALLOWED_HOSTS`, `RATE_LIMIT_PER_HOUR`, `keys` subcommand, admin-key check at startup) is in the commit you build. The names follow `docs/API_CONTRACT.md`.
 - How the `letsencrypt` resolver of coolify-proxy issues certificates behind Cloudflare (see step 6).
 - That a `WEBHOOK_SECRET` line in `deploy/.env` reaches the server through `env_file`: the startup log should show `"webhooks_enabled":true` (step 7).
-- That `stop_grace_period: 40s` lets the drain finish: after `docker compose -f deploy/docker-compose.yml stop`, the log should show `drained` or `drain incomplete` before the container exits.
+- That `stop_grace_period: 40s` lets the drain finish: after `docker compose -f deploy/docker-compose.yml stop`, the log should show `drained`, or the warning `drain incomplete` with its `error` and `timeout` fields (see "Stop" in step 10), before the container exits.
