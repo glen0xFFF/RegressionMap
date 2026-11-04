@@ -138,10 +138,11 @@ func loadKey(getenv func(string) string) (string, error) {
 const minWebhookSecret = 32
 
 // loadWebhookSecret reads WEBHOOK_SECRET exactly as set (receivers verify
-// the HMAC with the same bytes). Errors never contain the value.
+// the HMAC with the same bytes). The minimum counts Unicode characters, not
+// bytes, as the contract says. Errors never contain the value.
 func loadWebhookSecret(getenv func(string) string) (string, error) {
 	v := getenv("WEBHOOK_SECRET")
-	if v != "" && len(v) < minWebhookSecret {
+	if v != "" && utf8.RuneCountInString(v) < minWebhookSecret {
 		return "", fmt.Errorf("WEBHOOK_SECRET must be at least %d characters (it is the HMAC key of webhook signatures); unset it to disable webhooks", minWebhookSecret)
 	}
 	return v, nil
