@@ -33,6 +33,10 @@ type config struct {
 
 	AllowedHosts     []string // ALLOWED_HOSTS, extra Host/Origin names (lower-cased)
 	RateLimitPerHour int      // RATE_LIMIT_PER_HOUR, per-key POST /api/analyses limit, default 20
+
+	// WebhookSecret is WEBHOOK_SECRET: the HMAC key of completion
+	// notifications. "" disables them. It must never be logged.
+	WebhookSecret string
 }
 
 // parseAllowedHosts splits ALLOWED_HOSTS on commas, trims and lower-cases
@@ -121,6 +125,18 @@ func loadKey(getenv func(string) string) (string, error) {
 	return strings.TrimSpace(string(b)), nil
 }
 
+const minWebhookSecret = 32
+
+// loadWebhookSecret reads WEBHOOK_SECRET exactly as set (receivers verify
+// the HMAC with the same bytes). Errors never contain the value.
+func loadWebhookSecret(getenv func(string) string) (string, error) {
+	v := getenv("WEBHOOK_SECRET")
+	if v != "" && len(v) < minWebhookSecret {
+		return "", fmt.Errorf("WEBHOOK_SECRET must be at least %d characters (it is the HMAC key of webhook signatures); unset it to disable webhooks", minWebhookSecret)
+	}
+	return v, nil
+}
+
 func or(v, d string) string {
 	if v == "" {
 		return d
@@ -190,6 +206,9 @@ func loadConfig(getenv func(string) string) (config, []string, error) {
 	if cfg.Key, err = loadKey(getenv); err != nil {
 		return config{}, nil, err
 	}
+	if cfg.WebhookSecret, err = loadWebhookSecret(getenv); err != nil {
+		return config{}, nil, err
+	}
 	return cfg, warns, nil
 }
 
@@ -217,8 +236,8 @@ func newLogger(w io.Writer, format string) (*slog.Logger, error) {
 	return nil, fmt.Errorf("unknown log format %q", format)
 }
 
-// logStartup logs where the server listens. It logs whether a key is
-// configured, never the key.
+// logStartup logs where the server listens. It logs whether a key and a
+// webhook secret are configured, never their values.
 func logStartup(lg *slog.Logger, cfg config, warns []string) {
 	for _, w := range warns {
 		lg.Warn(w)
@@ -233,5 +252,6 @@ func logStartup(lg *slog.Logger, cfg config, warns []string) {
 		"data_dir", cfg.DataDir,
 		"allowed_hosts", strings.Join(cfg.AllowedHosts, ","),
 		"rate_limit_per_hour", cfg.RateLimitPerHour,
+		"webhooks_enabled", cfg.WebhookSecret != "",
 	)
 }

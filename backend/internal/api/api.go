@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -19,6 +20,7 @@ import (
 	"regressionmap/internal/evidence"
 	"regressionmap/internal/gitx"
 	"regressionmap/internal/model"
+	"regressionmap/internal/notify"
 	"regressionmap/internal/proc"
 	"regressionmap/internal/store"
 )
@@ -44,6 +46,28 @@ type Config struct {
 	MaxJobs       int           // analyses kept in memory (default 100)
 	JobTimeout    time.Duration // whole-analysis deadline (default 5 min)
 	DataDir       string        // where analyses are persisted; "" = memory only
+
+	// WebhookSecret enables completion notifications (notify_url) and is
+	// the HMAC key of json deliveries. "" = webhooks disabled.
+	WebhookSecret string
+	// Notifier delivers them; nil with a secret = a notify.Sender.
+	Notifier Notifier
+}
+
+// Notifier delivers one completion notification. *notify.Sender implements it.
+type Notifier interface {
+	Send(ctx context.Context, rawURL, format string, p notify.Payload) notify.Result
+}
+
+// Notification is the delivery status shown on an analysis. It holds the
+// host only; the full notify URL is never stored here.
+type Notification struct {
+	Host           string `json:"host"`
+	Format         string `json:"format"`
+	Status         string `json:"status"` // pending | delivered | failed
+	Attempts       int    `json:"attempts"`
+	LastStatusCode int    `json:"last_status_code"`
+	LastError      string `json:"last_error"`
 }
 
 type CommandRef struct {
@@ -73,6 +97,8 @@ type Analysis struct {
 	Model         *model.Result      `json:"model"`
 	Verifications []Verification     `json:"verifications"`
 	CreatedAt     string             `json:"created_at"`
+	FinishedAt    string             `json:"finished_at,omitempty"`
+	Notification  *Notification      `json:"notification"`
 }
 
 // Summary is one row of GET /api/analyses.
@@ -109,7 +135,15 @@ type Server struct {
 	store     *store.Store      // nil when DataDir is empty
 	saveMu    sync.Mutex        // serialises persistence so writes land in order
 	tempDir   string            // where gitx creates regressionmap-wt-* dirs
+
+	// notifyURLs holds the full notify URL of each analysis until its
+	// delivery finishes. It lives only here: never in an Analysis, so it is
+	// never returned, logged or persisted.
+	notifyURLs map[string]pendingNotify
+	delivering int // deliveries in flight
 }
+
+type pendingNotify struct{ url, format string }
 
 const (
 	maxOutput   = 256 << 10
@@ -134,9 +168,13 @@ func New(cfg Config) *Server {
 	if cfg.JobTimeout <= 0 {
 		cfg.JobTimeout = 5 * time.Minute
 	}
+	if cfg.WebhookSecret != "" && cfg.Notifier == nil {
+		cfg.Notifier = &notify.Sender{Secret: []byte(cfg.WebhookSecret)}
+	}
 	s := &Server{
 		cfg: cfg, mux: http.NewServeMux(), jobs: map[string]*Analysis{},
 		running: map[string]string{}, verifying: map[string]bool{}, tempDir: os.TempDir(),
+		notifyURLs: map[string]pendingNotify{},
 	}
 	if cfg.DataDir != "" {
 		s.store = store.New(cfg.DataDir)
@@ -345,6 +383,9 @@ func (s *Server) loadStored(id string) (Analysis, bool) {
 	if a.Verifications == nil {
 		a.Verifications = []Verification{}
 	}
+	if n := a.Notification; n != nil && n.Status == "pending" {
+		n.Status, n.LastError = "failed", "delivery interrupted: the server stopped before it finished"
+	}
 	return a, true
 }
 
@@ -409,32 +450,169 @@ func (s *Server) progress(id string, f func(a *Analysis)) {
 
 // finish moves a running analysis to its final state and frees its repo and
 // global slots in the same critical section, so a client that sees the final
-// status can immediately start new work on that repo.
+// status can immediately start new work on that repo. It then starts the
+// completion notification, if one was requested, without waiting for it.
 func (s *Server) finish(id string, f func(a *Analysis)) {
+	var (
+		pn      pendingNotify
+		payload notify.Payload
+		host    string
+		send    bool
+	)
 	s.mutate(id, nil, func(a *Analysis) bool {
 		if a.Status != "running" {
 			return false
 		}
 		f(a)
+		a.FinishedAt = time.Now().UTC().Format(time.RFC3339)
 		if s.running[a.Repo] == id {
 			delete(s.running, a.Repo)
 			s.active--
 		}
+		if p, ok := s.notifyURLs[id]; ok && a.Notification != nil {
+			delete(s.notifyURLs, id)
+			pn, payload, host, send = p, payloadOf(a), a.Notification.Host, true
+			s.delivering++ // in the same critical section as active--
+		}
 		return true
 	})
+	if send {
+		go s.deliver(id, pn, payload, host)
+	}
+}
+
+// payloadOf builds the webhook payload. It carries no evidence and no output.
+func payloadOf(a *Analysis) notify.Payload {
+	p := notify.Payload{
+		ID: a.ID, Repo: a.Repo, Status: a.Status, Error: a.Error, Baseline: a.Baseline, Current: a.Current,
+		CreatedAt: a.CreatedAt, FinishedAt: a.FinishedAt,
+	}
+	if a.BaselineRun != nil {
+		p.BaselineRan, p.BaselinePassed = true, a.BaselineRun.Passed
+	}
+	if a.CurrentRun != nil {
+		p.CurrentRan, p.CurrentPassed = true, a.CurrentRun.Passed
+	}
+	if a.Model != nil {
+		p.ModelStatus = a.Model.Status
+		if a.Model.Result != nil {
+			var top *model.Hypothesis
+			for i := range a.Model.Result.Hypotheses {
+				if h := &a.Model.Result.Hypotheses[i]; top == nil || h.Rank < top.Rank {
+					top = h
+				}
+			}
+			if top != nil {
+				p.TopHypothesis = &notify.Hypothesis{Rank: top.Rank, Title: top.Title, File: top.File,
+					LineStart: top.LineStart, LineEnd: top.LineEnd, ConfidenceLabel: top.ConfidenceLabel}
+			}
+		}
+	}
+	return p
+}
+
+const deliveryDeadline = 2 * time.Minute
+
+// deliver sends one notification and records its outcome on the analysis.
+// Only the host is ever logged or stored.
+func (s *Server) deliver(id string, pn pendingNotify, p notify.Payload, host string) {
+	defer func() {
+		s.mu.Lock()
+		s.delivering--
+		s.mu.Unlock()
+	}()
+	var res notify.Result
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("analysis %s: notification to %s panicked", id, host)
+				res = notify.Result{Err: "internal error"}
+			}
+		}()
+		ctx, cancel := context.WithTimeout(context.Background(), deliveryDeadline)
+		defer cancel()
+		res = s.cfg.Notifier.Send(ctx, pn.url, pn.format, p)
+	}()
+	res.Err = scrubURL(res.Err, pn.url)
+	status := "failed"
+	if res.Delivered {
+		status, res.Err = "delivered", ""
+	}
+	var fallback *Analysis
+	s.mu.Lock()
+	_, inMemory := s.jobs[id]
+	s.mu.Unlock()
+	if !inMemory {
+		if a, ok := s.loadStored(id); ok {
+			fallback = &a
+		}
+	}
+	s.mutate(id, fallback, func(a *Analysis) bool {
+		if a.Notification == nil {
+			return false
+		}
+		n := *a.Notification
+		n.Status, n.Attempts, n.LastStatusCode, n.LastError = status, res.Attempts, res.StatusCode, res.Err
+		a.Notification = &n
+		return true
+	})
+	if !res.Delivered {
+		log.Printf("analysis %s: notification to %s failed after %d attempt(s): %s", id, host, res.Attempts, res.Err)
+	}
+}
+
+// scrubURL removes the notify URL, its path and its query from msg, as a
+// second guard behind the Notifier, and caps its length.
+func scrubURL(msg, raw string) string {
+	parts := []string{raw}
+	if u, err := url.Parse(raw); err == nil {
+		parts = append(parts, u.RawQuery, u.EscapedPath(), u.Path)
+	}
+	for _, p := range parts {
+		if len(p) > 1 {
+			msg = strings.ReplaceAll(msg, p, "")
+		}
+	}
+	if r := []rune(msg); len(r) > 500 {
+		msg = string(r[:500])
+	}
+	return msg
 }
 
 // ---- handlers ------------------------------------------------------------
 
 func (s *Server) create(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Repo      string `json:"repo"`
-		Baseline  string `json:"baseline"`
-		CommandID string `json:"command_id"`
+		Repo         string `json:"repo"`
+		Baseline     string `json:"baseline"`
+		CommandID    string `json:"command_id"`
+		NotifyURL    string `json:"notify_url"`
+		NotifyFormat string `json:"notify_format"`
 	}
 	if err := decode(w, r, &req); err != nil {
 		fail(w, 400, "bad_request", "invalid JSON body")
 		return
+	}
+	format := req.NotifyFormat
+	if format == "" {
+		format = notify.FormatJSON
+	}
+	if !notify.ValidFormat(format) {
+		fail(w, 400, "bad_request", "notify_format must be json or slack")
+		return
+	}
+	var notifyHost string
+	if req.NotifyURL != "" {
+		if s.cfg.WebhookSecret == "" || s.cfg.Notifier == nil {
+			fail(w, 400, "webhooks_disabled", "completion notifications are disabled on this server (WEBHOOK_SECRET is not set)")
+			return
+		}
+		u, err := notify.Validate(req.NotifyURL)
+		if err != nil {
+			fail(w, 400, "invalid_notify_url", err.Error())
+			return
+		}
+		notifyHost = strings.ToLower(u.Hostname())
 	}
 	repo, dir, err := s.repoDir(req.Repo)
 	if err != nil {
@@ -481,6 +659,10 @@ func (s *Server) create(w http.ResponseWriter, r *http.Request) {
 		Command: CommandRef{ID: cmd.ID, Argv: cmd.Argv}, ChangedFiles: []gitx.ChangedFile{},
 		Evidence: []evidence.Item{}, Verifications: []Verification{},
 		CreatedAt: time.Now().UTC().Format(time.RFC3339),
+	}
+	if notifyHost != "" {
+		a.Notification = &Notification{Host: notifyHost, Format: format, Status: "pending"}
+		s.notifyURLs[a.ID] = pendingNotify{url: req.NotifyURL, format: format}
 	}
 	s.insertLocked(a)
 	s.running[repo] = a.ID

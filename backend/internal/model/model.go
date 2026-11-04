@@ -15,9 +15,11 @@ import (
 	"math/rand/v2"
 	"net/http"
 	"path"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"regressionmap/internal/evidence"
 )
@@ -360,35 +362,90 @@ func scrub(s, key string) string {
 	return strings.ReplaceAll(s, key, "[REDACTED]")
 }
 
+// Limits applied by Validate. Oversize items are rejected, not truncated.
+const (
+	maxHypotheses     = 5
+	maxTitleLen       = 200
+	maxReasonLen      = 2000
+	maxVerificationLn = 500
+	rangeSlack        = 3
+)
+
+// span is a known line range of one evidence item.
+type span struct{ start, end int }
+
 // Validate parses model content and drops every hypothesis that cites an
-// unknown evidence id, names a file outside the evidence, or has a bad range.
+// unknown evidence id, names a file outside the evidence, has a bad range or
+// a range outside the evidence for its file, carries oversize text, or repeats
+// an earlier valid hypothesis's rank. At most maxHypotheses are kept: the
+// lowest ranks, returned in rank order. summary, hypotheses and limitations
+// must be present.
 func Validate(content string, ev []evidence.Item) (Output, []string, error) {
-	var out Output
+	// Pointer fields tell an absent (or null) field apart from a zero value.
+	var raw struct {
+		Summary     *string       `json:"summary"`
+		Hypotheses  *[]Hypothesis `json:"hypotheses"`
+		Limitations *[]string     `json:"limitations"`
+	}
 	dec := json.NewDecoder(strings.NewReader(content))
 	dec.DisallowUnknownFields()
-	if err := dec.Decode(&out); err != nil {
+	if err := dec.Decode(&raw); err != nil {
 		return Output{}, nil, fmt.Errorf("model output did not match the schema: %v", err)
 	}
+	switch {
+	case raw.Summary == nil || strings.TrimSpace(*raw.Summary) == "":
+		return Output{}, nil, errors.New("model output did not match the schema: summary is missing or empty")
+	case raw.Hypotheses == nil:
+		return Output{}, nil, errors.New("model output did not match the schema: hypotheses is missing")
+	case raw.Limitations == nil:
+		return Output{}, nil, errors.New("model output did not match the schema: limitations is missing")
+	}
+	out := Output{Summary: *raw.Summary, Hypotheses: *raw.Hypotheses, Limitations: *raw.Limitations}
 	ids := map[string]bool{}
 	files := map[string]bool{}
+	spans := map[string][]span{}
 	for _, e := range ev {
 		ids[e.ID] = true
 		if e.File != "" {
 			files[e.File] = true
+			if e.LineStart > 0 {
+				spans[e.File] = append(spans[e.File], span{e.LineStart, max(e.LineEnd, e.LineStart)})
+			}
 		}
 	}
-	rejected := []string{}
-	kept := []Hypothesis{}
+	// First pass: per-item checks, then duplicate ranks (first one wins).
+	why := make([]string, len(out.Hypotheses))
+	seenRank := map[int]bool{}
+	valid := []int{}
 	for i, h := range out.Hypotheses {
-		why := checkHypothesis(h, ids, files)
-		if why != "" {
-			rejected = append(rejected, fmt.Sprintf("hypothesis %d (%q): %s", i+1, truncate(h.Title, 80), why))
+		why[i] = checkHypothesis(h, ids, files, spans)
+		if why[i] == "" && seenRank[h.Rank] {
+			why[i] = fmt.Sprintf("duplicate rank %d", h.Rank)
+		}
+		if why[i] == "" {
+			seenRank[h.Rank] = true
+			valid = append(valid, i)
+		}
+	}
+	// The cap keeps the best-ranked items, whatever order they arrived in.
+	sort.SliceStable(valid, func(a, b int) bool { return out.Hypotheses[valid[a]].Rank < out.Hypotheses[valid[b]].Rank })
+	kept := []Hypothesis{}
+	for n, i := range valid {
+		if n >= maxHypotheses {
+			why[i] = fmt.Sprintf("more than %d hypotheses", maxHypotheses)
 			continue
 		}
+		h := out.Hypotheses[i]
 		if h.CounterEvidenceIDs == nil {
 			h.CounterEvidenceIDs = []string{}
 		}
 		kept = append(kept, h)
+	}
+	rejected := []string{}
+	for i, h := range out.Hypotheses {
+		if why[i] != "" {
+			rejected = append(rejected, fmt.Sprintf("hypothesis %d (%q): %s", i+1, truncate(h.Title, 80), why[i]))
+		}
 	}
 	out.Hypotheses = kept
 	if out.Limitations == nil {
@@ -397,7 +454,7 @@ func Validate(content string, ev []evidence.Item) (Output, []string, error) {
 	return out, rejected, nil
 }
 
-func checkHypothesis(h Hypothesis, ids, files map[string]bool) string {
+func checkHypothesis(h Hypothesis, ids, files map[string]bool, spans map[string][]span) string {
 	if len(h.SupportingEvidenceIDs) == 0 {
 		return "cites no supporting evidence"
 	}
@@ -417,6 +474,9 @@ func checkHypothesis(h Hypothesis, ids, files map[string]bool) string {
 	if !unknownRange && (h.LineStart < 1 || h.LineEnd < h.LineStart) {
 		return fmt.Sprintf("invalid line range %d-%d", h.LineStart, h.LineEnd)
 	}
+	if !unknownRange && len(spans[h.File]) > 0 && !overlapsAny(h.LineStart, h.LineEnd, spans[h.File]) {
+		return fmt.Sprintf("line range %d-%d does not overlap any evidence for %s (within %d lines)", h.LineStart, h.LineEnd, h.File, rangeSlack)
+	}
 	switch h.ConfidenceLabel {
 	case "low", "medium", "high":
 	default:
@@ -425,5 +485,28 @@ func checkHypothesis(h Hypothesis, ids, files map[string]bool) string {
 	if h.Rank < 1 {
 		return "invalid rank"
 	}
+	for _, f := range []struct {
+		name string
+		val  string
+		max  int
+	}{
+		{"title", h.Title, maxTitleLen},
+		{"reason", h.Reason, maxReasonLen},
+		{"verification_suggestion", h.VerificationSuggestion, maxVerificationLn},
+	} {
+		if utf8.RuneCountInString(f.val) > f.max {
+			return fmt.Sprintf("%s longer than %d characters", f.name, f.max)
+		}
+	}
 	return ""
+}
+
+// overlapsAny reports whether [start,end] overlaps any span widened by rangeSlack.
+func overlapsAny(start, end int, spans []span) bool {
+	for _, s := range spans {
+		if start <= s.end+rangeSlack && end >= s.start-rangeSlack {
+			return true
+		}
+	}
+	return false
 }

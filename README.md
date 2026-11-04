@@ -109,6 +109,38 @@ With `WEB_DIR` set:
 - Other methods outside `/api` return 405.
 - Files are opened through `os.Root`, so `..` and symlinks cannot reach outside `WEB_DIR`.
 
+## CI and notifications
+
+A failing CI run can start an analysis and get the result back in two ways: the CI script waits for the result and writes a summary, or the server calls a webhook when the analysis finishes. Webhooks are the v3 contract: see "Completion notifications (v3)" in `docs/API_CONTRACT.md`.
+
+**1. Get an `analyze` key.** On a server you run, create one with `server keys create --name ci --scope analyze` (it uses `DATA_DIR`; in the Docker image: `/app/regressionmap keys create --name ci --scope analyze`) or on the UI's API Keys page. The secret (`rm_live_…`) is shown once. Store it as a CI secret, for example `REGRESSIONMAP_KEY`. Do not use an `admin` key in CI. Each key may start `RATE_LIMIT_PER_HOUR` analyses per hour. For the hosted demo, the operator gives out the keys.
+
+**2. Call the script.** `scripts/ci-analyze.sh` (POSIX sh, needs `curl` and `node`) and `scripts/ci-analyze.ps1` (Windows PowerShell 5.1) start `POST /api/analyses`, poll every 3 s, and print a markdown summary: status, baseline and HEAD PASS/FAIL from the exit codes, the ranked hypotheses with `file:line`, confidence and cited evidence IDs under the label "AI-generated hypotheses — not verified", and the number of rejected hypotheses. With `GITHUB_STEP_SUMMARY` set, the summary is also appended there.
+
+```sh
+export REGRESSIONMAP_URL=https://regressionmap.example.com   # http:// only for 127.0.0.1/localhost
+export REGRESSIONMAP_KEY=...                                  # from a CI secret; never on the command line
+REPO=my-repo BASELINE=<good-sha> sh scripts/ci-analyze.sh
+# optional: COMMAND_ID (default node-test), NOTIFY_URL, NOTIFY_FORMAT, TIMEOUT_SECONDS (600), POLL_SECONDS (3)
+```
+
+The key is read from the environment only. The shell script writes it to a private header file (created with `umask 077` in a `mktemp` directory, deleted on exit) for curl, so it is never in a process command line and never printed. Exit codes: `0` analysis done (the tests can still fail: read the summary), `1` usage error, `2` analysis error, `3` timeout, `4` HTTP or auth error (prints the API error code and message; on `429 rate_limited` also the `Retry-After` value). `docs/ci/github-actions-example.yml` is a workflow for your own repository: it runs the tests and, when they fail, downloads the script at a pinned commit and runs it.
+
+**3. Webhooks.** Add `notify_url` (and optionally `notify_format`: `json`, the default, or `slack`) to `POST /api/analyses`, or set `NOTIFY_URL` / `NOTIFY_FORMAT` for the script. The server must have `WEBHOOK_SECRET` set, otherwise it answers `400 webhooks_disabled`. When the analysis reaches `done` or `error`, the server sends one `POST` (`User-Agent: RegressionMap-Webhook/1`, 5 s timeout per attempt, up to 3 attempts after 1 s and 4 s, retried only on network errors, 5xx and 429). `json` bodies carry `event`, `id`, `repo`, `status`, the baseline and HEAD SHAs and PASS flags, `model_status` and `top_hypothesis` (or `null`). They are signed: `X-RegressionMap-Event: analysis.completed` and `X-RegressionMap-Signature: sha256=<hex HMAC-SHA256 of the exact body with WEBHOOK_SECRET>`. `slack` bodies are `{"text": "…"}`, a one-paragraph summary with no evidence and no source code, ending with "AI-generated hypothesis, not verified." Slack bodies are not signed; the token in the Slack URL protects them. `GET /api/analyses/{id}` shows the delivery under `notification` (host only, status, attempts). Treat a notify URL as a secret: the server never logs, returns or stores it, and the scripts never print it. Verify a `json` webhook on the raw body, before parsing it:
+
+```js
+const crypto = require('node:crypto');
+function verifySignature(rawBody, header, secret) { // rawBody: Buffer with the exact request body
+  const want = Buffer.from('sha256=' + crypto.createHmac('sha256', secret).update(rawBody).digest('hex'));
+  const got = Buffer.from(String(header || ''));
+  return got.length === want.length && crypto.timingSafeEqual(got, want);
+}
+```
+
+**SSRF rules.** A `notify_url` must be `https://`, at most 2048 characters, have no user info, and use port 443 or none (`400 invalid_notify_url` otherwise). At delivery time the server resolves the host and refuses to send the request if any resolved address is not public: loopback, private, link-local, CGNAT, multicast, unspecified or cloud-metadata addresses, for IPv4 and IPv6. It connects only to an address that passed this check, so a DNS rebind between the check and the connection cannot redirect it, and it does not follow redirects.
+
+**Hosted vs self-hosted.** The server analyses its own git clone under `WORKSPACE_ROOT`, at that clone's HEAD. It does not receive code from CI. The hosted demo contains only `pagination-demo`, so for any other repository it answers `400 invalid_repo`. To analyse your own repository, run a server yourself with a clone of it in `WORKSPACE_ROOT`, keep that clone at the commit that failed, and give the baseline as a commit that exists in the clone (otherwise `400 invalid_baseline`). Hosted bring-your-own-repo is a plan, not a feature: see `docs/ROADMAP-billing.md`.
+
 ## Safety design
 
 - No shell: git and test processes are started from argument arrays. Revisions must be `HEAD` or hex and are resolved to a full SHA before use.

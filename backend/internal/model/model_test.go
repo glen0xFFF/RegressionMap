@@ -436,3 +436,154 @@ func TestAllRejectedIsInvalid(t *testing.T) {
 		t.Fatalf("got %+v", r)
 	}
 }
+
+// Required top-level fields must be present: json decoding alone fills zero
+// values, so absence has to be detected explicitly.
+func TestValidateRequiresTopLevelFields(t *testing.T) {
+	h := `{"rank":1,"title":"t","file":"src/pagination.ts","line_start":10,"line_end":10,"reason":"r","supporting_evidence_ids":["E2"],"counter_evidence_ids":[],"verification_suggestion":"v","confidence_label":"medium"}`
+	cases := map[string]string{
+		"no summary":        `{"hypotheses":[` + h + `],"limitations":["l"]}`,
+		"empty summary":     `{"summary":"","hypotheses":[` + h + `],"limitations":["l"]}`,
+		"blank summary":     `{"summary":"   ","hypotheses":[` + h + `],"limitations":["l"]}`,
+		"null summary":      `{"summary":null,"hypotheses":[` + h + `],"limitations":["l"]}`,
+		"no hypotheses":     `{"summary":"s","limitations":["l"]}`,
+		"null hypotheses":   `{"summary":"s","hypotheses":null,"limitations":["l"]}`,
+		"no limitations":    `{"summary":"s","hypotheses":[` + h + `]}`,
+		"null limitations":  `{"summary":"s","hypotheses":[` + h + `],"limitations":null}`,
+		"neither sum/limit": `{"hypotheses":[` + h + `]}`,
+	}
+	for name, raw := range cases {
+		if _, _, err := Validate(raw, ev); err == nil {
+			t.Errorf("%s: Validate accepted %s", name, raw)
+		}
+	}
+	// present-but-empty arrays are fine
+	if _, _, err := Validate(`{"summary":"s","hypotheses":[],"limitations":[]}`, ev); err != nil {
+		t.Fatalf("empty arrays rejected: %v", err)
+	}
+}
+
+func TestMissingSummaryIsInvalidStatus(t *testing.T) {
+	raw := `{"hypotheses":[{"rank":1,"title":"t","file":"src/pagination.ts","line_start":10,"line_end":10,"reason":"r","supporting_evidence_ids":["E2"],"counter_evidence_ids":[],"verification_suggestion":"v","confidence_label":"medium"}]}`
+	s := server(t, 200, raw, nil, nil)
+	defer s.Close()
+	r := (&Client{BaseURL: s.URL, APIKey: "k", Model: "m"}).Analyze(context.Background(), Input{Evidence: ev})
+	if r.Status != "invalid" || r.Result != nil || !strings.Contains(r.Message, "summary") {
+		t.Fatalf("got %+v", r)
+	}
+}
+
+// A non-zero range must overlap (with +/-3 lines slack) an evidence item for
+// the same file that has a known range.
+func TestValidateRangeMustOverlapEvidence(t *testing.T) {
+	raw := content(
+		hyp(1, "src/pagination.ts", 900, 999, "E2"), // far outside 7-13
+		hyp(2, "src/pagination.ts", 10, 11, "E2"),   // inside
+		hyp(3, "src/pagination.ts", 15, 16, "E2"),   // 2 lines after 13: within slack
+		hyp(4, "src/pagination.ts", 3, 4, "E2"),     // 3 lines before 7: within slack
+		hyp(5, "src/pagination.ts", 17, 20, "E2"),   // 4 lines after 13: outside slack
+		hyp(1, "src/pagination.ts", 0, 0, "E2"),     // unknown range still fine
+	)
+	res, rejected, err := Validate(raw, ev)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Hypotheses) != 4 {
+		t.Fatalf("kept %+v rejected %v", res.Hypotheses, rejected)
+	}
+	if len(rejected) != 2 || !strings.Contains(rejected[0], "900-999") || !strings.Contains(rejected[0], "does not overlap") ||
+		!strings.Contains(rejected[1], "17-20") {
+		t.Fatalf("rejected %v", rejected)
+	}
+}
+
+// A file whose evidence has no known range keeps the old behaviour: any
+// well-formed range is accepted.
+func TestValidateRangeWithoutKnownEvidenceRange(t *testing.T) {
+	ev2 := append([]evidence.Item{{ID: "E9", Type: "changed_file", File: "src/nolines.ts"}}, ev...)
+	res, rejected, err := Validate(content(hyp(1, "src/nolines.ts", 900, 999, "E9")), ev2)
+	if err != nil || len(res.Hypotheses) != 1 || len(rejected) != 0 {
+		t.Fatalf("err=%v kept=%v rejected=%v", err, res.Hypotheses, rejected)
+	}
+}
+
+func TestValidateKeepsAtMostFiveHypotheses(t *testing.T) {
+	var hs []map[string]any
+	for i := 1; i <= 7; i++ {
+		hs = append(hs, hyp(i, "src/pagination.ts", 10, 10, "E2"))
+	}
+	res, rejected, err := Validate(content(hs...), ev)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Hypotheses) != 5 || res.Hypotheses[4].Rank != 5 {
+		t.Fatalf("kept %+v", res.Hypotheses)
+	}
+	if len(rejected) != 2 || !strings.Contains(rejected[0], "more than 5 hypotheses") || !strings.Contains(rejected[1], "more than 5 hypotheses") {
+		t.Fatalf("rejected %v", rejected)
+	}
+}
+
+func TestValidateRejectsOversizeText(t *testing.T) {
+	long := func(n int) string { return strings.Repeat("é", n) } // multi-byte: limits count characters
+	ok := hyp(1, "src/pagination.ts", 10, 10, "E2")
+	ok["title"], ok["reason"], ok["verification_suggestion"] = long(200), long(2000), long(500)
+	title := hyp(2, "src/pagination.ts", 10, 10, "E2")
+	title["title"] = long(201)
+	reason := hyp(3, "src/pagination.ts", 10, 10, "E2")
+	reason["reason"] = long(2001)
+	verif := hyp(4, "src/pagination.ts", 10, 10, "E2")
+	verif["verification_suggestion"] = long(501)
+	res, rejected, err := Validate(content(ok, title, reason, verif), ev)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Hypotheses) != 1 || res.Hypotheses[0].Rank != 1 {
+		t.Fatalf("kept %d hypotheses, rejected %v", len(res.Hypotheses), rejected)
+	}
+	if len(rejected) != 3 || !strings.Contains(rejected[0], "title longer than 200") ||
+		!strings.Contains(rejected[1], "reason longer than 2000") ||
+		!strings.Contains(rejected[2], "verification_suggestion longer than 500") {
+		t.Fatalf("rejected %v", rejected)
+	}
+}
+
+func TestValidateCapKeepsBestRanksWhenOutOfOrder(t *testing.T) {
+	var hs []map[string]any
+	for i := 7; i >= 1; i-- {
+		hs = append(hs, hyp(i, "src/pagination.ts", 10, 10, "E2"))
+	}
+	res, rejected, err := Validate(content(hs...), ev)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ranks []int
+	for _, h := range res.Hypotheses {
+		ranks = append(ranks, h.Rank)
+	}
+	if fmt.Sprint(ranks) != "[1 2 3 4 5]" {
+		t.Fatalf("kept ranks %v, rejected %v", ranks, rejected)
+	}
+	// Input positions 1 and 2 carry ranks 7 and 6.
+	if len(rejected) != 2 || !strings.HasPrefix(rejected[0], "hypothesis 1 ") || !strings.HasPrefix(rejected[1], "hypothesis 2 ") ||
+		!strings.Contains(rejected[0], "more than 5 hypotheses") || !strings.Contains(rejected[1], "more than 5 hypotheses") {
+		t.Fatalf("rejected %v", rejected)
+	}
+}
+
+func TestValidateRejectsDuplicateRank(t *testing.T) {
+	res, rejected, err := Validate(content(
+		hyp(1, "src/pagination.ts", 10, 10, "E2"),
+		hyp(1, "src/pagination.ts", 11, 11, "E2"),
+		hyp(2, "src/pagination.ts", 12, 12, "E2"),
+	), ev)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Hypotheses) != 2 || res.Hypotheses[0].LineStart != 10 || res.Hypotheses[1].Rank != 2 {
+		t.Fatalf("kept %+v", res.Hypotheses)
+	}
+	if len(rejected) != 1 || !strings.HasPrefix(rejected[0], "hypothesis 2 ") || !strings.Contains(rejected[0], "duplicate rank 1") {
+		t.Fatalf("rejected %v", rejected)
+	}
+}

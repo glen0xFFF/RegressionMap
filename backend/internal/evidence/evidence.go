@@ -9,6 +9,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 )
 
 // Item is one piece of evidence. JSON shape matches docs/API_CONTRACT.md.
@@ -52,6 +53,38 @@ type Limits struct {
 }
 
 const truncMark = "\n…[truncated]"
+
+// maxTitle caps a title in bytes (before the mark) so a huge test name cannot
+// blow the budget; titleTruncMark is appended when it is cut.
+const (
+	maxTitle       = 200
+	titleTruncMark = "…[truncated]"
+)
+
+// capTitle truncates s to at most maxTitle bytes on a rune boundary.
+func capTitle(s string) string {
+	if len(s) <= maxTitle {
+		return s
+	}
+	cut := maxTitle
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut] + titleTruncMark
+}
+
+// RedactPath redacts each path segment on its own, so a secret-looking
+// segment becomes [REDACTED] while the rest of the path stays usable.
+// Build applies it to Item.File; callers that send file names alongside the
+// evidence (for example a changed-files list) must use it too, so no secret
+// leaks and cited paths still match Item.File.
+func RedactPath(p string) string {
+	segs := strings.Split(p, "/")
+	for i, s := range segs {
+		segs[i] = Redact(s)
+	}
+	return strings.Join(segs, "/")
+}
 
 func itoa(i int) string { return strconv.Itoa(i) }
 
@@ -222,6 +255,16 @@ func Build(failures []Failure, hunks []Hunk, readFile func(string) (string, erro
 	var items []Item
 	total := 0
 	add := func(it Item) {
+		// Title and File reach the model too. A path embedded in the title is
+		// swapped for its segment-redacted form so both stay consistent and
+		// usable; everything else in the title goes through Redact.
+		const ph = "\x00"
+		title := it.Title
+		if it.File != "" {
+			title = strings.ReplaceAll(title, it.File, ph)
+		}
+		it.File = RedactPath(it.File)
+		it.Title = capTitle(strings.ReplaceAll(Redact(title), ph, it.File))
 		it.Excerpt = Redact(it.Excerpt)
 		if len(it.Excerpt) > lim.MaxExcerpt {
 			it.Excerpt = it.Excerpt[:lim.MaxExcerpt] + truncMark

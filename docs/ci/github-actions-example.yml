@@ -1,0 +1,121 @@
+# Example GitHub Actions workflow for YOUR repository (not for RegressionMap
+# itself). Copy it to .github/workflows/tests.yml in your repository.
+#
+# What it does: runs your tests. If they fail, a second job asks a RegressionMap
+# server to compare the baseline commit with HEAD and posts a markdown summary
+# (ranked, AI-generated hypotheses with file:line and cited evidence IDs) to the
+# job summary page.
+#
+# READ THIS FIRST: the RegressionMap server analyses its OWN clone.
+#   - The server runs the tests in a git clone of your repository that lives
+#     directly under its WORKSPACE_ROOT. It does not receive your code from CI.
+#     The REPO value below is the name of that directory on the server.
+#   - The server tests the HEAD of that clone. Keep the clone up to date (for
+#     example a `git fetch && git checkout <sha>` on the server) or the analysis
+#     looks at an older commit than the one that failed here.
+#   - So you need a SELF-HOSTED RegressionMap server with your repository in
+#     WORKSPACE_ROOT. The hosted demo contains only `pagination-demo`; for any
+#     other repository it answers `400 invalid_repo`, and the script exits 4.
+#   - The server runs your test command in that clone. Only point it at code
+#     you trust.
+#
+# Setup in your repository (Settings > Secrets and variables > Actions):
+#   secrets.REGRESSIONMAP_URL   https://your-regressionmap.example.com
+#   secrets.REGRESSIONMAP_KEY   an `analyze` key (rm_live_...). Create it on the
+#                               server with `regressionmap keys create --name ci --scope analyze`
+#                               or on the UI's API Keys page. Never use an admin key here.
+#   vars.REGRESSIONMAP_REPO     optional: directory name on the server, if it is
+#                               not the same as this repository's name.
+#   secrets.REGRESSIONMAP_NOTIFY_URL  optional: https webhook (for example Slack).
+#                               A webhook URL contains a token: keep it a secret.
+#
+# Secrets are passed to steps through `env:` only. They are never echoed, never
+# put on a command line, and the script writes the key to a private header file
+# for curl. Pull requests from forks do not get secrets; the analysis step then
+# skips itself.
+
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Least privilege: read the code, nothing else.
+permissions:
+  contents: read
+
+# Actions pinned to full commit SHAs (same pins as RegressionMap's own CI):
+#   actions/checkout   v7.0.1 -> 3d3c42e5aac5ba805825da76410c181273ba90b1
+#   actions/setup-node v7.1.0 -> 949feb2413d6458794dcd2491c4babbbce0c15c1
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+
+      - run: npm ci
+
+      # RegressionMap's allowlisted command is `node --test` (COMMAND_ID node-test).
+      - run: node --test
+
+  regressionmap:
+    needs: test
+    # Only when the test job failed (not when it was cancelled or skipped).
+    if: ${{ failure() && needs.test.result == 'failure' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      # Download the script from the RegressionMap repository at a PINNED commit.
+      # Replace <PINNED_SHA> with a full 40-character commit SHA you have
+      # reviewed, and <SCRIPT_SHA256> with `sha256sum scripts/ci-analyze.sh` at
+      # that commit. Never use a branch name here: whoever can push to that
+      # branch could change what runs with your key. Until both placeholders
+      # are replaced, this step fails on purpose.
+      - name: Download ci-analyze.sh (pinned)
+        env:
+          SCRIPT_URL: https://raw.githubusercontent.com/glen0xFFF/RegressionMap/<PINNED_SHA>/scripts/ci-analyze.sh
+          SCRIPT_SHA256: <SCRIPT_SHA256>
+        run: |
+          curl -fsSL --proto '=https' --tlsv1.2 "$SCRIPT_URL" -o "$RUNNER_TEMP/ci-analyze.sh"
+          echo "$SCRIPT_SHA256  $RUNNER_TEMP/ci-analyze.sh" | sha256sum -c -
+
+      - name: Analyze the regression
+        env:
+          REGRESSIONMAP_URL: ${{ secrets.REGRESSIONMAP_URL }}
+          REGRESSIONMAP_KEY: ${{ secrets.REGRESSIONMAP_KEY }}
+          REPO: ${{ vars.REGRESSIONMAP_REPO || github.event.repository.name }}
+          # Known-good commit: the previous tip for a push, the base branch
+          # commit for a pull request. If that commit already failed, set a
+          # better baseline here (it must exist in the server's clone, or the
+          # server answers `400 invalid_baseline`).
+          BASELINE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+          COMMAND_ID: node-test
+          TIMEOUT_SECONDS: "600"
+          # Optional completion webhook (the server must have WEBHOOK_SECRET set,
+          # otherwise it answers `400 webhooks_disabled`):
+          # NOTIFY_URL: ${{ secrets.REGRESSIONMAP_NOTIFY_URL }}
+          # NOTIFY_FORMAT: slack
+        # Inputs reach the script through env only; no ${{ }} inside `run`.
+        run: |
+          if [ -z "$REGRESSIONMAP_URL" ] || [ -z "$REGRESSIONMAP_KEY" ]; then
+            echo "::notice::RegressionMap secrets are not available (for example a pull request from a fork). Skipping."
+            exit 0
+          fi
+          case "$BASELINE" in
+            '' | 0000000000000000000000000000000000000000)
+              echo "::notice::No baseline commit (first push of a new branch?). Skipping."
+              exit 0 ;;
+          esac
+          # Exit codes: 0 done, 2 analysis error, 3 timeout, 4 HTTP/auth error.
+          sh "$RUNNER_TEMP/ci-analyze.sh"

@@ -286,3 +286,54 @@ func TestStartupLogShowsAuthSettings(t *testing.T) {
 		t.Fatalf("startup log lacks auth settings: %s", out)
 	}
 }
+
+func TestLoadConfigWebhookSecret(t *testing.T) {
+	root := t.TempDir()
+	cfg, _, err := loadConfig(envOf(map[string]string{"WORKSPACE_ROOT": root}))
+	if err != nil || cfg.WebhookSecret != "" {
+		t.Fatalf("unset: %q %v", cfg.WebhookSecret, err)
+	}
+	short := "short-webhook-secret-0123456789" // 31 characters
+	_, _, err = loadConfig(envOf(map[string]string{"WORKSPACE_ROOT": root, "WEBHOOK_SECRET": short}))
+	if err == nil || !strings.Contains(err.Error(), "WEBHOOK_SECRET") || !strings.Contains(err.Error(), "32") {
+		t.Fatalf("short secret: %v", err)
+	}
+	if strings.Contains(err.Error(), short) {
+		t.Fatalf("error echoes the secret: %v", err)
+	}
+	ok := "exactly-32-characters-secret-abc"
+	if len(ok) != 32 {
+		t.Fatal("fixture length")
+	}
+	cfg, _, err = loadConfig(envOf(map[string]string{"WORKSPACE_ROOT": root, "WEBHOOK_SECRET": ok}))
+	if err != nil || cfg.WebhookSecret != ok {
+		t.Fatalf("32 chars: %q %v", cfg.WebhookSecret, err)
+	}
+}
+
+func TestStartupLogShowsWebhooksEnabledNeverSecret(t *testing.T) {
+	const secret = "webhook-secret-must-never-be-logged-0123"
+	for _, tc := range []struct {
+		secret, text, json string
+	}{
+		{secret, "webhooks_enabled=true", `"webhooks_enabled":true`},
+		{"", "webhooks_enabled=false", `"webhooks_enabled":false`},
+	} {
+		for _, format := range []string{"text", "json"} {
+			var buf bytes.Buffer
+			lg, _ := newLogger(&buf, format)
+			logStartup(lg, config{Addr: "127.0.0.1:8787", WebhookSecret: tc.secret}, nil)
+			out := buf.String()
+			if strings.Contains(out, secret) {
+				t.Fatalf("%s: startup log leaked the webhook secret: %s", format, out)
+			}
+			want := tc.text
+			if format == "json" {
+				want = tc.json
+			}
+			if !strings.Contains(out, want) {
+				t.Fatalf("%s: startup log lacks %s: %s", format, want, out)
+			}
+		}
+	}
+}

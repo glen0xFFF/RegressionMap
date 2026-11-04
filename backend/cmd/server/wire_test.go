@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"io"
 	"log/slog"
 	"net/http"
@@ -48,5 +49,51 @@ func TestBuildHandlerAppliesSecurityChain(t *testing.T) {
 	h.ServeHTTP(rec, req)
 	if rec.Code != 200 {
 		t.Fatalf("list endpoint: %d %s", rec.Code, rec.Body)
+	}
+}
+
+func localPOST(h http.Handler, path, body string) *httptest.ResponseRecorder {
+	req := httptest.NewRequest("POST", path, strings.NewReader(body))
+	req.Host = "127.0.0.1:8787"
+	req.RemoteAddr = "127.0.0.1:50000"
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	return rec
+}
+
+// WEBHOOK_SECRET reaches api.Config: with it notify_url is validated, without
+// it any notify_url is refused. The access log never holds the URL.
+func TestBuildHandlerWiresWebhookSecret(t *testing.T) {
+	const hook = "https://hooks.example.com/services/T0/B0/PATHSECRET?token=QUERYSECRET"
+	body := func(u string) string {
+		return `{"repo":"nope","baseline":"HEAD","command_id":"node-test","notify_url":"` + u + `"}`
+	}
+	var logs bytes.Buffer
+	lg := slog.New(slog.NewTextHandler(&logs, nil))
+
+	on, _, err := buildHandler(config{Root: t.TempDir(), ModelID: "m", WebhookSecret: strings.Repeat("s", 32)}, lg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec := localPOST(on, "/api/analyses", body("http://hooks.example.com/x")); rec.Code != 400 || !strings.Contains(rec.Body.String(), "invalid_notify_url") {
+		t.Fatalf("with secret, http URL: %d %s", rec.Code, rec.Body)
+	}
+	// A valid URL passes the notify checks and fails later, on the repo.
+	if rec := localPOST(on, "/api/analyses", body(hook)); rec.Code != 400 || !strings.Contains(rec.Body.String(), "invalid_repo") {
+		t.Fatalf("with secret, valid URL: %d %s", rec.Code, rec.Body)
+	}
+
+	off, _, err := buildHandler(config{Root: t.TempDir(), ModelID: "m"}, lg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec := localPOST(off, "/api/analyses", body(hook)); rec.Code != 400 || !strings.Contains(rec.Body.String(), "webhooks_disabled") {
+		t.Fatalf("without secret: %d %s", rec.Code, rec.Body)
+	}
+	for _, leak := range []string{"PATHSECRET", "QUERYSECRET", "/services/"} {
+		if strings.Contains(logs.String(), leak) {
+			t.Fatalf("access log leaks %q: %s", leak, logs.String())
+		}
 	}
 }

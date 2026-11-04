@@ -61,7 +61,7 @@ func waitIdle(t *testing.T, s *Server) {
 	deadline := time.Now().Add(60 * time.Second)
 	for time.Now().Before(deadline) {
 		s.mu.Lock()
-		idle := s.active == 0 && len(s.verifying) == 0
+		idle := s.active == 0 && len(s.verifying) == 0 && s.delivering == 0
 		s.mu.Unlock()
 		if idle {
 			return

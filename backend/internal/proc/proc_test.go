@@ -22,6 +22,11 @@ func TestMain(m *testing.M) {
 	case "sleep":
 		time.Sleep(5 * time.Second)
 		os.Exit(0)
+	case "env":
+		for _, kv := range os.Environ() {
+			os.Stdout.WriteString(kv + "\n")
+		}
+		os.Exit(0)
 	}
 	os.Exit(m.Run())
 }
@@ -70,5 +75,63 @@ func TestRunMissingBinaryIsFailure(t *testing.T) {
 	r := Run(context.Background(), Spec{Argv: []string{"definitely-not-a-binary-xyz"}, Timeout: time.Second, MaxOutput: 100})
 	if r.Passed || r.ExitCode == 0 || r.StartError == "" {
 		t.Fatalf("got %+v", r)
+	}
+}
+
+// childEnvNames runs the helper and returns the upper-cased names of every
+// variable the child process actually received.
+func childEnvNames(t *testing.T) map[string]string {
+	t.Helper()
+	r := Run(context.Background(), helper("env"))
+	if !r.Passed {
+		t.Fatalf("env helper failed: %+v", r)
+	}
+	got := map[string]string{}
+	for _, l := range strings.Split(r.Stdout, "\n") {
+		if i := strings.Index(l[min(1, len(l)):], "="); i >= 0 {
+			i++
+			got[strings.ToUpper(l[:i])] = l[i+1:]
+		}
+	}
+	return got
+}
+
+func TestRunStripsSecretsFromChildEnv(t *testing.T) {
+	secrets := []string{
+		"MODEL_API_KEY", "MODEL_API_KEY_FILE", "WEBHOOK_SECRET",
+		"STRIPE_KEY", "github_token", "Db_Password", "SESSION_SECRET", "NPM_TOKEN",
+	}
+	for _, k := range secrets {
+		t.Setenv(k, "leak-"+k)
+	}
+	t.Setenv("REGRESSIONMAP_NORMAL", "keep-me")
+	t.Setenv("KEYBOARD_LAYOUT", "keep-too") // contains KEY but does not end with _KEY
+	got := childEnvNames(t)
+	for _, k := range secrets {
+		if v, ok := got[strings.ToUpper(k)]; ok {
+			t.Errorf("child saw secret %s=%q", k, v)
+		}
+	}
+	if got["REGRESSIONMAP_NORMAL"] != "keep-me" || got["KEYBOARD_LAYOUT"] != "keep-too" {
+		t.Errorf("normal vars not passed through: %q %q", got["REGRESSIONMAP_NORMAL"], got["KEYBOARD_LAYOUT"])
+	}
+	if _, ok := got["PATH"]; !ok {
+		t.Error("PATH not passed through")
+	}
+	if got["PROC_HELPER"] != "env" {
+		t.Error("Spec.Env extras not appended")
+	}
+}
+
+func TestIsSecretEnv(t *testing.T) {
+	for name, want := range map[string]bool{
+		"MODEL_API_KEY": true, "MODEL_API_KEY_FILE": true, "WEBHOOK_SECRET": true,
+		"aws_secret": true, "X_TOKEN": true, "PG_PASSWORD": true, "my_key": true,
+		"PATH": false, "HOME": false, "USERPROFILE": false, "KEY": false,
+		"TOKENIZER": false, "PASSWORD_HINT_SHOWN": false, "SYSTEMROOT": false,
+	} {
+		if got := isSecretEnv(name); got != want {
+			t.Errorf("isSecretEnv(%q) = %v, want %v", name, got, want)
+		}
 	}
 }

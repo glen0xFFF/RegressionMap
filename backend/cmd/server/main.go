@@ -15,6 +15,8 @@
 //	LOG_FORMAT                 text (default) or json
 //	ALLOWED_HOSTS              comma-separated extra Host/Origin names (e.g. regressionmap.example.com)
 //	RATE_LIMIT_PER_HOUR        per-key POST /api/analyses limit (default 20)
+//	WEBHOOK_SECRET             enables completion webhooks (notify_url); HMAC key,
+//	                           at least 32 characters; never logged
 //
 // Requests that are not local (loopback peer, loopback Host, no
 // X-Forwarded-For/Forwarded) need "Authorization: Bearer <key>" on /api/*,
@@ -62,7 +64,7 @@ func main() {
 // security headers.
 func buildHandler(cfg config, lg *slog.Logger) (http.Handler, *api.Server, error) {
 	mc := &model.Client{BaseURL: cfg.ModelBaseURL, APIKey: cfg.Key, Model: cfg.ModelID}
-	apiSrv := api.New(api.Config{Root: cfg.Root, Model: mc, DataDir: cfg.DataDir})
+	apiSrv := api.New(api.Config{Root: cfg.Root, Model: mc, DataDir: cfg.DataDir, WebhookSecret: cfg.WebhookSecret})
 	h, err := newHandler(apiSrv, cfg.WebDir)
 	if err != nil {
 		return nil, nil, err
