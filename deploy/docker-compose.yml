@@ -18,8 +18,10 @@ services:
     container_name: regressionmap
     restart: unless-stopped
 
-    # deploy/.env holds MODEL_API_KEY only (chmod 600, never committed, never
-    # in the image). Compose refuses to start if it is missing.
+    # deploy/.env holds MODEL_API_KEY and, optionally, WEBHOOK_SECRET (chmod
+    # 600, never committed, never in the image). Secrets go there, never into
+    # the environment list below, which is committed. Compose refuses to
+    # start if the file is missing.
     env_file:
       - .env
     environment:
@@ -46,7 +48,10 @@ services:
     pids_limit: 256
     mem_limit: 1g
     cpus: 1.0
-    stop_grace_period: 15s
+    # SIGTERM starts a shutdown of up to 35 s: 10 s for open requests, then
+    # up to 25 s for running analyses and their webhooks. Docker kills the
+    # container when the grace period ends.
+    stop_grace_period: 40s
 
     logging:
       driver: json-file

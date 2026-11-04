@@ -20,7 +20,7 @@ RegressionMap takes a local Git repository, a known-good baseline commit, and an
 1. Runs the tests at the baseline and at HEAD, each in a temporary `git worktree`, and records the real exit codes and output.
 2. Collects evidence and gives each item a stable ID (E1, E2, …): failing assertions with actual and expected values, stack frames with the real source lines, diff hunks, and the current source of changed files.
 3. Sends this bounded, redacted evidence bundle to a Meta model and asks for ranked root-cause hypotheses as strict JSON. Each hypothesis must cite evidence IDs and may list counter-evidence.
-4. Validates every hypothesis. Any hypothesis that cites an unknown ID, names a file outside the evidence, uses an unsafe path, or gives an invalid line range is rejected and shown as rejected.
+4. Validates the model output. A result with a missing `summary`, `hypotheses` or `limitations` field is invalid. A hypothesis is rejected, and shown as rejected with its reason, when it cites no evidence ID, cites an unknown ID, uses an unsafe path or names a file outside the evidence, gives an invalid line range or one more than 3 lines away from the evidence for that file, has an unknown confidence label or a rank below 1, or repeats an earlier rank. Only the 5 best-ranked hypotheses are kept. A title, reason or verification suggestion over its limit (200, 2000 and 500 characters) is cut and ends with `…[truncated]`.
 5. Lets the developer apply a fix and approve a verification rerun. The test runner's exit code decides PASS or FAIL. The model never does.
 
 ## What makes it different
@@ -45,7 +45,9 @@ RegressionMap is not a chatbot. The tools collect the evidence deterministically
 - Test commands come from an allowlist and are selected by ID. Each run has a timeout and an output cap.
 - A verification run requires `"approved": true`. The Run button stays disabled until the user ticks the approval box.
 - Repositories must be direct children of the configured workspace root.
-- The API key is kept on the backend only. It is never returned to the browser, it is scrubbed from error messages, and it is removed from the environment of test processes.
+- The API key is kept on the backend only. It is never returned to the browser and it is scrubbed from error messages.
+- Test runs, verification runs and git never receive the model key, the webhook secret, or any variable whose name ends in `_KEY`, `_SECRET`, `_TOKEN` or `_PASSWORD`. An operator can let named variables through to test and verification runs with `TEST_ENV_ALLOW`, never to git and never the server's own secrets. The startup log lists the names, never the values, of the variables that test runs do not get.
+- Completion webhooks are off unless the operator sets `WEBHOOK_SECRET` (at least 32 characters). `json` deliveries are signed with HMAC-SHA256. The server sends them only over `https://` to hosts whose every address is public, checks the address again at connect time, follows no redirects, and never logs, returns or stores the full notify URL.
 - Likely secrets in the evidence are redacted before the model request.
 
 ## New work completed during the hackathon
