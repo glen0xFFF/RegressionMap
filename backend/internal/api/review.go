@@ -59,12 +59,16 @@ func (s *Server) reviewChange(ctx context.Context, id string, in model.Input) mo
 		rctx, cancel = context.WithDeadline(ctx, end)
 		defer cancel()
 	}
-	// cutOff reports that the chain's deadline passed while the job lives.
-	cutOff := func() bool {
-		return errors.Is(rctx.Err(), context.DeadlineExceeded) && ctx.Err() == nil
+	// cutOff reports that a call that ended with status was cut off by the
+	// chain's deadline while the job lives. Such a call ends as an error, or
+	// as invalid when the deadline cut short the body of a 200 answer, which
+	// then is not a chat completion.
+	cutOff := func(status string) bool {
+		return (status == "error" || status == "invalid") &&
+			errors.Is(rctx.Err(), context.DeadlineExceeded) && ctx.Err() == nil
 	}
 	rv := mc.Review(rctx, in)
-	if rv.Status == "error" && cutOff() {
+	if cutOff(rv.Status) {
 		rv = mc.NoReview("error", msgReviewDeadline)
 	}
 	s.keepReviewOutcome(id, rv)
@@ -72,7 +76,7 @@ func (s *Server) reviewChange(ctx context.Context, id string, in model.Input) mo
 		return rv
 	}
 	checked := mc.Check(rctx, in, rv)
-	if checked.CheckStatus == "error" && cutOff() {
+	if cutOff(checked.CheckStatus) {
 		checked = rv.EndCheck("error", msgCheckDeadline)
 	}
 	s.keepReviewOutcome(id, checked)

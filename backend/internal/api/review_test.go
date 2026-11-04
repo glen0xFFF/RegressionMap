@@ -43,6 +43,7 @@ type chainAnswer struct {
 	status  int           // HTTP status; 0 means 200 with content
 	content string        // the answer's message content
 	hold    chan struct{} // when set, the answer waits until it is closed or the request ends
+	partial string        // when set, a 200 answer whose body stops after these bytes, then waits as for hold
 }
 
 // chainModel is a fake chat-completions endpoint that answers each request
@@ -82,6 +83,18 @@ func newChainModel(t *testing.T) *chainModel {
 			m.inFlight--
 			m.mu.Unlock()
 		}()
+		if ans.partial != "" {
+			// The header and the start of the body go out at once; the rest
+			// never does.
+			w.WriteHeader(http.StatusOK)
+			io.WriteString(w, ans.partial)
+			w.(http.Flusher).Flush()
+			select {
+			case <-ans.hold:
+			case <-r.Context().Done():
+			}
+			return
+		}
 		if ans.hold != nil {
 			select {
 			case <-ans.hold:
@@ -455,6 +468,35 @@ func TestReviewChangeDeadlines(t *testing.T) {
 		}
 		if n := m.Names(); len(n) != 0 {
 			t.Fatalf("model calls %v, want none", n)
+		}
+	})
+
+	// A deadline that lands while the body of an answer is being read cuts
+	// the body short. The call is still running at that point, so the result
+	// is the deadline message, not an invalid answer (contract rule 4).
+	const cutBody = `{"choices":[{"message":{"content":"`
+	t.Run("review cut off mid-body", func(t *testing.T) {
+		m := newChainModel(t)
+		m.set("ChangeReview", chainAnswer{partial: cutBody})
+		m.hold(t, "ChangeReview")
+		s := New(Config{Root: t.TempDir(), Model: m.client()})
+		rv := s.reviewChange(jobCtx(t, time.Second+300*time.Millisecond), "a1", in)
+		if rv.Status != "error" || rv.Message != msgReviewDeadline || rv.CheckStatus != "skipped" || rv.CheckMessage != "no review to check" {
+			t.Fatalf("review %+v, want error %q", rv, msgReviewDeadline)
+		}
+	})
+
+	t.Run("check cut off mid-body", func(t *testing.T) {
+		m := newChainModel(t)
+		m.set("FindingChecks", chainAnswer{partial: cutBody})
+		m.hold(t, "FindingChecks")
+		s := New(Config{Root: t.TempDir(), Model: m.client()})
+		rv := s.reviewChange(jobCtx(t, time.Second+300*time.Millisecond), "a1", in)
+		if rv.Status != "ok" || rv.Message != "" || rv.CheckStatus != "error" || rv.CheckMessage != msgCheckDeadline {
+			t.Fatalf("review %+v, want ok with check_status error %q", rv, msgCheckDeadline)
+		}
+		if got := verdicts(&rv); !slices.Equal(got, []string{"unchecked"}) || rv.Counts != (model.ReviewCounts{Unchecked: 1}) {
+			t.Fatalf("verdicts %q counts %+v, want one unchecked finding", got, rv.Counts)
 		}
 	})
 
