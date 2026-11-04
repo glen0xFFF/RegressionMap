@@ -250,7 +250,16 @@ func TestReviewRequestShape(t *testing.T) {
 func TestValidateReviewRejections(t *testing.T) {
 	base := func() map[string]any { return finding("code", "high", "src/pagination.ts", 7, 8, "E2") }
 	with := func(k string, v any) map[string]any { f := base(); f[k] = v; return f }
+	// withAll sets several keys, for rows that break more than one rule.
+	withAll := func(kv ...any) map[string]any {
+		f := base()
+		for i := 0; i+1 < len(kv); i += 2 {
+			f[kv[i].(string)] = kv[i+1]
+		}
+		return f
+	}
 	one := func(f map[string]any) []map[string]any { return []map[string]any{f} }
+	x80 := strings.Repeat("x", 80)
 	cases := []struct {
 		name string
 		fs   []map[string]any
@@ -278,6 +287,30 @@ func TestValidateReviewRejections(t *testing.T) {
 		{"range outside the cited item only", one(finding("code", "high", "src/pagination.ts", 18, 19, "E2")),
 			`finding 1 ("t"): line range 18-19 does not overlap any cited evidence for src/pagination.ts (within 3 lines)`},
 		{"repeat", []map[string]any{base(), base()}, `finding 2 ("t"): repeats finding 1`},
+		// A repeat is of an earlier kept finding: a rejected one does not count.
+		{"same as a rejected finding", []map[string]any{with("evidence_ids", []string{"E99"}), base()},
+			`finding 1 ("t"): cites unknown evidence id E99`},
+		// Each row breaks one rule and every later rule it can: the first wins.
+		{"lens first", one(withAll("lens", "style", "severity", "critical", "title", "  ", "evidence_ids", []string{})),
+			`finding 1 ("  "): unknown lens "style"`},
+		{"severity before title", one(withAll("severity", "critical", "title", "  ", "evidence_ids", []string{})),
+			`finding 1 ("  "): unknown severity "critical"`},
+		{"title before evidence", one(withAll("title", "  ", "evidence_ids", []string{})), `finding 1 ("  "): empty title`},
+		{"no evidence before the file", one(withAll("evidence_ids", []string{}, "file", "../x", "line_start", 9, "line_end", 3)),
+			`finding 1 ("t"): cites no evidence`},
+		{"unknown id before change evidence", one(with("evidence_ids", []string{"E1", "E99"})),
+			`finding 1 ("t"): cites unknown evidence id E99`},
+		{"change evidence before the range", one(finding("code", "high", "", 3, 4, "E1")),
+			`finding 1 ("t"): cites no diff_hunk or source evidence`},
+		{"path before the evidence files", one(withAll("file", "../x", "line_start", 9, "line_end", 3)),
+			`finding 1 ("t"): invalid file path "../x"`},
+		{"evidence files before the range", one(withAll("file", "src/other.ts", "line_start", 9, "line_end", 3)),
+			`finding 1 ("t"): file src/other.ts is not in the evidence`},
+		{"range before the cited file", one(finding("code", "high", "src/format.ts", 9, 3, "E2")),
+			`finding 1 ("t"): invalid line range 9-3`},
+		// The title in a rejection is cut to 80 bytes.
+		{"80-byte title", one(withAll("lens", "style", "title", x80)), `finding 1 ("` + x80 + `"): unknown lens "style"`},
+		{"81-byte title", one(withAll("lens", "style", "title", x80+"y")), `finding 1 ("` + x80 + `…"): unknown lens "style"`},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
