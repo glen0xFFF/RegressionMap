@@ -90,6 +90,26 @@ func startBody(repo, base, cmd string) map[string]any {
 	return map[string]any{"repo": repo, "baseline": base, "command_id": cmd}
 }
 
+// rawAnalysis returns the fields of GET /api/analyses/{id} as raw JSON.
+func rawAnalysis(t *testing.T, url, id string) map[string]json.RawMessage {
+	t.Helper()
+	code, body := rawDo(t, "GET", url+"/api/analyses/"+id, nil)
+	var out map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(body), &out); code != 200 || err != nil {
+		t.Fatalf("GET /api/analyses/%s: %d %v\n%s", id, code, err, body)
+	}
+	return out
+}
+
+// field returns the raw JSON of m's key k, or "(no such key)" when m lacks
+// it, so a failure tells a missing key apart from a null one.
+func field(m map[string]json.RawMessage, k string) string {
+	if v, ok := m[k]; ok {
+		return string(v)
+	}
+	return "(no such key)"
+}
+
 func TestConfigDefaults(t *testing.T) {
 	s := New(Config{Root: t.TempDir(), Model: &model.Client{}})
 	if s.cfg.MaxConcurrent != 2 || s.cfg.MaxJobs != 100 || s.cfg.JobTimeout != 5*time.Minute {

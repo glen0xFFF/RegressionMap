@@ -196,26 +196,6 @@ func chainServer(t *testing.T, m *chainModel, mut func(*Config)) (*Server, *http
 	return s, srv, shas["r1"].Baseline
 }
 
-// rawAnalysis returns the fields of GET /api/analyses/{id} as raw JSON.
-func rawAnalysis(t *testing.T, url, id string) map[string]json.RawMessage {
-	t.Helper()
-	code, body := rawDo(t, "GET", url+"/api/analyses/"+id, nil)
-	var out map[string]json.RawMessage
-	if err := json.Unmarshal([]byte(body), &out); code != 200 || err != nil {
-		t.Fatalf("GET /api/analyses/%s: %d %v\n%s", id, code, err, body)
-	}
-	return out
-}
-
-// field returns the raw JSON of m's key k, or "(no such key)" when m lacks
-// it, so a failure tells a missing key apart from a null one.
-func field(m map[string]json.RawMessage, k string) string {
-	if v, ok := m[k]; ok {
-		return string(v)
-	}
-	return "(no such key)"
-}
-
 // rawRows returns the rows of GET /api/analyses as raw JSON fields.
 func rawRows(t *testing.T, url string) []map[string]json.RawMessage {
 	t.Helper()
