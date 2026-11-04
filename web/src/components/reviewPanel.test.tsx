@@ -143,6 +143,18 @@ describe("ReviewPanel", () => {
     expect(onToggle).toHaveBeenCalledTimes(2);
   });
 
+  it("ReviewPanel keeps the toggle and not No findings when every finding is refuted", () => {
+    const rv = review({
+      counts: { confirmed: 0, disputed: 0, refuted: 2, unchecked: 0 },
+      findings: [finding("R1", "refuted"), finding("R2", "refuted", { lens: "security" })],
+    });
+    const { container } = render(panel(rv));
+    expect(screen.queryByText("No findings.")).not.toBeInTheDocument();
+    expect(container.querySelectorAll(".finding-title")).toHaveLength(0);
+    expect(screen.getByText("0 confirmed · 0 not checked · 0 disputed · 2 refuted")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Show 2 refuted" })).toBeInTheDocument();
+  });
+
   it("review text renders as text", () => {
     const hostile = finding("R1", "confirmed", {
       title: "<img src=x onerror=alert(1)>",
