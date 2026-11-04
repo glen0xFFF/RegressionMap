@@ -5,6 +5,7 @@ import { MiddlePanel } from "./MiddlePanel";
 import { RightPanel } from "./RightPanel";
 import { DiffView } from "./DiffView";
 import { EvidenceList } from "./EvidenceList";
+import { REVIEW_DISCLAIMER } from "../review";
 import type { Analysis, Hypothesis, ModelResult, Review, ReviewFinding, TestRun } from "../types";
 
 afterEach(() => {
@@ -123,6 +124,22 @@ describe("DiffView", () => {
     const header = screen.getByTestId("file-comments-src/pagination.js");
     expect(within(header).getByText("File finding")).toBeInTheDocument();
     expect(within(header).getByText("Not checked")).toBeInTheDocument();
+  });
+
+  it("DiffView carries the review disclaimer when it shows a finding", () => {
+    const diff = (findings: ReviewFinding[]) => (
+      <DiffView evidence={analysis().evidence!} hypotheses={[]} findings={findings} highlightId={null} onSelectEvidence={() => {}} />
+    );
+    const { container, rerender } = render(diff([reviewFinding()]));
+    expect(within(container.querySelector(".diffview") as HTMLElement).getByText(REVIEW_DISCLAIMER)).toHaveClass("ai-label");
+    rerender(diff([reviewFinding({ line_start: 0, line_end: 0 })]));
+    expect(screen.getByText(REVIEW_DISCLAIMER)).toBeInTheDocument();
+    rerender(diff([]));
+    expect(screen.queryByText(REVIEW_DISCLAIMER)).not.toBeInTheDocument();
+    // Findings the diff does not anchor (no file, or a file without a hunk) are not shown there.
+    rerender(diff([reviewFinding({ file: "", line_start: 0, line_end: 0 }), reviewFinding({ id: "R2", file: "src/other.js" })]));
+    expect(screen.queryByText("Inline finding")).not.toBeInTheDocument();
+    expect(screen.queryByText(REVIEW_DISCLAIMER)).not.toBeInTheDocument();
   });
 });
 

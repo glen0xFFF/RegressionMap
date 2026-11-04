@@ -3,6 +3,7 @@ import { FindingCard } from "./FindingCard";
 import { ReviewComment } from "./ReviewComment";
 import { anchorFindings, anchorHypotheses, groupDiffsByFile, parseHunk } from "../diff";
 import { evidenceDomId } from "../logic";
+import { REVIEW_DISCLAIMER } from "../review";
 import type { Evidence, Hypothesis, ReviewFinding } from "../types";
 
 const SIGN: Record<string, string> = { add: "+", del: "-", ctx: " ", hunk: "", meta: "" };
@@ -28,9 +29,12 @@ export function DiffView({
   if (groups.length === 0) return <div className="empty-state">No diff hunks between baseline and HEAD.</div>;
   const anchors = anchorHypotheses(hypotheses, evidence);
   const found = anchorFindings(findings, evidence);
+  // Every surface that shows the review carries the disclaimer (docs/API_CONTRACT.md, v4).
+  const showsFindings = found.rows.size > 0 || found.fileLevel.size > 0;
 
   return (
     <div className="diffview">
+      {showsFindings && <div className="ai-label">{REVIEW_DISCLAIMER}</div>}
       {groups.map((g) => {
         const fileComments = anchors.fileLevel.get(g.file) ?? [];
         const fileFindings = found.fileLevel.get(g.file) ?? [];
