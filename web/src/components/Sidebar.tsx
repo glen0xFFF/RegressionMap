@@ -70,20 +70,25 @@ export function Sidebar({
         <p className="muted small pad-x">No analyses yet in this session.</p>
       ) : (
         <ul className="recent">
-          {recent.map((r) => (
-            <li key={r.id}>
-              <button
-                type="button"
-                className={activeId === r.id ? "recent-item active" : "recent-item"}
-                onClick={() => onOpenRecent(r.id)}
-                title={`analysis ${r.id} · ${r.dot}`}
-              >
-                <span className={`dot dot-${r.dot}`} aria-hidden="true" />
-                <span className="recent-repo">{r.repo}</span>
-                <span className="recent-date muted">{fmtDate(r.startedAt)}</span>
-              </button>
-            </li>
-          ))}
+          {recent.map((r) => {
+            // Entries saved by a v3 page have no confirmed count, and show no badge.
+            const confirmed = typeof r.confirmed === "number" && r.confirmed > 0 ? r.confirmed : 0;
+            return (
+              <li key={r.id}>
+                <button
+                  type="button"
+                  className={activeId === r.id ? "recent-item active" : "recent-item"}
+                  onClick={() => onOpenRecent(r.id)}
+                  title={`analysis ${r.id} · ${r.dot}${confirmed > 0 ? ` · ${confirmed} confirmed` : ""}`}
+                >
+                  <span className={`dot dot-${r.dot}`} aria-hidden="true" />
+                  <span className="recent-repo">{r.repo}</span>
+                  {confirmed > 0 && <span className="recent-confirmed">{`${confirmed} confirmed`}</span>}
+                  <span className="recent-date muted">{fmtDate(r.startedAt)}</span>
+                </button>
+              </li>
+            );
+          })}
         </ul>
       )}
 

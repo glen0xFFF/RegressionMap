@@ -5,7 +5,7 @@ import { RunBadge } from "./RunBadge";
 import { ClearIcon, PlayIcon } from "./Icons";
 import { diffEvidence } from "../layout";
 import { evidenceDomId } from "../logic";
-import type { Analysis, TestRun } from "../types";
+import type { Analysis, ReviewFinding, TestRun } from "../types";
 
 type Tab = "output" | "diff" | "evidence";
 const TABS: { id: Tab; label: string }[] = [
@@ -44,6 +44,7 @@ export function MiddlePanel({
   busy,
   error,
   onSelectEvidence = () => {},
+  findings = [],
 }: {
   analysis: Analysis | null;
   highlight: string | null;
@@ -55,6 +56,8 @@ export function MiddlePanel({
   busy: boolean;
   error?: ReactNode;
   onSelectEvidence?: (id: string) => void;
+  /** Muse review findings for the diff, already filtered and in display order. */
+  findings?: ReviewFinding[];
 }) {
   const [tab, setTab] = useState<Tab>("output");
 
@@ -96,6 +99,7 @@ export function MiddlePanel({
         <DiffView
           evidence={evidence}
           hypotheses={a.model?.status === "ok" ? (a.model.result?.hypotheses ?? []) : []}
+          findings={findings}
           highlightId={highlight}
           onSelectEvidence={onSelectEvidence}
         />

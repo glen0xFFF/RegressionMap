@@ -40,7 +40,7 @@ export function hypothesisLocation(h: Hypothesis): string {
   return l ? `${h.file}:${l}` : h.file;
 }
 
-function Suggestion({ text }: { text: string }) {
+export function Suggestion({ text, label = "Suggested verification" }: { text: string; label?: string }) {
   const [copied, setCopied] = useState(false);
   async function copy() {
     try {
@@ -53,7 +53,7 @@ function Suggestion({ text }: { text: string }) {
   }
   return (
     <details className="suggest">
-      <summary>Suggested verification</summary>
+      <summary>{label}</summary>
       <div className="suggest-box">
         <code className="suggest-text">{text}</code>
         <button type="button" className="icon-btn" aria-label="Copy suggestion" title={copied ? "Copied" : "Copy (text only — never executed)"} onClick={copy}>

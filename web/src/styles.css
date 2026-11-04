@@ -145,7 +145,13 @@ button:disabled, select:disabled { opacity: 0.5; cursor: not-allowed; }
 .recent { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 2px; }
 .recent-item {
   width: 100%; border: 1px solid transparent; background: transparent; padding: 6px 8px; border-radius: 8px;
-  display: grid; grid-template-columns: 10px minmax(0, 1fr) auto; gap: 8px; text-align: left;
+  /* dot, repo, then the optional confirmed badge and the date in columns of their own */
+  display: grid; grid-template-columns: 10px minmax(0, 1fr); grid-auto-flow: column; grid-auto-columns: auto;
+  gap: 8px; text-align: left;
+}
+.recent-confirmed {
+  font-size: 10.5px; font-weight: 600; padding: 0 6px; border-radius: 999px; white-space: nowrap; align-self: center;
+  background: var(--pass-soft); color: var(--pass); border: 1px solid color-mix(in srgb, var(--pass) 35%, transparent);
 }
 .recent-item:hover, .recent-item.active { background: var(--bg-muted); }
 .recent-repo { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; }
@@ -343,6 +349,26 @@ details.group[open] > summary::before { transform: rotate(90deg); }
   background: var(--bg-muted); border: 1px solid var(--border); border-radius: 8px; padding: 8px 8px 8px 10px;
 }
 .suggest-text { flex: 1; background: transparent; padding: 0; white-space: pre-wrap; word-break: break-word; }
+
+/* muse review (v4): a section under the hypotheses, and inline findings in the diff */
+.review-panel { display: flex; flex-direction: column; gap: 10px; }
+.review-head { display: flex; align-items: center; gap: 8px; padding: 4px 2px 0; }
+.review-h { font-size: 14px; }
+.review-counts { color: var(--text-2); display: flex; flex-direction: column; gap: 2px; padding: 0 2px; }
+.findings { display: flex; flex-direction: column; gap: 10px; }
+.refuted-toggle { align-self: flex-start; }
+.avatar-review { background: var(--dark-btn); color: var(--dark-btn-text); }
+.lens-chip {
+  font-family: var(--mono); font-size: 11px; padding: 0 7px; border-radius: 6px; line-height: 1.7;
+  background: var(--bg-muted); border: 1px solid var(--border); color: var(--text-2);
+}
+.verdict { font-size: 11px; font-weight: 600; padding: 0 8px; border-radius: 999px; line-height: 1.7; border: 1px solid var(--border); }
+.verdict-confirmed { background: var(--pass-soft); color: var(--pass); border-color: color-mix(in srgb, var(--pass) 40%, transparent); }
+.verdict-unchecked { background: var(--bg-muted); color: var(--muted); }
+.verdict-disputed { background: var(--amber-soft); color: var(--amber); border-color: color-mix(in srgb, var(--amber) 40%, transparent); }
+.verdict-refuted { background: transparent; color: var(--muted); border-style: dashed; }
+.finding-refuted .finding-title { text-decoration: line-through; color: var(--muted); }
+.check-reason { color: var(--text-2); white-space: pre-wrap; word-break: break-word; }
 
 /* verify card + test run */
 .verify-card .field { display: flex; flex-direction: column; gap: 4px; margin: 8px 0; }
