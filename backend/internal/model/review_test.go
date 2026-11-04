@@ -817,8 +817,12 @@ func TestValidateReviewRepeatKey(t *testing.T) {
 		fs   []map[string]any
 		want []string
 	}{
-		{"another file", []map[string]any{base(), finding("code", "high", "src/format.ts", 1, 2, "E3")}, []string{}},
+		// E4 covers src/pagination.ts 1-20 and E3 covers src/format.ts 1-3,
+		// so only the file differs.
+		{"another file", []map[string]any{finding("code", "high", "src/pagination.ts", 1, 2, "E4"), finding("code", "high", "src/format.ts", 1, 2, "E3")}, []string{}},
 		{"another range", []map[string]any{base(), finding("code", "high", "src/pagination.ts", 9, 10, "E2")}, []string{}},
+		{"another start", []map[string]any{base(), finding("code", "high", "src/pagination.ts", 8, 8, "E2")}, []string{}},
+		{"another end", []map[string]any{base(), finding("code", "high", "src/pagination.ts", 7, 9, "E2")}, []string{}},
 		{"another lens", []map[string]any{base(), finding("security", "high", "src/pagination.ts", 7, 8, "E2")}, []string{}},
 		{"exact repeat", []map[string]any{base(), base()}, []string{`finding 2 ("t"): repeats finding 1`}},
 	}
