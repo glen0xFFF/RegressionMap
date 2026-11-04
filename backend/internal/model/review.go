@@ -219,10 +219,15 @@ func (c *Client) Review(ctx context.Context, in Input) Review {
 }
 
 // Check asks the model to try to refute each finding of a review that owes
-// its check. Any other review is returned unchanged, with no request made.
+// its check. Any other review, and a review that is not ok or has no
+// finding, is returned unchanged, with no request made. Without a key no
+// request is made either: the check ends as an error with MsgNotConfigured.
 func (c *Client) Check(ctx context.Context, in Input, rv Review) Review {
-	if rv.CheckStatus != "" {
+	if rv.CheckStatus != "" || rv.Status != "ok" || len(rv.Findings) == 0 {
 		return rv
+	}
+	if !c.Configured() {
+		return rv.EndCheck("error", MsgNotConfigured)
 	}
 	content, status, msg := c.complete(ctx, checkSystemPrompt, checkUserPrompt(in, rv.Findings), "FindingChecks", checkSchema())
 	if status != "" {

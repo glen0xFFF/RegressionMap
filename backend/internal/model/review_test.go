@@ -689,6 +689,38 @@ func TestCheckWithoutOwedCheckMakesNoRequest(t *testing.T) {
 	}
 }
 
+// Contract rule 5: without a model key no call is made, so a review that
+// owes its check ends it as an error with the not-configured text. A review
+// that is not ok, or has no finding, has nothing to check.
+func TestCheckWithoutKeyOrFindingsMakesNoRequest(t *testing.T) {
+	var n atomic.Int32
+	s := seqServer(t, &n, reply{status: 200})
+	defer s.Close()
+	rv := owed(t, three()[:2]...)
+	before, _ := json.Marshal(rv)
+	out := (&Client{BaseURL: s.URL, Model: "m"}).Check(context.Background(), Input{Evidence: evR}, rv)
+	if out.Status != "ok" || out.CheckStatus != "error" || out.CheckMessage != MsgNotConfigured ||
+		len(out.Findings) != 2 || out.Counts != (ReviewCounts{Unchecked: 2}) || out.Rejected == nil {
+		t.Errorf("without a key: got %+v", out)
+	}
+	allUnchecked(t, out.Findings)
+	if after, _ := json.Marshal(rv); string(after) != string(before) {
+		t.Errorf("Check changed its input:\nbefore %s\nafter  %s", before, after)
+	}
+	c := &Client{BaseURL: s.URL, APIKey: "k", Model: "m"}
+	for name, in := range map[string]Review{
+		"zero value":  {},
+		"no findings": {Status: "ok", ModelID: "m", Findings: []Finding{}, Rejected: []string{}},
+	} {
+		if out := c.Check(context.Background(), Input{Evidence: evR}, in); !reflect.DeepEqual(out, in) {
+			t.Errorf("%s: changed\n got %+v\nwant %+v", name, out, in)
+		}
+	}
+	if n.Load() != 0 {
+		t.Fatalf("%d request(s) reached the server", n.Load())
+	}
+}
+
 func TestEndCheck(t *testing.T) {
 	rv := owed(t, append(three(), titled(finding("code", "high", "src/pagination.ts", 7, 8, "E99"), "d"))...)
 	checked := checkWith(t, 200, checksContent(ck{"R1", "confirmed", "shown", []string{"E2"}}), rv, nil)
