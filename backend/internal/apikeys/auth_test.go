@@ -74,6 +74,12 @@ type fixture struct {
 
 func newFixture(t *testing.T, limit int) *fixture {
 	t.Helper()
+	return newFixtureWith(t, limit, false)
+}
+
+// newFixtureWith is newFixture with PublicDemo set to public.
+func newFixtureWith(t *testing.T, limit int, public bool) *fixture {
+	t.Helper()
 	f := &fixture{t: t, store: NewStore(t.TempDir()), clock: newFakeClock()}
 	f.store.now = f.clock.Now
 	var err error
@@ -96,7 +102,7 @@ func newFixture(t *testing.T, limit int) *fixture {
 		w.WriteHeader(http.StatusAccepted)
 		io.WriteString(w, "inner:"+r.URL.Path)
 	})
-	f.h = Middleware(Options{Store: f.store, RateLimitPerHour: limit, Now: f.clock.Now})(inner)
+	f.h = Middleware(Options{Store: f.store, RateLimitPerHour: limit, Now: f.clock.Now, PublicDemo: public})(inner)
 	return f
 }
 
@@ -509,5 +515,273 @@ func TestLimiterMemoryIsBounded(t *testing.T) {
 	l.allow("k_c", now)
 	if n := l.size(); n != 1 {
 		t.Fatalf("timestamps older than the window must be dropped, holding %d", n)
+	}
+}
+
+// remoteReq sends a remote request from peer with the given Authorization
+// header values (none when auth is nil).
+func (f *fixture) remoteReq(method, path, peer string, auth []string, body string) *httptest.ResponseRecorder {
+	f.t.Helper()
+	var rd io.Reader
+	if body != "" {
+		rd = strings.NewReader(body)
+	}
+	r := httptest.NewRequest(method, path, rd)
+	r.RemoteAddr, r.Host = peer, publicHost
+	if body != "" {
+		r.Header.Set("Content-Type", "application/json")
+	}
+	if auth != nil {
+		r.Header["Authorization"] = auth
+	}
+	rec := httptest.NewRecorder()
+	f.h.ServeHTTP(rec, r)
+	return rec
+}
+
+func TestPublicDemoKeylessRemoteRunsAsPublicIdentity(t *testing.T) {
+	f := newFixtureWith(t, 20, true)
+	rec := f.do("GET", "/api/repos", false, "", "")
+	if rec.Code != http.StatusAccepted || rec.Body.String() != "inner:/api/repos" {
+		t.Fatalf("keyless remote: %d %q", rec.Code, rec.Body.String())
+	}
+	if id := f.lastID; !id.Public || id.Local || id.Key != (Key{}) || id.Scope() != ScopeAnalyze {
+		t.Fatalf("identity = %+v, scope %q; want the public demo identity with the analyze scope", id, id.Scope())
+	}
+	// Everything the analyze scope allows reaches the API.
+	for _, tc := range []struct{ method, path, body string }{
+		{"GET", "/api/repos/demo/commits", ""},
+		{"GET", "/api/commands", ""},
+		{"GET", "/api/analyses", ""},
+		{"POST", "/api/analyses", `{"repo":"demo"}`},
+		{"GET", "/api/analyses/a1", ""},
+		{"POST", "/api/analyses/a1/verify", `{}`},
+	} {
+		if rec := f.do(tc.method, tc.path, false, "", tc.body); rec.Code != http.StatusAccepted || !f.lastID.Public {
+			t.Errorf("%s %s: %d identity %+v", tc.method, tc.path, rec.Code, f.lastID)
+		}
+	}
+	// A forwarded request from a local proxy is not local, so it is public.
+	r := httptest.NewRequest("GET", "/api/repos", nil)
+	r.RemoteAddr, r.Host = localPeer, localHost
+	r.Header.Set("X-Forwarded-For", "203.0.113.9")
+	rec = httptest.NewRecorder()
+	f.h.ServeHTTP(rec, r)
+	if rec.Code != http.StatusAccepted || !f.lastID.Public || f.lastID.Local {
+		t.Fatalf("forwarded keyless request: %d identity %+v", rec.Code, f.lastID)
+	}
+	// Local requests do not change.
+	if rec := f.do("GET", "/api/repos", true, "", ""); rec.Code != http.StatusAccepted || !f.lastID.Local || f.lastID.Public {
+		t.Fatalf("local: %d identity %+v", rec.Code, f.lastID)
+	}
+}
+
+func TestPublicDemoChecksEveryAuthorizationHeader(t *testing.T) {
+	f := newFixtureWith(t, 20, true)
+	revokedK, revoked, _ := f.store.Create("old", ScopeAdmin)
+	f.store.Revoke(revokedK.ID)
+
+	for name, auth := range map[string][]string{
+		"empty":       {""},
+		"malformed":   {"Bearer"},
+		"wrong":       {"Bearer rm_live_" + strings.Repeat("Z", 32)},
+		"revoked":     {"Bearer " + revoked},
+		"basic":       {"Basic " + f.admin},
+		"no scheme":   {f.admin},
+		"two headers": {"Bearer " + f.analyze, "Bearer " + f.analyze},
+		"two keys":    {"Bearer " + f.analyze, "Bearer " + f.admin},
+	} {
+		t.Run(name, func(t *testing.T) {
+			before := f.reached
+			rec := f.remoteReq("GET", "/api/repos", remotePeer, auth, "")
+			if rec.Code != 401 || errCode(t, rec) != "unauthorized" {
+				t.Fatalf("got %d %q", rec.Code, rec.Body.String())
+			}
+			if rec.Header().Get("WWW-Authenticate") != "Bearer" {
+				t.Fatalf("WWW-Authenticate = %q", rec.Header().Get("WWW-Authenticate"))
+			}
+			if f.reached != before {
+				t.Fatal("a request with an invalid key reached the API as the public identity")
+			}
+		})
+	}
+
+	// A valid key runs as that key, not as the public identity.
+	rec := f.do("GET", "/api/analyses/a1", false, f.analyze, "")
+	if rec.Code != http.StatusAccepted || f.lastID.Public || f.lastID.Local || f.lastID.Key.ID != f.anaK.ID {
+		t.Fatalf("analyze key: %d identity %+v", rec.Code, f.lastID)
+	}
+	if rec := f.do("GET", "/api/keys", false, f.admin, ""); rec.Code != 200 {
+		t.Fatalf("admin key on /api/keys: %d %q", rec.Code, rec.Body.String())
+	}
+	if rec := f.do("GET", "/api/me", false, f.analyze, ""); rec.Code != 200 || !strings.Contains(rec.Body.String(), `"mode":"key"`) {
+		t.Fatalf("analyze key me: %d %q", rec.Code, rec.Body.String())
+	}
+}
+
+func TestPublicDemoOffKeylessRemoteStillNeedsKey(t *testing.T) {
+	f := newFixtureWith(t, 20, false)
+	for _, p := range []string{"/api/repos", "/api/me", "/api/keys"} {
+		rec := f.do("GET", p, false, "", "")
+		if rec.Code != 401 || errCode(t, rec) != "unauthorized" || rec.Header().Get("WWW-Authenticate") != "Bearer" {
+			t.Fatalf("%s: %d %v %q", p, rec.Code, rec.Header(), rec.Body.String())
+		}
+	}
+	if f.reached != 0 {
+		t.Fatal("a keyless remote request reached the API with the public demo off")
+	}
+}
+
+func TestPublicDemoHealthAuthRequired(t *testing.T) {
+	for _, public := range []bool{true, false} {
+		f := newFixtureWith(t, 20, public)
+		for _, tc := range []struct {
+			name   string
+			local  bool
+			secret string
+		}{{"local", true, ""}, {"remote", false, ""}, {"remote bogus key", false, "rm_live_bogus"}, {"remote admin key", false, f.admin}} {
+			rec := f.do("GET", "/api/health", tc.local, tc.secret, "")
+			var m map[string]any
+			if err := json.Unmarshal(rec.Body.Bytes(), &m); err != nil || rec.Code != 200 {
+				t.Fatalf("public=%v %s: %d %q", public, tc.name, rec.Code, rec.Body.String())
+			}
+			want := !public && !tc.local
+			if m["auth_required"] != want {
+				t.Errorf("public=%v %s: auth_required = %v, want %v", public, tc.name, m["auth_required"], want)
+			}
+			if m["ok"] != true || m["model_id"] != "muse-spark-1.3" {
+				t.Errorf("public=%v %s: inner fields lost: %v", public, tc.name, m)
+			}
+		}
+	}
+}
+
+func TestPublicDemoMe(t *testing.T) {
+	f := newFixtureWith(t, 20, true)
+	rec := f.do("GET", "/api/me", false, "", "")
+	if rec.Code != 200 || strings.TrimSpace(rec.Body.String()) != `{"mode":"public"}` {
+		t.Fatalf("public me: %d %q", rec.Code, rec.Body.String())
+	}
+	if rec := f.do("GET", "/api/me", true, "", ""); strings.TrimSpace(rec.Body.String()) != `{"mode":"local"}` {
+		t.Fatalf("local me: %d %q", rec.Code, rec.Body.String())
+	}
+	if rec := f.do("POST", "/api/me", false, "", `{}`); rec.Code != 405 || rec.Header().Get("Allow") != "GET" {
+		t.Fatalf("POST me: %d %v", rec.Code, rec.Header())
+	}
+}
+
+func TestPublicDemoCannotManageKeys(t *testing.T) {
+	f := newFixtureWith(t, 20, true)
+	for _, tc := range []struct{ method, path, body string }{
+		{"GET", "/api/keys", ""},
+		{"POST", "/api/keys", `{"name":"x","scope":"admin"}`},
+		{"DELETE", "/api/keys/" + f.adminK.ID, ""},
+		{"DELETE", "/api/keys/" + f.anaK.ID, ""},
+		{"PUT", "/api/keys", `{}`},
+		{"GET", "/api/keys/", ""},
+	} {
+		rec := f.do(tc.method, tc.path, false, "", tc.body)
+		if rec.Code != 403 || errCode(t, rec) != "forbidden_scope" {
+			t.Errorf("%s %s as the public identity: %d %q", tc.method, tc.path, rec.Code, rec.Body.String())
+		}
+		if !strings.Contains(rec.Body.String(), "public demo") || !strings.Contains(rec.Body.String(), "admin key") {
+			t.Errorf("%s %s: the message must say the public demo needs an admin key: %q", tc.method, tc.path, rec.Body.String())
+		}
+	}
+	if keys, _ := f.store.List(); len(keys) != 2 || keys[0].Revoked || keys[1].Revoked {
+		t.Fatalf("the public identity changed the store: %+v", keys)
+	}
+	if f.reached != 0 {
+		t.Fatal("keys routes must not reach the API")
+	}
+}
+
+func TestPublicDemoIdentityIsNeverAKeyOrAdmin(t *testing.T) {
+	pub := Identity{Public: true}
+	if pub.Scope() != ScopeAnalyze {
+		t.Fatalf("public scope = %q, want analyze", pub.Scope())
+	}
+	// Even with a key value attached by mistake, the public identity is never admin.
+	if s := (Identity{Public: true, Key: Key{ID: "k_admin00001", Scope: ScopeAdmin}}).Scope(); s != ScopeAnalyze {
+		t.Fatalf("public identity with an admin key value has scope %q", s)
+	}
+	if s := (Identity{}).Scope(); s == ScopeAdmin {
+		t.Fatal("the zero identity must not be admin")
+	}
+	if s := (Identity{Local: true}).Scope(); s != ScopeAdmin {
+		t.Fatalf("local scope = %q, want admin", s)
+	}
+	if s := (Identity{Key: Key{ID: "k_ci00000001", Scope: ScopeAnalyze}}).Scope(); s != ScopeAnalyze {
+		t.Fatalf("analyze key scope = %q", s)
+	}
+
+	// The public bucket is never a key's bucket, whatever the key id.
+	b := pub.bucket()
+	if b == "" || strings.HasPrefix(b, "k_") || idRe.MatchString(b) {
+		t.Fatalf("public bucket %q looks like a key id", b)
+	}
+	for _, kid := range []string{"k_ci00000001", "", b, "public", "k_", "key:", "key:public"} {
+		if kb := (Identity{Key: Key{ID: kid}}).bucket(); kb == b {
+			t.Fatalf("key id %q shares the public bucket %q", kid, b)
+		}
+	}
+	if (Identity{Key: Key{ID: "k_a000000001"}}).bucket() == (Identity{Key: Key{ID: "k_b000000001"}}).bucket() {
+		t.Fatal("two keys share a bucket")
+	}
+}
+
+func TestPublicDemoSharesOneRateLimitBucket(t *testing.T) {
+	f := newFixtureWith(t, 2, true)
+	const body = `{"repo":"x"}`
+	// Two different clients, one shared bucket.
+	if rec := f.remoteReq("POST", "/api/analyses", "203.0.113.7:1000", nil, body); rec.Code != http.StatusAccepted || !f.lastID.Public {
+		t.Fatalf("first public request: %d %+v", rec.Code, f.lastID)
+	}
+	f.clock.Add(10 * time.Minute)
+	if rec := f.remoteReq("POST", "/api/analyses", "198.51.100.9:2000", nil, body); rec.Code != http.StatusAccepted {
+		t.Fatalf("second public request: %d", rec.Code)
+	}
+	f.clock.Add(10 * time.Minute)
+	reached := f.reached
+	rec := f.remoteReq("POST", "/api/analyses", "192.0.2.44:3000", nil, body)
+	if rec.Code != 429 || errCode(t, rec) != "rate_limited" {
+		t.Fatalf("third public request: %d %q", rec.Code, rec.Body.String())
+	}
+	// The first request was 20 minutes ago, so it leaves the window in 40 minutes.
+	if ra := rec.Header().Get("Retry-After"); ra != "2400" {
+		t.Fatalf("Retry-After = %q, want 2400", ra)
+	}
+	if f.reached != reached {
+		t.Fatal("rate-limited public request reached the API")
+	}
+
+	// A real key keeps its own bucket: the public demo did not use it up, and
+	// using it up does not free the public bucket.
+	for i := 0; i < 2; i++ {
+		if rec := f.do("POST", "/api/analyses", false, f.analyze, body); rec.Code != http.StatusAccepted || f.lastID.Key.ID != f.anaK.ID {
+			t.Fatalf("analyze key request %d: %d", i, rec.Code)
+		}
+	}
+	if rec := f.do("POST", "/api/analyses", false, f.analyze, body); rec.Code != 429 {
+		t.Fatalf("analyze key over its own limit: %d", rec.Code)
+	}
+	if rec := f.do("POST", "/api/analyses", false, "", body); rec.Code != 429 {
+		t.Fatalf("public bucket freed by key traffic: %d", rec.Code)
+	}
+	// Other routes are not limited for the public identity.
+	if rec := f.do("POST", "/api/analyses/a1/verify", false, "", `{}`); rec.Code != http.StatusAccepted {
+		t.Fatalf("public verify limited: %d", rec.Code)
+	}
+	// Local requests are never limited.
+	if rec := f.do("POST", "/api/analyses", true, "", body); rec.Code != http.StatusAccepted {
+		t.Fatalf("local request limited: %d", rec.Code)
+	}
+	// Sliding window: once the first public request is an hour old, one slot frees.
+	f.clock.Add(40 * time.Minute)
+	if rec := f.do("POST", "/api/analyses", false, "", body); rec.Code != http.StatusAccepted {
+		t.Fatalf("public after window: %d", rec.Code)
+	}
+	if rec := f.do("POST", "/api/analyses", false, "", body); rec.Code != 429 {
+		t.Fatalf("second public slot must still be taken: %d", rec.Code)
 	}
 }

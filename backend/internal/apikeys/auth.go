@@ -20,10 +20,41 @@ import (
 // Options.RateLimitPerHour is not positive.
 const DefaultRateLimitPerHour = 20
 
-// Identity is who made a request: a local caller, or the holder of Key.
+// Identity is who made a request: a local caller, the public demo identity
+// (Options.PublicDemo, a remote request without an Authorization header),
+// or the holder of Key.
 type Identity struct {
-	Local bool
-	Key   Key // zero when Local
+	Local  bool
+	Public bool // the public demo identity: analyze scope, no key
+	Key    Key  // zero when Local or Public
+}
+
+// Scope is the scope the identity acts with: analyze for the public demo
+// identity, admin for a local caller, otherwise the key's scope ("" for the
+// zero Identity). Public is checked first, so the public demo identity is
+// never admin, whatever else the value holds.
+func (id Identity) Scope() string {
+	switch {
+	case id.Public:
+		return ScopeAnalyze
+	case id.Local:
+		return ScopeAdmin
+	}
+	return id.Key.Scope
+}
+
+// publicBucket is the one rate-limit bucket that every public demo request
+// shares.
+const publicBucket = "public"
+
+// bucket is the rate-limit bucket of a remote identity. Key buckets are
+// "key:" followed by the key id, so no key id, not even one written into
+// keys.json by hand, can name the public bucket.
+func (id Identity) bucket() string {
+	if id.Public {
+		return publicBucket
+	}
+	return "key:" + id.Key.ID
 }
 
 type ctxKey struct{}
@@ -65,23 +96,32 @@ type Options struct {
 	Store            *Store // nil: no keys exist; only local requests reach /api
 	RateLimitPerHour int    // per key on POST /api/analyses; <= 0 means DefaultRateLimitPerHour
 	Now              func() time.Time
+
+	// PublicDemo (PUBLIC_DEMO=1) serves a remote /api request that carries
+	// no Authorization header as the public demo identity, with the analyze
+	// scope. A request that carries one is checked as without PublicDemo.
+	PublicDemo bool
 }
 
 type auth struct {
-	next  http.Handler
-	store *Store
-	lim   *limiter
-	now   func() time.Time
+	next   http.Handler
+	store  *Store
+	lim    *limiter
+	now    func() time.Time
+	public bool
 }
 
-// Middleware enforces the v2 contract in front of the API:
+// Middleware enforces the v2 contract, and the v4 public demo mode, in
+// front of the API:
 //   - paths outside /api pass through without a key (the static UI);
 //   - GET /api/health is public and gains "auth_required";
 //   - other /api requests that are not local need a valid Bearer key, else
-//     401 unauthorized with WWW-Authenticate: Bearer;
+//     401 unauthorized with WWW-Authenticate: Bearer; with PublicDemo, one
+//     without an Authorization header runs as the public demo identity;
 //   - GET /api/me and /api/keys* are answered here (admin or local only for
 //     /api/keys*, else 403 forbidden_scope);
-//   - POST /api/analyses is rate limited per key (429 rate_limited).
+//   - POST /api/analyses is rate limited per key, and in one shared bucket
+//     for the public demo identity (429 rate_limited).
 //
 // The identity is attached to the request context (FromContext).
 func Middleware(opts Options) func(http.Handler) http.Handler {
@@ -95,7 +135,7 @@ func Middleware(opts Options) func(http.Handler) http.Handler {
 	}
 	lim := newLimiter(limit, time.Hour)
 	return func(next http.Handler) http.Handler {
-		return &auth{next: next, store: opts.Store, lim: lim, now: now}
+		return &auth{next: next, store: opts.Store, lim: lim, now: now, public: opts.PublicDemo}
 	}
 }
 
@@ -129,7 +169,13 @@ func (a *auth) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	id := Identity{Local: true}
-	if !local {
+	switch {
+	case local:
+	case a.public && len(r.Header.Values("Authorization")) == 0:
+		// No Authorization header: the public demo identity. A header that
+		// is present, even empty or repeated, is checked as a key below.
+		id = Identity{Public: true}
+	default:
 		k, err := a.authenticate(r)
 		switch {
 		case err == nil:
@@ -153,13 +199,17 @@ func (a *auth) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		a.keys(w, r, id)
 		return
 	case p == "/api/analyses" && r.Method == http.MethodPost && !id.Local:
-		if ok, retry := a.lim.allow(id.Key.ID, a.now()); !ok {
+		if ok, retry := a.lim.allow(id.bucket(), a.now()); !ok {
 			secs := int((retry + time.Second - 1) / time.Second)
 			if secs < 1 {
 				secs = 1
 			}
 			w.Header().Set("Retry-After", strconv.Itoa(secs))
-			fail(w, http.StatusTooManyRequests, "rate_limited", "analysis rate limit for this key reached; retry later")
+			msg := "analysis rate limit for this key reached; retry later"
+			if id.Public {
+				msg = "analysis rate limit of the public demo reached; retry later"
+			}
+			fail(w, http.StatusTooManyRequests, "rate_limited", msg)
 			return
 		}
 	}
@@ -201,8 +251,8 @@ func (b *bufferedWriter) Write(p []byte) (int, error) {
 }
 
 // health runs the inner GET /api/health and adds "auth_required" (true when
-// the caller is not local). A non-200 or non-object response passes
-// through unchanged.
+// the caller is not local and PublicDemo is off). A non-200 or non-object
+// response passes through unchanged.
 func (a *auth) health(w http.ResponseWriter, r *http.Request, local bool) {
 	bw := &bufferedWriter{header: http.Header{}}
 	a.next.ServeHTTP(bw, r)
@@ -216,7 +266,9 @@ func (a *auth) health(w http.ResponseWriter, r *http.Request, local bool) {
 		var m map[string]any
 		if err := dec.Decode(&m); err == nil && m != nil {
 			if _, err := dec.Token(); err == io.EOF {
-				m["auth_required"] = !local
+				// With PublicDemo, a caller that is not local can use the
+				// API without a key, so no caller is required to sign in.
+				m["auth_required"] = !local && !a.public
 				if b, err := json.Marshal(m); err == nil {
 					out = append(b, '\n')
 				}
@@ -245,7 +297,11 @@ func (a *auth) me(w http.ResponseWriter, r *http.Request, id Identity) {
 		fail(w, http.StatusMethodNotAllowed, "method_not_allowed", "use GET")
 		return
 	}
-	if id.Local {
+	switch {
+	case id.Public:
+		writeJSON(w, http.StatusOK, map[string]any{"mode": "public"})
+		return
+	case id.Local:
 		writeJSON(w, http.StatusOK, map[string]any{"mode": "local"})
 		return
 	}
@@ -254,8 +310,12 @@ func (a *auth) me(w http.ResponseWriter, r *http.Request, id Identity) {
 }
 
 func (a *auth) keys(w http.ResponseWriter, r *http.Request, id Identity) {
-	if !id.Local && id.Key.Scope != ScopeAdmin {
-		fail(w, http.StatusForbidden, "forbidden_scope", "this key's scope does not allow managing API keys")
+	if id.Scope() != ScopeAdmin {
+		msg := "this key's scope does not allow managing API keys"
+		if id.Public {
+			msg = "the public demo cannot manage API keys; use an admin key"
+		}
+		fail(w, http.StatusForbidden, "forbidden_scope", msg)
 		return
 	}
 	if a.store == nil {
