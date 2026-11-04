@@ -4,7 +4,7 @@ import { Sidebar, canManageKeys } from "./Sidebar";
 import { SignIn } from "./SignIn";
 import { KeysPage } from "./KeysPage";
 import { VerifyPanel } from "./VerifyPanel";
-import { clearStoredKey } from "../api";
+import { clearStoredKey, setStoredKey } from "../api";
 import type { ApiKey, Me } from "../types";
 
 afterEach(() => {
@@ -263,6 +263,8 @@ describe("VerifyPanel busy and rate-limit errors", () => {
   });
 
   it("shows rate_limited with Retry-After", async () => {
+    // Local requests are never rate limited, so this caller holds a key.
+    setStoredKey(SECRET);
     vi.stubGlobal(
       "fetch",
       vi.fn(async () => json({ error: { code: "rate_limited", message: "slow down" } }, 429, { "Retry-After": "9" })),

@@ -164,7 +164,11 @@ export function errorMessage(e: unknown): string {
       case "unauthorized":
         return "Invalid or revoked API key.";
       case "rate_limited":
-        return `Rate limit reached for this API key.${retryHint(e)}`;
+        // Local requests are never rate limited, so without a key this is
+        // the one bucket that the public demo identity shares.
+        return getStoredKey() === null
+          ? `The public demo has reached its shared analysis rate limit.${retryHint(e)}`
+          : `Rate limit reached for this API key.${retryHint(e)}`;
       case "too_many_analyses":
         return `Too many analyses are running on the server right now.${retryHint(e)}`;
       case "analysis_running":

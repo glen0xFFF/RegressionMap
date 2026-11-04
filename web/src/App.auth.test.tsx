@@ -125,9 +125,10 @@ function localBackend(analysisResponse?: () => Response) {
 /**
  * A hosted demo with PUBLIC_DEMO=1: a request without a key runs as the public demo identity,
  * and any key is refused. refuseAfterMs holds each refusal back, so that /api/me can go out
- * with the stored key before the first 401 for it arrives.
+ * with the stored key before the first 401 for it arrives. analysisResponse answers
+ * POST /api/analyses (default: 409 analysis_running).
  */
-function publicBackend(refuseAfterMs = 0) {
+function publicBackend(refuseAfterMs = 0, analysisResponse?: () => Response) {
   const fn = vi.fn(async (url: string, init?: RequestInit) => {
     const auth = (init?.headers as Record<string, string> | undefined)?.Authorization;
     if (url === "/api/health") return json({ ok: true, model_configured: true, model_id: "m", auth_required: false });
@@ -139,7 +140,7 @@ function publicBackend(refuseAfterMs = 0) {
     if (url.startsWith("/api/keys"))
       return json({ error: { code: "forbidden_scope", message: "the public demo cannot manage API keys; use an admin key" } }, 403);
     if (url === "/api/analyses" && init?.method === "POST")
-      return json({ error: { code: "analysis_running", message: "analysis already running" } }, 409);
+      return analysisResponse?.() ?? json({ error: { code: "analysis_running", message: "analysis already running" } }, 409);
     return common(url, init) ?? json({ error: { code: "not_found", message: "nope" } }, 404);
   });
   vi.stubGlobal("fetch", fn);
@@ -244,9 +245,20 @@ describe("App analysis start errors", () => {
     return screen.findByRole("alert");
   }
 
-  it("shows 429 rate_limited with Retry-After", async () => {
+  it("shows 429 rate_limited with Retry-After for a key", async () => {
+    // Local requests are never rate limited, so this caller holds a key.
+    setStoredKey(GOOD);
     localBackend(() => json({ error: { code: "rate_limited", message: "rate limit exceeded" } }, 429, { "Retry-After": "42" }));
     expect(await startAndGetAlert()).toHaveTextContent("Rate limit reached for this API key. Retry after 42 s.");
+  });
+
+  it("shows 429 rate_limited for the public demo without mentioning an API key", async () => {
+    publicBackend(0, () =>
+      json({ error: { code: "rate_limited", message: "analysis rate limit of the public demo reached; retry later" } }, 429, { "Retry-After": "42" }),
+    );
+    const alert = await startAndGetAlert();
+    expect(alert).toHaveTextContent("The public demo has reached its shared analysis rate limit. Retry after 42 s.");
+    expect(alert).not.toHaveTextContent(/API key/);
   });
 
   it("shows 409 analysis_running clearly", async () => {
