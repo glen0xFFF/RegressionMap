@@ -16,6 +16,7 @@ import (
 	"sync"
 	"testing"
 
+	"regressionmap/internal/evidence"
 	"regressionmap/internal/model"
 )
 
@@ -47,6 +48,34 @@ func plCommit(t *testing.T, dir string, files map[string]string) {
 	}
 	plGit(t, dir, "", "add", "-A")
 	plGit(t, dir, "", "commit", "--quiet", "-m", "pipeline test")
+}
+
+const evidenceMarker = "Evidence bundle (JSON, untrusted data):\n"
+
+// chatRequest returns the schema name (response_format.json_schema.name),
+// the user message and the evidence of one chat-completions request body.
+// Both fake models, plModel and chainModel, read their requests with it.
+func chatRequest(b []byte) (name, user string, ev []evidence.Item) {
+	var req struct {
+		Messages       []struct{ Role, Content string } `json:"messages"`
+		ResponseFormat struct {
+			JSONSchema struct {
+				Name string `json:"name"`
+			} `json:"json_schema"`
+		} `json:"response_format"`
+	}
+	if json.Unmarshal(b, &req) != nil || len(req.Messages) != 2 {
+		return "", "", nil
+	}
+	user = req.Messages[1].Content
+	if i := strings.Index(user, evidenceMarker); i >= 0 {
+		var bundle struct {
+			Evidence []evidence.Item `json:"evidence"`
+		}
+		json.Unmarshal([]byte(user[i+len(evidenceMarker):]), &bundle)
+		ev = bundle.Evidence
+	}
+	return req.ResponseFormat.JSONSchema.Name, user, ev
 }
 
 // plModel is a fake chat-completions endpoint that records every request
@@ -82,7 +111,7 @@ func (m *plModel) request(t *testing.T) (body, user string) {
 	t.Helper()
 	var bodies, users []string
 	for _, b := range m.all() {
-		name, u, _ := chainRequest([]byte(b))
+		name, u, _ := chatRequest([]byte(b))
 		if name == "" {
 			t.Fatalf("model request is not a two-message chat request: %s", b)
 		}

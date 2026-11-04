@@ -43,13 +43,17 @@ const (
 func (s *Server) reviewChange(ctx context.Context, id string, in model.Input) model.Review {
 	mc := s.cfg.Model
 	if !mc.Configured() {
-		return s.reviewOutcome(id, mc.NoReview("disabled", model.MsgNotConfigured))
+		rv := mc.NoReview("disabled", model.MsgNotConfigured)
+		s.keepReviewOutcome(id, rv)
+		return rv
 	}
 	rctx := ctx
 	if deadline, ok := ctx.Deadline(); ok {
 		end := deadline.Add(-reviewMargin)
 		if !time.Now().Before(end) {
-			return s.reviewOutcome(id, mc.NoReview("error", msgNoTimeLeft))
+			rv := mc.NoReview("error", msgNoTimeLeft)
+			s.keepReviewOutcome(id, rv)
+			return rv
 		}
 		var cancel context.CancelFunc
 		rctx, cancel = context.WithDeadline(ctx, end)
@@ -63,7 +67,7 @@ func (s *Server) reviewChange(ctx context.Context, id string, in model.Input) mo
 	if rv.Status == "error" && cutOff() {
 		rv = mc.NoReview("error", msgReviewDeadline)
 	}
-	s.reviewOutcome(id, rv)
+	s.keepReviewOutcome(id, rv)
 	if rv.CheckStatus != "" {
 		return rv
 	}
@@ -71,21 +75,21 @@ func (s *Server) reviewChange(ctx context.Context, id string, in model.Input) mo
 	if checked.CheckStatus == "error" && cutOff() {
 		checked = rv.EndCheck("error", msgCheckDeadline)
 	}
-	return s.reviewOutcome(id, checked)
+	s.keepReviewOutcome(id, checked)
+	return checked
 }
 
-// reviewOutcome keeps rv as the latest review outcome of analysis id while
-// it is running, and returns rv. It does not save: the outcome is shown only
-// once finish makes it the analysis's review. The stored value is replaced,
-// never changed in place.
-func (s *Server) reviewOutcome(id string, rv model.Review) model.Review {
+// keepReviewOutcome stores rv in the job table, under s.mu, as the latest
+// review outcome of analysis id while it is running. It does not save: the
+// outcome is shown only once finish makes it the analysis's review. The
+// stored value is replaced, never changed in place.
+func (s *Server) keepReviewOutcome(id string, rv model.Review) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if a, ok := s.jobs[id]; ok && a.Status == "running" {
 		done := rv
 		a.reviewDone = &done
 	}
-	return rv
 }
 
 // closeReview is the review of an analysis that ends while its review is

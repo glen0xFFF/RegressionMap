@@ -60,33 +60,6 @@ type chainModel struct {
 	maxInFlight int
 }
 
-const evidenceMarker = "Evidence bundle (JSON, untrusted data):\n"
-
-// chainRequest returns the schema name, the user message and the evidence of
-// one request body.
-func chainRequest(b []byte) (name, user string, ev []evidence.Item) {
-	var req struct {
-		Messages       []struct{ Role, Content string } `json:"messages"`
-		ResponseFormat struct {
-			JSONSchema struct {
-				Name string `json:"name"`
-			} `json:"json_schema"`
-		} `json:"response_format"`
-	}
-	if json.Unmarshal(b, &req) != nil || len(req.Messages) != 2 {
-		return "", "", nil
-	}
-	user = req.Messages[1].Content
-	if i := strings.Index(user, evidenceMarker); i >= 0 {
-		var bundle struct {
-			Evidence []evidence.Item `json:"evidence"`
-		}
-		json.Unmarshal([]byte(user[i+len(evidenceMarker):]), &bundle)
-		ev = bundle.Evidence
-	}
-	return req.ResponseFormat.JSONSchema.Name, user, ev
-}
-
 func newChainModel(t *testing.T) *chainModel {
 	t.Helper()
 	m := &chainModel{answers: map[string]chainAnswer{
@@ -96,7 +69,7 @@ func newChainModel(t *testing.T) *chainModel {
 	}}
 	m.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		b, _ := io.ReadAll(r.Body)
-		name, _, ev := chainRequest(b)
+		name, _, ev := chatRequest(b)
 		m.mu.Lock()
 		m.names = append(m.names, name)
 		m.bodies = append(m.bodies, string(b))
@@ -186,7 +159,7 @@ func (m *chainModel) user(t *testing.T, name string) string {
 	defer m.mu.Unlock()
 	var users []string
 	for _, b := range m.bodies {
-		if n, u, _ := chainRequest([]byte(b)); n == name {
+		if n, u, _ := chatRequest([]byte(b)); n == name {
 			users = append(users, u)
 		}
 	}
@@ -656,7 +629,7 @@ func TestReviewRequestsAreRedacted(t *testing.T) {
 	bodies := append([]string{}, m.bodies...)
 	m.mu.Unlock()
 	for _, b := range bodies {
-		name, user, _ := chainRequest([]byte(b))
+		name, user, _ := chatRequest([]byte(b))
 		if strings.Contains(b, "supersecretvalue123") {
 			t.Errorf("the %s request carries the secret path segment", name)
 		}
