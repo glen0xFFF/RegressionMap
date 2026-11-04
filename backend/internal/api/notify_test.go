@@ -20,6 +20,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 	"unicode/utf8"
@@ -742,6 +743,109 @@ func TestNotifyPendingWhileDeliveringAfterEviction(t *testing.T) {
 	waitIdle(t, s)
 	if st, ok := loadStoredAnalysis(t, data, a.ID); !ok || st.Notification == nil || st.Notification.Status != "delivered" {
 		t.Fatalf("stored notification %+v", st.Notification)
+	}
+}
+
+// A GET of an evicted analysis runs while its delivery records the outcome
+// and leaves the in-flight set. loadStored takes its in-flight snapshot
+// before it reads the stored copy, and deliver records the outcome before
+// it leaves the set, so the GET shows "pending" or the recorded outcome,
+// never a delivered webhook as failed with msgDeliveryInterrupted. The seam
+// holds the GET between those two steps while the delivery ends.
+func TestGetWhileDeliveryEndsNeverShowsItInterrupted(t *testing.T) {
+	data := t.TempDir()
+	fake := newFake(true, notify.Result{Delivered: true, Attempts: 1, StatusCode: 200})
+	s, srv, _, shas := newServer(t, []string{"r1", "r2"}, func(c *Config) {
+		c.DataDir = data
+		c.MaxJobs = 1
+		c.Commands = []Command{slowCmd(50)}
+		c.WebhookSecret = testWebhookSecret
+		c.Notifier = fake
+	})
+	release := releaser(t, fake)
+	var a Analysis
+	if code := do(t, "POST", srv.URL+"/api/analyses", notifyBody("r1", shas["r1"].Baseline, "slow", secretNotifyURL, "json"), &a); code != 202 {
+		t.Fatalf("POST A %d", code)
+	}
+	pollDone(t, srv.URL, a.ID)
+	waitCalls(t, fake, 1)
+	var b Analysis
+	if code := do(t, "POST", srv.URL+"/api/analyses", startBody("r2", shas["r2"].Baseline, "slow"), &b); code != 202 {
+		t.Fatalf("POST B %d", code)
+	}
+	pollDone(t, srv.URL, b.ID)
+	s.mu.Lock()
+	_, inMemory := s.jobs[a.ID]
+	s.mu.Unlock()
+	if inMemory {
+		t.Fatal("fixture: A must have been evicted by B")
+	}
+
+	// The first loadStored of A (the GET's) waits between its two steps
+	// until resume is closed; later ones (deliver's own load) go on.
+	paused, resume := make(chan struct{}), make(chan struct{})
+	var loads atomic.Int32
+	s.loadStoredHook = func(id string) {
+		if id == a.ID && loads.Add(1) == 1 {
+			close(paused)
+			<-resume
+		}
+	}
+	var resumed sync.Once
+	resumeGET := func() { resumed.Do(func() { close(resume) }) }
+	t.Cleanup(resumeGET)
+
+	type getResult struct {
+		a    Analysis
+		code int
+		err  error
+	}
+	got := make(chan getResult, 1)
+	go func() {
+		resp, err := http.Get(srv.URL + "/api/analyses/" + a.ID)
+		if err != nil {
+			got <- getResult{err: err}
+			return
+		}
+		defer resp.Body.Close()
+		r := getResult{code: resp.StatusCode}
+		r.err = json.NewDecoder(resp.Body).Decode(&r.a)
+		got <- r
+	}()
+	select {
+	case <-paused:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the GET never reached loadStored")
+	}
+	release() // the receiver answered 200
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		s.mu.Lock()
+		_, inFlight := s.delivering[a.ID]
+		s.mu.Unlock()
+		if !inFlight {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the delivery never left the in-flight set")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if st, ok := loadStoredAnalysis(t, data, a.ID); !ok || st.Notification == nil || st.Notification.Status != "delivered" {
+		t.Fatalf("fixture: the outcome must be recorded before the GET goes on, stored %+v", st.Notification)
+	}
+	resumeGET()
+	var r getResult
+	select {
+	case r = <-got:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the GET never answered")
+	}
+	if r.err != nil || r.code != 200 {
+		t.Fatalf("GET A: %d %v", r.code, r.err)
+	}
+	if n := r.a.Notification; n == nil || n.Status != "delivered" || n.Attempts != 1 || n.LastStatusCode != 200 || n.LastError != "" {
+		t.Fatalf("a GET while a successful delivery ended served %+v, want delivered", r.a.Notification)
 	}
 }
 
