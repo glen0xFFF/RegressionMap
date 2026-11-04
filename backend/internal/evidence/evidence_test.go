@@ -530,3 +530,27 @@ func TestCommitSpaceIsReservedFromTheBudget(t *testing.T) {
 		t.Fatalf("commit items: %+v", commitItems(ev))
 	}
 }
+
+// Below 4000 bytes, MaxTotal is the commit limit: the commit excerpts, and
+// all items together, stay within it.
+func TestCommitItemsStayWithinASmallTotal(t *testing.T) {
+	lim := Limits{MaxExcerpt: 3000, MaxTotal: 1500}
+	hunks := []Hunk{{File: "src/a.ts", NewStart: 1, NewCount: 1, Text: strings.Repeat("h", 100)}}
+	cs := []CommitMessage{{SHA: testSHA(1), Message: strings.Repeat("c", 900)}, {SHA: testSHA(2), Message: strings.Repeat("d", 900)}}
+	ev := BuildWithCommits(nil, hunks, cs, fakeRead(nil), lim)
+	types := []string{}
+	total, commitTotal := 0, 0
+	for _, e := range ev {
+		types = append(types, e.Type)
+		total += len(e.Excerpt)
+		if e.Type == "commit" {
+			commitTotal += len(e.Excerpt)
+		}
+	}
+	if commitTotal > 1500 || total > 1500 {
+		t.Fatalf("commit excerpts %d bytes, all items %d bytes; want both within 1500 (types %v)", commitTotal, total, types)
+	}
+	if strings.Join(types, ",") != "diff_hunk,commit" || ev[1].Excerpt != cs[0].Message {
+		t.Fatalf("types %v; want diff_hunk,commit with the newest commit", types)
+	}
+}
