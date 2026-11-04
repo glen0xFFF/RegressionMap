@@ -312,6 +312,55 @@ func TestErrorTextHasNoControlCharacters(t *testing.T) {
 	}
 }
 
+// A host (as url.Parse decodes it) that holds a control, format or space
+// character, or that is not valid UTF-8, is refused with the generic error,
+// so it never reaches notification.host, DATA_DIR or the log. Other
+// non-ASCII letters (IDN hosts) stay accepted.
+func TestValidateRefusesControlFormatAndSpaceInHost(t *testing.T) {
+	const want = "notify_url is not a valid URL"
+	bad := map[string]string{
+		"U+0085 raw":           "https://h\u0085ooks.example.com/x",
+		"U+0085 as %C2%85":     "https://h%C2%85ooks.example.com/x",
+		"U+009B raw":           "https://h\u009b2Kooks.example.com/x",
+		"U+009B as %C2%9B":     "https://h%C2%9B2Kooks.example.com/x",
+		"U+202E raw":           "https://h\u202eooks.example.com/x",
+		"U+202E as %E2%80%AE":  "https://h%E2%80%AEooks.example.com/x",
+		"U+200B raw":           "https://h\u200books.example.com/x",
+		"U+FEFF raw":           "https://\ufeffhooks.example.com/x",
+		"U+00A0 raw":           "https://hooks\u00a0.example.com/x",
+		"U+2028 raw":           "https://hooks.example.com\u2028/x",
+		"U+2029 raw":           "https://hooks\u2029.example.com/x",
+		"U+3000 raw":           "https://hooks\u3000.example.com/x",
+		"invalid UTF-8 %FF":    "https://h%FFooks.example.com/x",
+		"invalid UTF-8 raw":    "https://h\xffooks.example.com/x",
+		"truncated UTF-8 %C2":  "https://h%C2ooks.example.com/x",
+		"tab (url.Parse)":      "https://hooks\t.example.com/x",
+		"space (url.Parse)":    "https://hooks .example.com/x",
+		"before the https one": "http://h\u0085ooks.example.com/x",
+		"with port 443":        "https://h\u202eooks.example.com:443/x",
+	}
+	for name, u := range bad {
+		_, err := Validate(u)
+		if err == nil || err.Error() != want {
+			t.Errorf("%s: %+q gave %v, want %q", name, u, err, want)
+		}
+	}
+	ok := []string{
+		"https://bücher.example/x",
+		"https://b%C3%BCcher.example/x",
+		"https://hooks.example.com/x",
+		"https://HOOKS.Example.COM:443/x",
+		"https://xn--bcher-kva.example/x",
+		"https://[2606:4700:4700::1111]/x",
+		"https://93.184.216.34/x",
+	}
+	for _, u := range ok {
+		if _, err := Validate(u); err != nil {
+			t.Errorf("%+q must be accepted: %v", u, err)
+		}
+	}
+}
+
 // "At most 2048 characters" counts Unicode characters, not bytes.
 func TestValidateCountsCharactersNotBytes(t *testing.T) {
 	prefix := "https://" + testHost + "/"

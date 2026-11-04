@@ -529,11 +529,21 @@ func TestFinishPersistsDoneAndError(t *testing.T) {
 	}
 }
 
-// Progress (test runs and evidence) is persisted while the model step is
-// still running, so a crash at that point keeps the collected evidence.
+// Everything collected before the model step (both test runs, the changed
+// files, the evidence and the warnings) is persisted before that step
+// starts, so a crash or a timeout during it keeps all of it, and GET serves
+// it while the step runs. A changed file over 1 MiB puts the fixture over a
+// cap, so the warnings are not empty. The fake model server signals when
+// the model request arrives and then holds it: by then every save before
+// the model step has finished.
 func TestProgressIsPersistedBeforeModelStep(t *testing.T) {
+	entered := make(chan struct{}, 1)
 	release := make(chan struct{})
 	modelSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case entered <- struct{}{}:
+		default:
+		}
 		select {
 		case <-release:
 		case <-r.Context().Done():
@@ -548,26 +558,42 @@ func TestProgressIsPersistedBeforeModelStep(t *testing.T) {
 		}
 	}()
 	data := t.TempDir()
-	_, srv, _, shas := newServer(t, []string{"r1"}, func(c *Config) {
+	_, srv, root, shas := newServer(t, []string{"r1"}, func(c *Config) {
 		c.DataDir = data
 		c.Commands = []Command{slowCmd(50)}
 		c.Model = &model.Client{BaseURL: modelSrv.URL, APIKey: "test", Model: "m", MaxAttempts: 1}
 	})
+	line := strings.Repeat("abcdefghij", 9) + "\n" // 91 bytes
+	plCommit(t, filepath.Join(root, "r1"), map[string]string{"src/big.ts": strings.Repeat(line, (3<<19)/len(line))})
+	const wantWarning = "1 file(s) larger than 1 MiB were read only in part"
 	var a Analysis
 	if code := do(t, "POST", srv.URL+"/api/analyses", startBody("r1", shas["r1"].Baseline, "slow"), &a); code != 202 {
 		t.Fatalf("POST %d", code)
 	}
-	deadline := time.Now().Add(30 * time.Second)
-	for {
-		if st, found := loadStoredAnalysis(t, data, a.ID); found && st.Status == "running" && st.CurrentRun != nil && st.BaselineRun != nil {
-			break
-		}
-		if time.Now().After(deadline) {
-			st, _ := loadStoredAnalysis(t, data, a.ID)
-			t.Fatalf("progress never persisted while model step runs: %+v", st)
-		}
-		time.Sleep(20 * time.Millisecond)
+	select {
+	case <-entered:
+	case <-time.After(60 * time.Second):
+		st, _ := loadStoredAnalysis(t, data, a.ID)
+		t.Fatalf("the model step never started: %+v", st)
 	}
+	check := func(where string, got Analysis) {
+		t.Helper()
+		if got.Status != "running" || got.BaselineRun == nil || got.CurrentRun == nil || len(got.ChangedFiles) == 0 ||
+			len(got.Evidence) == 0 || len(got.Warnings) != 1 || got.Warnings[0] != wantWarning {
+			t.Fatalf("%s while the model step runs: status %q, baseline run %v, current run %v, %d changed file(s), %d evidence item(s), warnings %q; want running, both runs, changed files, evidence and [%q]",
+				where, got.Status, got.BaselineRun != nil, got.CurrentRun != nil, len(got.ChangedFiles), len(got.Evidence), got.Warnings, wantWarning)
+		}
+	}
+	st, found := loadStoredAnalysis(t, data, a.ID)
+	if !found {
+		t.Fatal("the analysis is not stored while the model step runs")
+	}
+	check("stored copy", st)
+	var got Analysis
+	if code := do(t, "GET", srv.URL+"/api/analyses/"+a.ID, nil, &got); code != 200 {
+		t.Fatalf("GET %d", code)
+	}
+	check("GET", got)
 	once = true
 	close(release)
 	pollDone(t, srv.URL, a.ID)

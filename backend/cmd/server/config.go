@@ -12,6 +12,9 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"unicode"
+	"unicode/utf16"
+	"unicode/utf8"
 
 	"regressionmap/internal/apikeys"
 	"regressionmap/internal/model"
@@ -135,10 +138,11 @@ func loadKey(getenv func(string) string) (string, error) {
 const minWebhookSecret = 32
 
 // loadWebhookSecret reads WEBHOOK_SECRET exactly as set (receivers verify
-// the HMAC with the same bytes). Errors never contain the value.
+// the HMAC with the same bytes). The minimum counts Unicode characters, not
+// bytes, as the contract says. Errors never contain the value.
 func loadWebhookSecret(getenv func(string) string) (string, error) {
 	v := getenv("WEBHOOK_SECRET")
-	if v != "" && len(v) < minWebhookSecret {
+	if v != "" && utf8.RuneCountInString(v) < minWebhookSecret {
 		return "", fmt.Errorf("WEBHOOK_SECRET must be at least %d characters (it is the HMAC key of webhook signatures); unset it to disable webhooks", minWebhookSecret)
 	}
 	return v, nil
@@ -260,14 +264,68 @@ func isLoopbackAddr(addr string) (bool, error) {
 	return ip != nil && ip.IsLoopback(), nil
 }
 
+// newLogger returns the server's logger. The json handler writes C1
+// controls, format characters and U+2028/U+2029 inside a string raw (or, for
+// U+2028/U+2029, as an escape that decodes back to them), and a terminal or
+// log viewer can act on them, so its strings go through escapeLogAttr first.
+// The text handler quotes such strings already.
 func newLogger(w io.Writer, format string) (*slog.Logger, error) {
 	switch format {
 	case "", "text":
 		return slog.New(slog.NewTextHandler(w, nil)), nil
 	case "json":
-		return slog.New(slog.NewJSONHandler(w, nil)), nil
+		return slog.New(slog.NewJSONHandler(w, &slog.HandlerOptions{ReplaceAttr: escapeLogAttr})), nil
 	}
 	return nil, fmt.Errorf("unknown log format %q", format)
+}
+
+// escapeLogAttr applies escapeLogText to every string value the json
+// handler writes: attribute values of kind string, error values after
+// Error(), and the message (the built-in "msg" attribute). Other values are
+// left alone.
+func escapeLogAttr(_ []string, a slog.Attr) slog.Attr {
+	switch a.Value.Kind() {
+	case slog.KindString:
+		if s := a.Value.String(); strings.ContainsFunc(s, logEscaped) {
+			a.Value = slog.StringValue(escapeLogText(s))
+		}
+	case slog.KindAny:
+		if err, ok := a.Value.Any().(error); ok && err != nil {
+			if s := err.Error(); strings.ContainsFunc(s, logEscaped) {
+				a.Value = slog.StringValue(escapeLogText(s))
+			}
+		}
+	}
+	return a
+}
+
+// logEscaped reports whether escapeLogText rewrites r: a rune in
+// U+0080..U+009F, a format character (unicode.Cf) or U+2028/U+2029. C0
+// controls are left to the json handler, which escapes them already.
+func logEscaped(r rune) bool {
+	return r >= 0x80 && r <= 0x9f || r == 0x2028 || r == 0x2029 || unicode.Is(unicode.Cf, r)
+}
+
+// escapeLogText writes each rune for which logEscaped is true as the
+// six-character text \uXXXX in lowercase hex; a format character beyond
+// U+FFFF becomes its UTF-16 surrogate pair, two such texts. Every other
+// byte, including invalid UTF-8, is kept for the handler as it was.
+func escapeLogText(s string) string {
+	var b strings.Builder
+	for i := 0; i < len(s); {
+		r, size := utf8.DecodeRuneInString(s[i:])
+		switch {
+		case !logEscaped(r):
+			b.WriteString(s[i : i+size])
+		case r > 0xffff:
+			hi, lo := utf16.EncodeRune(r)
+			fmt.Fprintf(&b, `\u%04x\u%04x`, hi, lo)
+		default:
+			fmt.Fprintf(&b, `\u%04x`, r)
+		}
+		i += size
+	}
+	return b.String()
 }
 
 // logStartup logs where the server listens. It logs whether a key and a

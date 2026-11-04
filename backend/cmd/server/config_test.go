@@ -316,6 +316,21 @@ func TestLoadConfigWebhookSecret(t *testing.T) {
 	if err != nil || cfg.WebhookSecret != ok {
 		t.Fatalf("32 chars: %q %v", cfg.WebhookSecret, err)
 	}
+	// The minimum counts characters, not bytes: 16 two-byte characters are
+	// 32 bytes but only 16 characters.
+	shortWide := strings.Repeat("é", 16)
+	if len(shortWide) != 32 {
+		t.Fatal("fixture length")
+	}
+	_, _, err = loadConfig(envOf(map[string]string{"WORKSPACE_ROOT": root, "WEBHOOK_SECRET": shortWide}))
+	if err == nil || err.Error() != "WEBHOOK_SECRET must be at least 32 characters (it is the HMAC key of webhook signatures); unset it to disable webhooks" {
+		t.Fatalf("16 two-byte characters (32 bytes): %v", err)
+	}
+	okWide := strings.Repeat("é", 32)
+	cfg, _, err = loadConfig(envOf(map[string]string{"WORKSPACE_ROOT": root, "WEBHOOK_SECRET": okWide}))
+	if err != nil || cfg.WebhookSecret != okWide {
+		t.Fatalf("32 two-byte characters: %q %v", cfg.WebhookSecret, err)
+	}
 }
 
 func TestLoadConfigTestEnvAllow(t *testing.T) {

@@ -17,6 +17,11 @@
 //	RATE_LIMIT_PER_HOUR        per-key POST /api/analyses limit (default 20)
 //	WEBHOOK_SECRET             enables completion webhooks (notify_url); HMAC key,
 //	                           at least 32 characters; never logged
+//	TEST_ENV_ALLOW             comma-separated variable names that test and
+//	                           verification runs receive although their names end
+//	                           in _KEY, _SECRET, _TOKEN or _PASSWORD (never
+//	                           MODEL_API_KEY, MODEL_API_KEY_FILE or WEBHOOK_SECRET);
+//	                           git never receives them
 //
 // Requests that are not local (loopback peer, loopback Host, no
 // X-Forwarded-For/Forwarded) need "Authorization: Bearer <key>" on /api/*,
@@ -28,7 +33,9 @@
 //	server keys list
 //	server keys revoke ID
 //
-// SIGINT/SIGTERM trigger a graceful shutdown (10s).
+// SIGINT/SIGTERM start a graceful shutdown: the server waits up to 10 s for
+// open requests, then up to 25 s for running analyses (ended as error) and
+// webhooks still being sent.
 package main
 
 import (

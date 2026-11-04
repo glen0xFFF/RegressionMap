@@ -154,6 +154,11 @@ type Server struct {
 	runs     map[string]context.CancelFunc
 	stopping bool          // Drain has begun
 	changed  chan struct{} // closed when active, runs or delivering shrinks; nil while nobody waits
+
+	// loadStoredHook is a test seam, nil in production. loadStored calls it
+	// after it has read the stored file and before it rewrites a stored
+	// "pending", so a test can end a delivery in between.
+	loadStoredHook func(id string)
 }
 
 type pendingNotify struct{ url, format string }
@@ -376,9 +381,19 @@ func (s *Server) loadStored(id string) (Analysis, bool) {
 	if s.store == nil || !store.ValidID(id) {
 		return Analysis{}, false
 	}
+	// The in-flight snapshot is taken before the file is read. deliver
+	// records the outcome before it leaves the in-flight set, so when the
+	// snapshot says not in flight, the read below already sees any outcome
+	// this process recorded.
+	s.mu.Lock()
+	_, inFlight := s.delivering[id]
+	s.mu.Unlock()
 	b, err := s.store.Load(id)
 	if err != nil {
 		return Analysis{}, false
+	}
+	if s.loadStoredHook != nil {
+		s.loadStoredHook(id)
 	}
 	var a Analysis
 	if err := json.Unmarshal(b, &a); err != nil || a.ID != id {
@@ -397,14 +412,9 @@ func (s *Server) loadStored(id string) (Analysis, bool) {
 		a.Verifications = []Verification{}
 	}
 	// A stored "pending" is a delivery that a previous process did not
-	// finish, unless this process is still sending it.
-	if n := a.Notification; n != nil && n.Status == "pending" {
-		s.mu.Lock()
-		_, inFlight := s.delivering[id]
-		s.mu.Unlock()
-		if !inFlight {
-			n.Status, n.LastError = "failed", msgDeliveryInterrupted
-		}
+	// finish, unless this process was still sending it at the snapshot.
+	if n := a.Notification; n != nil && n.Status == "pending" && !inFlight {
+		n.Status, n.LastError = "failed", msgDeliveryInterrupted
 	}
 	return a, true
 }
@@ -577,7 +587,8 @@ const (
 // Only the host is ever logged or stored.
 func (s *Server) deliver(id string, pn pendingNotify, p notify.Payload, host string) {
 	// Leaves the in-flight set only after the outcome is recorded, so a
-	// read of the stored analysis in between still sees "pending".
+	// loadStored whose in-flight snapshot misses the delivery reads the
+	// recorded outcome, and one whose snapshot sees it keeps "pending".
 	defer func() {
 		s.mu.Lock()
 		delete(s.delivering, id)
