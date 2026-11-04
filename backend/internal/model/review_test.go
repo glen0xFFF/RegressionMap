@@ -793,6 +793,20 @@ func TestDisplayOrderAndTopFinding(t *testing.T) {
 	}
 }
 
+// DisplayOrder and TopFinding return copies down to the evidence id lists,
+// so a change to their result never reaches the caller's findings.
+func TestDisplayOrderAndTopFindingCopyEvidenceIDs(t *testing.T) {
+	fs := []Finding{{ID: "R1", EvidenceIDs: []string{"E2"}, Check: Check{Verdict: "confirmed", Reason: "r", EvidenceIDs: []string{"E2"}}}}
+	before, _ := json.Marshal(fs)
+	top := TopFinding(fs)
+	top.EvidenceIDs[0], top.Check.EvidenceIDs[0] = "MUTATED", "MUTATED"
+	d := DisplayOrder(fs)
+	d[0].EvidenceIDs[0], d[0].Check.EvidenceIDs[0] = "MUTATED", "MUTATED"
+	if after, _ := json.Marshal(fs); string(after) != string(before) {
+		t.Fatalf("a change to the result reached the input:\nbefore %s\nafter  %s", before, after)
+	}
+}
+
 func TestReviewErrorDoesNotLeakKey(t *testing.T) {
 	const key = "secret-key-123"
 	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

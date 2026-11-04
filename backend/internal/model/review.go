@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"path"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -553,8 +554,14 @@ func ValidateChecks(content string, ev []evidence.Item, fs []Finding) ([]Finding
 
 // DisplayOrder returns a copy of fs in the contract's display order:
 // confirmed, unchecked, disputed, then refuted, each group in the order of fs.
+// The evidence id lists are copied too, so the result shares nothing with fs.
 func DisplayOrder(fs []Finding) []Finding {
-	out := append([]Finding{}, fs...)
+	out := make([]Finding, len(fs))
+	for i, f := range fs {
+		f.EvidenceIDs = slices.Clone(f.EvidenceIDs)
+		f.Check.EvidenceIDs = slices.Clone(f.Check.EvidenceIDs)
+		out[i] = f
+	}
 	sort.SliceStable(out, func(a, b int) bool { return displayRank(out[a]) < displayRank(out[b]) })
 	return out
 }
