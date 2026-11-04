@@ -65,6 +65,48 @@ describe("changesTable", () => {
   it("handles missing inputs", () => {
     expect(changesTable(null, null)).toEqual([]);
   });
+  it("joins a hunk whose path has a [REDACTED] segment to the one changed file it fits", () => {
+    const rows = changesTable(
+      [{ path: "packages/sk-components-library/src/button.ts", status: "M" }, { path: "src/p.js", status: "M" }],
+      [ev("E1", "packages/[REDACTED]/src/button.ts", HUNK), ev("E2", "src/p.js", "-q")],
+    );
+    expect(rows).toEqual([
+      { path: "packages/sk-components-library/src/button.ts", status: "M", add: 2, del: 1, hunks: 1 },
+      { path: "src/p.js", status: "M", add: 0, del: 1, hunks: 1 },
+    ]);
+  });
+  it("treats each [REDACTED] segment as exactly one segment of the changed path", () => {
+    const rows = changesTable(
+      [
+        { path: "a/token=abc/b/ghp_xyz/c.ts", status: "M" },
+        { path: "a/token=abc/b/c.ts", status: "M" },
+        { path: "a/token=abc/b/ghp_xyz/extra/c.ts", status: "A" },
+      ],
+      [ev("E1", "a/[REDACTED]/b/[REDACTED]/c.ts", "+x\n+y")],
+    );
+    expect(rows).toEqual([
+      { path: "a/token=abc/b/ghp_xyz/c.ts", status: "M", add: 2, del: 0, hunks: 1 },
+      { path: "a/token=abc/b/c.ts", status: "M", add: 0, del: 0, hunks: 0 },
+      { path: "a/token=abc/b/ghp_xyz/extra/c.ts", status: "A", add: 0, del: 0, hunks: 0 },
+    ]);
+  });
+  it("gives the hunk to no file when the redacted path fits more than one changed file", () => {
+    const rows = changesTable(
+      [{ path: "keys/AKIAAAAAAAAAAAAAAAAA/x.ts", status: "M" }, { path: "keys/AKIABBBBBBBBBBBBBBBB/x.ts", status: "M" }],
+      [ev("E1", "keys/[REDACTED]/x.ts", "+x")],
+    );
+    expect(rows.map((r) => r.hunks)).toEqual([0, 0]);
+  });
+  it("prefers an exact path match over a [REDACTED] wildcard match", () => {
+    const rows = changesTable(
+      [{ path: "docs/[REDACTED]/a.md", status: "M" }, { path: "docs/secret/a.md", status: "M" }],
+      [ev("E1", "docs/[REDACTED]/a.md", "+x"), ev("E2", "docs/secret/a.md", "-y")],
+    );
+    expect(rows).toEqual([
+      { path: "docs/[REDACTED]/a.md", status: "M", add: 1, del: 0, hunks: 1 },
+      { path: "docs/secret/a.md", status: "M", add: 0, del: 1, hunks: 1 },
+    ]);
+  });
 });
 
 describe("groupDiffsByFile", () => {

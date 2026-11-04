@@ -68,11 +68,33 @@ export interface ChangeRow extends DiffCounts {
   hunks: number;
 }
 
+const REDACTED = "[REDACTED]";
+
+/**
+ * Find the changed file an evidence path belongs to. The server redacts evidence
+ * paths one segment at a time (a secret-looking segment becomes exactly
+ * "[REDACTED]") but keeps changed_files paths raw. An exact match wins; otherwise
+ * each "[REDACTED]" segment stands for exactly one segment of the changed path,
+ * and that match is used only when exactly one changed file fits.
+ */
+export function changedFileFor(evidencePath: string, changedPaths: readonly string[]): string | null {
+  if (changedPaths.includes(evidencePath)) return evidencePath;
+  const segs = evidencePath.split("/");
+  if (!segs.includes(REDACTED)) return null;
+  const fits = changedPaths.filter((p) => {
+    const ps = p.split("/");
+    return ps.length === segs.length && segs.every((s, i) => s === REDACTED || s === ps[i]);
+  });
+  return fits.length === 1 ? fits[0] : null;
+}
+
 /** Walkthrough "Changes" table: one row per changed file; counts come only from diff_hunk evidence. */
 export function changesTable(files: ChangedFile[] | null | undefined, evidence: Evidence[] | null | undefined): ChangeRow[] {
   const hunks = diffHunks(evidence);
+  const paths = (files ?? []).map((f) => f.path);
+  const owner = hunks.map((h) => changedFileFor(h.file, paths));
   return (files ?? []).map((f) => {
-    const mine = hunks.filter((h) => h.file === f.path);
+    const mine = hunks.filter((_, i) => owner[i] === f.path);
     const c = mine.reduce(
       (acc, h) => {
         const n = countDiffLines(h.excerpt);
