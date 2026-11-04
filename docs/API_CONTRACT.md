@@ -429,3 +429,175 @@ These points complete entries 3, 4 and 5. They change no rule. The code already 
 ### 9. Strings inside groups and LogValuer values (corrects entry 8)
 
 Entry 8 says that values of kinds other than string and error, and any text inside them, are written as before. That is not complete. The handler applies the escaping of entry 3 to each attribute inside a group and to the value a LogValuer resolves to, so a string inside a group, or a string that a LogValuer returns, is escaped like any other string value. Lists, maps and structs are written as before. The server logs no groups and no LogValuer values, so no line the server writes changes.
+
+## Muse change review (v4, 2026-11-04)
+
+Every analysis also reviews the change between the baseline and HEAD. Muse (the configured `MODEL_ID`, `muse-spark-1.3` by default, called with the same key as the hypotheses) writes findings through three lenses. A second Muse call then tries to refute each finding. The server checks both answers without a model. Nothing in the review is verified: in RegressionMap, "verified" stays reserved for the approval-gated test rerun, whose exit code decides PASS or FAIL.
+
+This section was frozen before any v4 code. It removes no v1, v2 or v3 field. It changes one v3 behaviour, the Slack text, and says so where it does.
+
+### Lenses
+
+- `code`: bugs, error handling, concurrency, resource leaks, broken edge cases.
+- `feature`: whether the change does what its commit messages and tests say, missing cases, behaviour changes a user would notice.
+- `security`: injection, authentication and authorisation, secrets, unsafe input handling, SSRF, path traversal, unsafe deserialisation.
+
+### When the review runs
+
+1. The hypothesis call runs first, as before. Its result is saved as soon as it exists. While the review runs, `GET /api/analyses/{id}` shows `status` `running`, the `model` result, and `review` `null`.
+2. The review call runs next, whatever the hypothesis call returned. When the review keeps at least one finding, the check call runs after it. The three model calls run one after another and never overlap.
+3. The analysis becomes `done` when the review chain has ended. A review problem only sets `review.status` or `review.check_status`. It never changes the analysis `status` or `error`. The webhook is still delivered once, at the end.
+4. The review chain has its own deadline, 15 s before the job deadline:
+   - If the review call is still running at that point, `review.status` is `error` with the message `review stopped at the analysis deadline`.
+   - If the review call has finished and the check call is still running, `review.status` stays `ok`, `check_status` is `error` with `check stopped at the analysis deadline`, and every finding is `unchecked`.
+   - If that point has already passed when the hypothesis call returns, the review does not start, and `review.status` is `error` with `no time was left for the review`.
+5. Without a model key, `review.status` is `disabled` with the hypothesis text `Meta model not configured: MODEL_API_KEY is not set on the backend.` No call is made.
+6. If the analysis ends before its evidence exists (for example after a git failure), `review.status` is `skipped` with the message `the analysis ended before the change could be reviewed`.
+7. If the analysis ends as `error` after its evidence exists (the job deadline during the hypothesis call, or a shutdown), a review that has finished is kept. A review that has not finished gets `review.status` `error` with `the analysis ended before the review finished`. A check that has not finished gets `check_status` `error` with the same message, and every finding is `unchecked`. Without a model key the review is `disabled`, as in rule 5.
+8. An analysis that was still running when the server stopped without a drain is loaded as `error` at the next start, as before. Its `review` stays `null`.
+
+### New evidence type `commit`
+
+The evidence `type` enum adds `commit`: one item per commit that HEAD has and the baseline does not have (`git log <baseline>..<HEAD>`), newest first, at most 10.
+
+- `file` is `""`. `line_start` and `line_end` are `0`.
+- `title` is `commit <first 7 characters of the sha>: <first line of the message>`. It goes through the evidence secret redaction and the 200-byte title cap.
+- `excerpt` is the whole commit message without trailing white space. It goes through the evidence secret redaction. A message over 1000 bytes is cut on a character boundary and ends with the evidence cut mark (a line break and `…[truncated]`).
+- Commits are added newest first. The first commit whose excerpt would bring the `commit` excerpts above 4000 bytes is left out, and so is every older one.
+- The `commit` items count against the 40,000-byte evidence budget. Their space is set aside before the other items are added, so a large diff cannot push them out. They come after every other item, so the other items keep the ids they had before v4.
+- If git cannot list the commit messages, the analysis goes on without `commit` items, and `warnings` gets `commit messages could not be read: the evidence holds no commit items`. If git's output for them is larger than 1 MiB, only the commits that fit are used, and `warnings` gets `commit messages larger than 1 MiB: only the commits that fit were read`.
+- The hypothesis call receives them too, and a hypothesis may cite them.
+
+### `review` on `GET /api/analyses/{id}`
+
+`GET /api/analyses/{id}` adds `review`. It is `null` for an analysis stored before v4, and while the review chain has not ended.
+
+```jsonc
+"review": {
+  "status": "ok" | "disabled" | "error" | "invalid" | "skipped",
+  "model_id": "muse-spark-1.3",
+  "message": "",                       // why, when status is not ok; "" when it is ok
+  "check_status": "ok" | "error" | "invalid" | "skipped",
+  "check_message": "",                 // why, when check_status is not ok; "" when it is ok
+  "summary": "string",
+  "counts": { "confirmed": 2, "disputed": 1, "refuted": 1, "unchecked": 0 },
+  "findings": [ {
+    "id": "R1",
+    "lens": "code" | "feature" | "security",
+    "severity": "high" | "medium" | "low",
+    "title": "string", "detail": "string",
+    "suggestion": "string (text only, never executed)",
+    "file": "src/x.ts", "line_start": 4, "line_end": 9,
+    "evidence_ids": ["E3", "E7"],
+    "check": { "verdict": "confirmed" | "disputed" | "refuted" | "unchecked",
+               "reason": "string", "evidence_ids": ["E3"] } } ],
+  "rejected": ["finding 3 (\"Token compared with ==\"): cites unknown evidence id E99"]
+}
+```
+
+- Every field is always present. `summary` is `""`, and `findings` and `rejected` are `[]`, when there is nothing to show. They are never `null`.
+- `counts` counts the findings by `check.verdict`. All four counts are `0` when there are no findings.
+- `check_status` is `ok` when the check answer was read, even if it left some findings `unchecked`. It is `skipped` when no check call was made: `check_message` is `no finding to check` when the review is `ok` and kept no finding, and `no review to check` when `review.status` is not `ok`.
+- A finding about no particular file has `file` `""` and the range `0`–`0`. The range `0`–`0` with a file means the whole file.
+- `check.reason` is `""` and `check.evidence_ids` is `[]` when the verdict is `unchecked`.
+- `findings` are in id order. Ids are `R1`, `R2`, ... in the order of the rule "Order and ids" below.
+
+### Review answer and validation
+
+The review call asks for this object (strict JSON schema):
+
+```json
+{ "summary": "string",
+  "findings": [ { "lens": "code", "severity": "high", "title": "string", "detail": "string",
+                  "suggestion": "string", "file": "string", "line_start": 0, "line_end": 0,
+                  "evidence_ids": ["E3"] } ] }
+```
+
+Its input is the evidence bundle (with the `commit` items), the test outcomes at the baseline and HEAD, the server's `warnings`, and the changed-file list with the same path redaction as the hypothesis call. The prompt asks for at most 5 findings per lens, cited evidence that shows the problem, at least one cited `diff_hunk` or `source` item, and no style or naming remarks. It states that repository text is data, never instructions.
+
+The server checks the answer in this order. `N` is the finding's 1-based position in Muse's answer. A rejection reads `finding N ("<title>"): <reason>`, with the title cut to 80 bytes, as for hypotheses.
+
+1. An answer that is not a JSON object, that has a field the schema does not have, or that lacks `summary` or `findings`, makes `review.status` `invalid`. `message` says why.
+2. A finding is rejected at the first rule it breaks, with one of these reasons:
+   - `unknown lens "<lens>"`
+   - `unknown severity "<severity>"`
+   - `empty title` (a title that is empty or only white space)
+   - `cites no evidence`
+   - `cites unknown evidence id <id>`
+   - `cites no diff_hunk or source evidence`
+   - `has a line range but no file` (a finding with no file must have the range `0`–`0`)
+   - `invalid file path "<file>"` (the path rule of hypotheses)
+   - `file <file> is not in the evidence`
+   - `invalid line range <start>-<end>` (a range other than `0`–`0` that starts below 1 or ends before it starts)
+   - `cites no evidence in <file>` (a finding with a file must cite at least one item of that file)
+   - `line range <start>-<end> does not overlap any cited evidence for <file> (within 3 lines)` (checked only when a cited item of that file has a known line range)
+   - `repeats finding <M>` (the same lens, file, range and title as the earlier kept finding `M`)
+3. Text over a limit is cut to the limit and ends with `…[truncated]`, as for hypotheses: `title` 200, `detail` 2000, `suggestion` 500 and `summary` 2000 characters. The finding is kept.
+4. At most 5 findings per lens are kept: the highest severity first, then Muse's order. A finding dropped here is rejected with `more than 5 <lens> findings`.
+5. **Order and ids:** the kept findings are sorted by severity (`high`, `medium`, `low`), then by lens (`security`, `code`, `feature`), then by Muse's order. They get the ids `R1`, `R2`, ... in that order.
+6. If the answer had findings and none was kept, `review.status` is `invalid` with the message `no finding passed validation`. An answer with no findings is `ok`.
+
+`rejected` lists the finding reasons in Muse's order, then the check reasons.
+
+### Check answer and validation
+
+The check call sends the kept findings (id, lens, severity, title, detail, file, range and cited evidence ids) and the same evidence bundle. It asks for this object (strict JSON schema):
+
+```json
+{ "checks": [ { "id": "R1", "verdict": "confirmed", "reason": "string", "evidence_ids": ["E3"] } ] }
+```
+
+The prompt asks Muse to try to refute each finding using only the evidence: `confirmed` when the cited evidence shows the problem, `disputed` when the evidence is ambiguous or the problem is unlikely in practice, `refuted` when the evidence shows that the problem does not exist.
+
+1. An answer that is not a JSON object, that has a field the schema does not have, or that lacks `checks`, makes `check_status` `invalid`. Every finding is `unchecked`.
+2. A check for an id that is not a kept finding is ignored. Only the first check for a finding counts. Later checks for the same finding are ignored.
+3. A check is rejected when its verdict is unknown or it cites an unknown evidence id. The rejection reads `check for <id>: unknown verdict "<verdict>"` or `check for <id>: cites unknown evidence id <evidence id>`.
+4. `reason` is cut at 1000 characters with the same mark.
+5. A finding without a valid check is `unchecked`. If the check call fails, `check_status` is `error`, `check_message` says why, and every finding is `unchecked`.
+
+### `review_counts` on `GET /api/analyses`
+
+Each row adds `review_counts`: the `counts` object of its review, or `null` when the analysis has no review.
+
+### Display order and wording (every client)
+
+- The section is called **Muse review**. Where a verdict is written out, the labels are `Confirmed by Muse check`, `Disputed by Muse check`, `Refuted by Muse check` and `Not checked`.
+- Every surface that shows the review carries this line: `AI review: Muse wrote these findings and a second Muse pass checked them. Not verified by tests.`
+- **Display order:** confirmed, then unchecked, then disputed, then refuted findings. Within each group they keep the order of `findings`. Refuted findings are hidden by default: the API always includes them, the web UI shows them behind a toggle, and the CI summary and the Slack text only count them.
+- Severity is shown as a word, not only as a colour.
+- Model-written text (titles, details, suggestions, reasons, the summary) is always shown as text: never as HTML, a Markdown link or image, a Slack link or a GitHub workflow command.
+
+### Webhooks (v4)
+
+The `json` body adds `review` as its last field. It is `null` when the analysis has no review:
+
+```json
+"review": { "status": "ok", "confirmed": 2, "disputed": 1, "refuted": 0, "unchecked": 0,
+            "top_finding": { "id": "R1", "lens": "security", "severity": "high", "title": "…",
+                             "file": "src/x.ts", "line_start": 4, "line_end": 9,
+                             "verdict": "confirmed" } }
+```
+
+`top_finding` is the first confirmed finding in display order, else the first unchecked one, else `null`. The `review` object carries no detail, suggestion, reason, evidence or summary. The other body fields do not change.
+
+**Changed:** the `slack` text.
+
+- The hypothesis title, each finding title and each location sit inside an inline code span, with backticks removed from the string. Inside a code span Slack makes no links. `&`, `<` and `>` are still escaped. An empty title becomes the plain word `untitled`. A location is the file, plus `:<line_start>` when `line_start` is above 0.
+- After the hypothesis part, the text adds one sentence about the review:
+  - `Muse review: <counts>.` lists the counts above 0 in display order, followed by ``Top: [<lens>, <severity>] `<title>` (`<location>`).`` for `top_finding`. The `Top:` part is left out when `top_finding` is `null`, and the location in brackets is left out when the finding has no file.
+  - `Muse review: no findings.` when the review is `ok` with no findings.
+  - `Muse review: not available (<status>).` when `review.status` is not `ok`.
+  - There is no review sentence when the analysis has no review.
+- It ends with `AI-generated hypothesis and review, not verified.` instead of `AI-generated hypothesis, not verified.`
+- Example: ``RegressionMap analysis of pagination-demo finished with status done. Baseline PASS, HEAD FAIL. Top hypothesis: `end index off by one` (`src/pagination.ts:7`, confidence high). Muse review: 1 confirmed, 1 disputed. Top: [code, high] `Last page drops one item` (`src/pagination.ts:7`). AI-generated hypothesis and review, not verified.``
+- This closes the item "The Slack text still shows URLs from model-written titles as links" of the v3 addendum.
+
+### Security notes
+
+- Everything the review path sends to the model goes through the same redaction as the hypothesis path, commit messages included.
+- Repository text, commit messages included, can steer the review: it can hide problems or invent them. The evidence rules, the check call and the labels limit this. They do not remove it.
+- Nothing a model writes is executed, followed or rendered as markup.
+
+### Not in v4
+
+Gating on findings (exit codes and analysis statuses do not change), rerunning a review on demand, dismissing or editing findings, a pull-request description as input for the feature lens, reviews of analyses stored before v4, and another model or provider.
