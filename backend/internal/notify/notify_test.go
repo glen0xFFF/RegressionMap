@@ -740,6 +740,8 @@ func TestSlackTextReviewSentence(t *testing.T) {
 		{"disabled is not available", &ReviewSummary{Status: "disabled"}, " Muse review: not available (disabled)."},
 		{"invalid is not available", &ReviewSummary{Status: "invalid"}, " Muse review: not available (invalid)."},
 		{"skipped is not available", &ReviewSummary{Status: "skipped"}, " Muse review: not available (skipped)."},
+		{"not ok with counts is not available", &ReviewSummary{Status: "error", Confirmed: 2, Refuted: 1},
+			" Muse review: not available (error)."},
 		{"no review", nil, ""},
 	} {
 		p := samplePayload()
