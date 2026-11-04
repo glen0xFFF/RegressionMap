@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"path"
 	"sort"
 	"strconv"
@@ -312,10 +313,8 @@ func ValidateReview(content string, ev []evidence.Item) (summary string, kept []
 		Summary  *string       `json:"summary"`
 		Findings *[]reviewItem `json:"findings"`
 	}
-	dec := json.NewDecoder(strings.NewReader(content))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&raw); err != nil {
-		return "", nil, nil, fmt.Errorf("model output did not match the schema: %v", err)
+	if err := decodeAnswer(content, &raw); err != nil {
+		return "", nil, nil, err
 	}
 	switch {
 	case raw.Summary == nil:
@@ -399,6 +398,21 @@ func ValidateReview(content string, ev []evidence.Item) (summary string, kept []
 		}
 	}
 	return cutText(*raw.Summary, maxSummaryLen), kept, rejected, nil
+}
+
+// decodeAnswer decodes content into v as one JSON value, and rejects a field
+// that v does not have. White space around the value is allowed; any other
+// data after it means the answer is not one JSON object.
+func decodeAnswer(content string, v any) error {
+	dec := json.NewDecoder(strings.NewReader(content))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(v); err != nil {
+		return fmt.Errorf("model output did not match the schema: %v", err)
+	}
+	if _, err := dec.Token(); err != io.EOF {
+		return errors.New("model output did not match the schema: data after the JSON object")
+	}
+	return nil
 }
 
 // checkFinding returns the first rule of the contract's rule 2 that f breaks
@@ -488,10 +502,8 @@ func ValidateChecks(content string, ev []evidence.Item, fs []Finding) ([]Finding
 			EvidenceIDs []string `json:"evidence_ids"`
 		} `json:"checks"`
 	}
-	dec := json.NewDecoder(strings.NewReader(content))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&raw); err != nil {
-		return nil, nil, fmt.Errorf("model output did not match the schema: %v", err)
+	if err := decodeAnswer(content, &raw); err != nil {
+		return nil, nil, err
 	}
 	if raw.Checks == nil {
 		return nil, nil, errors.New("model output did not match the schema: checks is missing")

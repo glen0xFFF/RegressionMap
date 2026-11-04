@@ -473,10 +473,16 @@ func TestValidateReviewTopLevel(t *testing.T) {
 		`[]`, `{}`, `{"summary":"s"}`, `{"findings":[]}`, `{"summary":"s","findings":[],"extra":1}`,
 		`{"summary":null,"findings":[]}`, `{"summary":"s","findings":null}`, `not json {`,
 		reviewContent(extra), // a finding field the schema does not have
+		// Data after the object: the answer is not one JSON object.
+		`{"summary":"s","findings":[]} trailing garbage`, `{"summary":"s","findings":[]}{"extra":1}`, `{"summary":"s","findings":[]}}`,
 	} {
 		if _, _, _, err := ValidateReview(raw, evR); err == nil || !strings.HasPrefix(err.Error(), "model output did not match the schema") {
 			t.Errorf("%s: err %v", raw, err)
 		}
+	}
+	// White space around the object is not data.
+	if _, _, _, err := ValidateReview(" \n{\"summary\":\"s\",\"findings\":[]}\n\t ", evR); err != nil {
+		t.Errorf("white space around the object: err %v", err)
 	}
 }
 
@@ -652,7 +658,10 @@ func TestCheckFailureLeavesAllUnchecked(t *testing.T) {
 }
 
 func TestCheckInvalidAnswer(t *testing.T) {
-	for _, raw := range []string{`{"checks":[],"x":1}`, `{}`, `[]`, `{"checks":null}`} {
+	for _, raw := range []string{
+		`{"checks":[],"x":1}`, `{}`, `[]`, `{"checks":null}`,
+		`{"checks":[]} trailing garbage`, `{"checks":[]}{"checks":[]}`, `{"checks":[]}]`,
+	} {
 		rv := owed(t, three()[:2]...)
 		out := checkWith(t, 200, raw, rv, nil)
 		if out.Status != "ok" || out.CheckStatus != "invalid" || !strings.HasPrefix(out.CheckMessage, "model output did not match the schema") {
@@ -662,6 +671,11 @@ func TestCheckInvalidAnswer(t *testing.T) {
 			t.Errorf("%s: findings %+v, counts %+v", raw, out.Findings, out.Counts)
 		}
 		allUnchecked(t, out.Findings)
+	}
+	// White space around the object is not data.
+	out := checkWith(t, 200, " \n"+checksContent(ck{"R1", "confirmed", "r", []string{"E2"}})+"\n\t ", owed(t, three()[:2]...), nil)
+	if out.CheckStatus != "ok" || verdicts(out.Findings) != "R1:confirmed R2:unchecked" {
+		t.Errorf("white space around the object: got %+v", out)
 	}
 }
 
