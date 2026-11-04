@@ -534,9 +534,17 @@ func removeParts(msg string, parts []string) string {
 // with its port, is written with.
 var addrText = regexp.MustCompile(`[0-9A-Fa-f.:\[\]]+`)
 
-// dropAddresses removes every IP address, and every address with its port,
-// from msg. It is the last guard behind addrFree, for an address that
-// reached the error text some other way.
+// dropAddresses removes from msg each run of the characters an address is
+// written with (hex digits, '.', ':' and brackets) that parses as an IP
+// address or as an address with its port, such as 192.0.2.1:443 or
+// [2001:db8::1]:443, and keeps the run's trailing '.' or ':'. It is a last
+// guard for text that came from the receiver, such as a certificate name:
+// the addresses that matter, the resolved address and the server's own,
+// are already removed where the error is made, by addrFree, addrFreeConn
+// and scrubDNS. It does not catch every form: a bracketed IPv6 address
+// without a port and a bracketed address with a zone survive, a bare zoned
+// address keeps its zone, and an address-shaped part of a longer name is
+// cut as well (1.2.3.4.nip.io becomes .nip.io).
 func dropAddresses(msg string) string {
 	return addrText.ReplaceAllStringFunc(msg, func(run string) string {
 		core := strings.TrimRight(run, ".:")
