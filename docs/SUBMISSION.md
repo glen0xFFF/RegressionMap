@@ -70,7 +70,7 @@ The work was built from an empty repository on 2026-11-04, inside the Oct 26 –
 - The confidence label is a qualitative estimate, not a calibrated probability.
 - Evidence parsing is built for `node --test` output. Other runners would produce a failure summary without parsed stack frames.
 - Only `node --test` is on the command allowlist in this version.
-- Analyses are kept in memory and are lost when the server restarts.
+- Without `DATA_DIR`, analyses are kept only in memory and are lost when the server restarts. With `DATA_DIR` (as in the hosted demo, see `deploy/Dockerfile`), they are saved to disk and survive restarts.
 
 ## Live demo
 https://regressionmap.glenox.net

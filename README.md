@@ -92,7 +92,7 @@ Server environment:
 
 1. stops taking requests and waits up to 10 s for open ones (log lines `shutting down`, then `stopped`);
 2. ends every running analysis with status `error` and the error `analysis interrupted: the server stopped while it was running`, which stops its test processes and starts its completion notification;
-3. waits up to 25 s more for running analyses and for every notification still being sent (log lines `draining`, then `drained`, or the warning `drain incomplete: notifications still being sent are reported as failed`).
+3. waits up to 25 s more for running analyses and for every notification still being sent (log lines `draining`, then `drained`). If the 25 s run out, it logs the warning `drain incomplete` instead, with an `error` field that counts what was still open, for example `1 analysis run(s) still stopping, 1 notification(s) still being sent: context deadline exceeded`, and a `timeout` field (`25s`).
 
 A stop takes at most about 35 s. A notification that is not finished by then is never retried: the URL lived in memory only. With `DATA_DIR`, the next process shows it as `failed` with `last_error` `delivery interrupted: the server stopped before it finished`; attempts made before the stop are not kept, so `attempts` shows 0. Without `DATA_DIR`, nothing survives a restart.
 
@@ -149,7 +149,7 @@ REPO=my-repo BASELINE=<good-sha> sh scripts/ci-analyze.sh
 
 Inputs:
 
-- `REGRESSIONMAP_URL`: `https://` to any host. Plain `http://` only when the host part is exactly `127.0.0.1`, `localhost` or `[::1]`, optionally followed by `:` and a port of digits. The host part is the text after the scheme up to the first `/`. It must not contain `@` or a backslash, also with `https://`. Scheme and host must be lowercase. Trailing slashes are removed.
+- `REGRESSIONMAP_URL`: `https://` to any host. Plain `http://` only when the host part is exactly `127.0.0.1`, `localhost` or `[::1]`, optionally followed by `:` and a port of digits. The host part is the text after the scheme up to the first `/`. It must not contain `@` or a backslash, also with `https://`. The scheme must be lowercase (`HTTPS://` is refused). With `http://`, the host part must be one of the three names above exactly as written, in lowercase (`http://LOCALHOST` is refused). An `https://` host is accepted in any letter case. Trailing slashes are removed.
 - `TIMEOUT_SECONDS`: digits without a leading zero. `0` is allowed and times out after the first poll. `POLL_SECONDS`: digits above 0 without a leading zero.
 - A bad URL or number is a usage error (exit 1) before anything is sent, for example `ci-analyze: REGRESSIONMAP_URL must not contain '@' or a backslash before its path` or `ci-analyze: TIMEOUT_SECONDS must be a whole number of seconds, without leading zeros`.
 
