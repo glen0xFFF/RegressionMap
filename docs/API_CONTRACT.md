@@ -642,3 +642,23 @@ When `GET /api/health` says `auth_required` `false`, the UI shows no sign-in car
 - Anyone who can reach the server can start analyses and verifications. Each analysis makes up to three model calls with the server's key, so the model cost is bounded by the shared rate limit and the job limits only.
 - The existing limits still apply: one analysis or verification per repository at a time, and at most two analyses running at once.
 - API key management still needs an admin key or a local request.
+
+## Corrections of record to the v4 section (2026-11-04)
+
+The final review of the v4 build found these points. Each entry corrects or completes a rule above.
+
+### 1. Ids of the other evidence items (corrects "New evidence type `commit`")
+
+The `commit` items come after every other item, so the other items keep their order. They keep the ids they had before v4 only while the budget has room for all of them: when the space set aside for the `commit` items leaves out an item that v3 would have kept, every later item gets a lower id.
+
+### 2. Secrets that start on the first line of a commit message (completes "New evidence type `commit`")
+
+The secret redaction runs on the whole message before the title takes its first line. A secret that starts on the first line and ends on a later one is therefore removed from the title as well as from the excerpt.
+
+### 3. A model answer that is cut off (completes "When the review runs", rules 4 and 7, and check rule 5)
+
+A model call whose response body cannot be read to the end has failed; it is not an invalid answer. When the deadline or a cancellation ends the read, the call ends as `error` with the same timeout or cancel message as a request that got no response, so rules 4 and 7 apply. Any other read error is retried like a transport error. This holds for the hypothesis, review and check calls.
+
+### 4. Verdicts in the CI summary (completes "Display order and wording")
+
+In the CI summary, the verdict inside each finding line's brackets is written out with the labels: `Confirmed by Muse check`, `Not checked` or `Disputed by Muse check`.
