@@ -979,10 +979,12 @@ func (s *Server) run(ctx context.Context, id, dir string, cmd Command, base, cur
 		warnings = append(warnings, "diff larger than 8 MiB: only the first 8 MiB were analysed")
 	}
 	// The commit messages of the change become commit items. A failure to
-	// list them is not fatal: the analysis goes on without them.
+	// list them is not fatal: the analysis goes on without them, and its
+	// cause goes to the log, because the warning does not name it.
 	var commits []evidence.CommitMessage
-	msgs, cut, err := commitMessages(ctx, dir, base, cur, 10)
+	msgs, cut, err := commitMessages(ctx, dir, base, cur, maxCommitMessages)
 	if err != nil {
+		slog.Warn("commit messages could not be read", "analysis", id, "error", notify.StripControl(err.Error()))
 		warnings = append(warnings, warnCommitsUnread)
 	} else {
 		if cut {

@@ -712,10 +712,13 @@ func TestUnreadableCommitsAddAWarning(t *testing.T) {
 		mu.Unlock()
 	}
 
+	// The analysis carries only the fixed warning, so the cause goes to the
+	// log: one line, without the control characters git's text may hold.
 	t.Run("unreadable", func(t *testing.T) {
+		logs := captureJSONLog(t)
 		commitMessages = func(ctx context.Context, dir, base, cur string, n int) ([]gitx.CommitMessage, bool, error) {
 			record(dir, base, cur, n)
-			return nil, false, errors.New("git log failed")
+			return nil, false, errors.New("git log failed: fatal: bad\nrevision\x1b[0m")
 		}
 		_, srv, _, shas := newServer(t, []string{"r1"}, func(c *Config) { c.Commands = []Command{slowCmd(50)} })
 		a := plAnalyse(t, srv.URL, "r1", shas["r1"].Baseline, "slow")
@@ -735,6 +738,14 @@ func TestUnreadableCommitsAddAWarning(t *testing.T) {
 		mu.Unlock()
 		if want := shas["r1"].Baseline + ".." + shas["r1"].Bug + " n=10"; got != want {
 			t.Fatalf("commit messages asked for %q, want %q", got, want)
+		}
+		recs := jsonLines(t, logs.String())
+		if len(recs) != 1 {
+			t.Fatalf("want exactly one log line, got %d:\n%s", len(recs), logs.String())
+		}
+		if r := recs[0]; r["level"] != "WARN" || r["msg"] != "commit messages could not be read" || r["analysis"] != a.ID ||
+			r["error"] != "git log failed: fatal: badrevision[0m" {
+			t.Fatalf("log record %v", r)
 		}
 	})
 

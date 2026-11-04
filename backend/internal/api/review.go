@@ -23,6 +23,10 @@ var reviewMargin = 15 * time.Second
 // commitMessages lists the commits of the change. Tests swap it.
 var commitMessages = gitx.CommitMessages
 
+// maxCommitMessages is how many commits of the change are read: the
+// contract's "at most 10" commit items.
+const maxCommitMessages = 10
+
 // The contract's review messages and warnings.
 const (
 	msgReviewDeadline = "review stopped at the analysis deadline"
