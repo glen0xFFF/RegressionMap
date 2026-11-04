@@ -66,6 +66,13 @@ jobs:
       - name: go test
         run: go test -count=1 ./...
 
+      # scripts/ci-analyze.sh (with sh: dash on Linux, Git Bash on Windows) and
+      # scripts/ci-analyze.ps1 (pwsh on Linux, powershell.exe 5.1 on Windows)
+      # against a Node fake server. node --test takes a glob, not a directory.
+      - name: CI script tests
+        working-directory: .
+        run: node --test "scripts/test/*.test.mjs"
+
   web:
     name: web (${{ matrix.os }})
     strategy:
