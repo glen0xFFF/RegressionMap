@@ -15,6 +15,9 @@
 //	LOG_FORMAT                 text (default) or json
 //	ALLOWED_HOSTS              comma-separated extra Host/Origin names (e.g. regressionmap.example.com)
 //	RATE_LIMIT_PER_HOUR        per-key POST /api/analyses limit (default 20)
+//	PUBLIC_DEMO                1 serves non-local /api requests without a key as
+//	                           the public demo identity (analyze scope, one shared
+//	                           RATE_LIMIT_PER_HOUR bucket); any other value is off
 //	WEBHOOK_SECRET             enables completion webhooks (notify_url); HMAC key,
 //	                           at least 32 characters; never logged
 //	TEST_ENV_ALLOW             comma-separated variable names that test and
@@ -25,7 +28,9 @@
 //
 // Requests that are not local (loopback peer, loopback Host, no
 // X-Forwarded-For/Forwarded) need "Authorization: Bearer <key>" on /api/*,
-// except GET /api/health. The UI files are served without a key.
+// except GET /api/health. With PUBLIC_DEMO=1, such a request without an
+// Authorization header runs as the public demo identity instead; a key that
+// is sent is still checked. The UI files are served without a key.
 //
 // Subcommands manage the keys in DATA_DIR (the server may be running):
 //
@@ -85,7 +90,7 @@ func buildHandler(cfg config, lg *slog.Logger) (http.Handler, *api.Server, error
 		httpx.Recover(lg),
 		httpx.SecurityHeaders,
 		httpx.LocalOnlyFor(httpx.WithDefaultHosts(cfg.AllowedHosts)),
-		apikeys.Middleware(apikeys.Options{Store: keys, RateLimitPerHour: cfg.RateLimitPerHour}),
+		apikeys.Middleware(apikeys.Options{Store: keys, RateLimitPerHour: cfg.RateLimitPerHour, PublicDemo: cfg.PublicDemo}),
 	), apiSrv, nil
 }
 

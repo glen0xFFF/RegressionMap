@@ -149,6 +149,70 @@ func TestWiredRateLimit(t *testing.T) {
 	}
 }
 
+// TestWiredPublicDemo takes PUBLIC_DEMO from the environment through
+// loadConfig and buildHandler, the path main takes.
+func TestWiredPublicDemo(t *testing.T) {
+	for _, tc := range []struct {
+		env  string
+		want int
+	}{{"1", 200}, {"", 401}, {"true", 401}} {
+		t.Run("PUBLIC_DEMO="+tc.env, func(t *testing.T) {
+			cfg, _, err := loadConfig(envOf(map[string]string{
+				"WORKSPACE_ROOT": t.TempDir(), "DATA_DIR": dataDirWithKey(t, apikeys.ScopeAdmin, false),
+				"ALLOWED_HOSTS": pubHost, "PUBLIC_DEMO": tc.env,
+			}))
+			if err != nil {
+				t.Fatal(err)
+			}
+			h, _, err := buildHandler(cfg, slog.New(slog.NewJSONHandler(io.Discard, nil)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			w := &wired{h: h}
+			on := tc.want == 200
+
+			rec := w.req("GET", "/api/repos", pubPeer, pubHost, nil, "")
+			if rec.Code != tc.want {
+				t.Fatalf("remote GET /api/repos without a key: %d %q, want %d", rec.Code, rec.Body.String(), tc.want)
+			}
+			if on && strings.TrimSpace(rec.Body.String()) != `{"repos":[]}` {
+				t.Fatalf("public repos body: %q", rec.Body.String())
+			}
+			if !on && rec.Header().Get("WWW-Authenticate") != "Bearer" {
+				t.Fatalf("401 lacks WWW-Authenticate: %v", rec.Header())
+			}
+
+			var health map[string]any
+			rec = w.req("GET", "/api/health", pubPeer, pubHost, nil, "")
+			if err := json.Unmarshal(rec.Body.Bytes(), &health); err != nil || health["auth_required"] != !on {
+				t.Fatalf("remote health: %d %q, want auth_required %v", rec.Code, rec.Body.String(), !on)
+			}
+			if !on {
+				return
+			}
+			if rec = w.req("GET", "/api/me", pubPeer, pubHost, nil, ""); rec.Code != 200 || strings.TrimSpace(rec.Body.String()) != `{"mode":"public"}` {
+				t.Fatalf("public me: %d %q", rec.Code, rec.Body.String())
+			}
+			// A browser POST from the public origin is checked for its scope.
+			rec = w.req("POST", "/api/keys", pubPeer, pubHost, map[string]string{
+				"Content-Type": "application/json", "Origin": "https://" + pubHost, "Sec-Fetch-Site": "same-origin",
+			}, `{"name":"x","scope":"admin"}`)
+			if rec.Code != 403 || !strings.Contains(rec.Body.String(), "forbidden_scope") {
+				t.Fatalf("public POST /api/keys: %d %q", rec.Code, rec.Body.String())
+			}
+			// A key that is sent is still checked.
+			rec = w.req("GET", "/api/repos", pubPeer, pubHost, map[string]string{"Authorization": "Bearer rm_live_" + strings.Repeat("Q", 32)}, "")
+			if rec.Code != 401 {
+				t.Fatalf("bad key with the public demo on: %d", rec.Code)
+			}
+			// Host checks still run first.
+			if rec = w.req("GET", "/api/repos", pubPeer, "evil.example", nil, ""); rec.Code != 403 || !strings.Contains(rec.Body.String(), "forbidden_host") {
+				t.Fatalf("evil host: %d %q", rec.Code, rec.Body.String())
+			}
+		})
+	}
+}
+
 func TestAccessLogNeverContainsAuthorizationOrSecret(t *testing.T) {
 	w := newWired(t, []string{pubHost}, 0)
 	for _, secret := range []string{w.admin, w.ana, "rm_live_" + strings.Repeat("Q", 32)} {

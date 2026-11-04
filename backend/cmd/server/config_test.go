@@ -294,6 +294,93 @@ func TestStartupLogShowsAuthSettings(t *testing.T) {
 	}
 }
 
+// publicDemoWarning returns the one warning that names PUBLIC_DEMO, or "".
+func publicDemoWarning(t *testing.T, warns []string) string {
+	t.Helper()
+	var found []string
+	for _, w := range warns {
+		if strings.Contains(w, "PUBLIC_DEMO") {
+			found = append(found, w)
+		}
+	}
+	if len(found) > 1 {
+		t.Fatalf("more than one PUBLIC_DEMO warning: %v", found)
+	}
+	if len(found) == 0 {
+		return ""
+	}
+	return found[0]
+}
+
+func TestLoadConfigPublicDemo(t *testing.T) {
+	root := t.TempDir()
+	// Off unless PUBLIC_DEMO is exactly "1", the rule of REGRESSIONMAP_ALLOW_REMOTE.
+	for _, v := range []string{"", "0", "true", "TRUE", "yes", "on", " 1", "1 ", "01", "1,"} {
+		cfg, warns, err := loadConfig(envOf(map[string]string{"WORKSPACE_ROOT": root, "PUBLIC_DEMO": v}))
+		if err != nil {
+			t.Fatalf("PUBLIC_DEMO=%q: %v", v, err)
+		}
+		if cfg.PublicDemo || publicDemoWarning(t, warns) != "" {
+			t.Fatalf("PUBLIC_DEMO=%q must leave the public demo off: %+v %v", v, cfg, warns)
+		}
+	}
+
+	cfg, warns, err := loadConfig(envOf(map[string]string{"WORKSPACE_ROOT": root, "PUBLIC_DEMO": "1", "RATE_LIMIT_PER_HOUR": "7"}))
+	if err != nil || !cfg.PublicDemo {
+		t.Fatalf("PUBLIC_DEMO=1: %+v %v", cfg, err)
+	}
+	w := publicDemoWarning(t, warns)
+	for _, want := range []string{
+		"WARNING: PUBLIC_DEMO=1 - ",
+		"without a key run as the public demo identity with the analyze scope",
+		"Anyone can start analyses (one shared limit of 7 per hour, RATE_LIMIT_PER_HOUR) and verifications",
+		"API key management still needs an admin key",
+	} {
+		if !strings.Contains(w, want) {
+			t.Fatalf("PUBLIC_DEMO warning lacks %q: %q", want, w)
+		}
+	}
+
+	// With REGRESSIONMAP_ALLOW_REMOTE both warnings are logged, and an active
+	// admin key is still required to start.
+	remote := map[string]string{"WORKSPACE_ROOT": root, "ADDR": "0.0.0.0:8787", "REGRESSIONMAP_ALLOW_REMOTE": "1", "PUBLIC_DEMO": "1"}
+	remote["DATA_DIR"] = dataDirWithKey(t, apikeys.ScopeAdmin, false)
+	cfg, warns, err = loadConfig(envOf(remote))
+	if err != nil || !cfg.PublicDemo || !cfg.AllowRemote {
+		t.Fatalf("remote public demo: %+v %v", cfg, err)
+	}
+	if len(warns) != 2 || !strings.Contains(warns[0], "REGRESSIONMAP_ALLOW_REMOTE") || !strings.Contains(warns[1], "PUBLIC_DEMO") {
+		t.Fatalf("want the ALLOW_REMOTE then the PUBLIC_DEMO warning, got %v", warns)
+	}
+	remote["DATA_DIR"] = dataDirWithKey(t, apikeys.ScopeAnalyze, false)
+	if _, _, err := loadConfig(envOf(remote)); err == nil || !strings.Contains(err.Error(), "admin key") {
+		t.Fatalf("PUBLIC_DEMO must not lift the admin key requirement: %v", err)
+	}
+}
+
+func TestStartupLogShowsPublicDemo(t *testing.T) {
+	for _, tc := range []struct {
+		on         bool
+		text, json string
+	}{
+		{true, "rate_limit_per_hour=7 public_demo=true ", `"rate_limit_per_hour":7,"public_demo":true,`},
+		{false, "rate_limit_per_hour=7 public_demo=false ", `"rate_limit_per_hour":7,"public_demo":false,`},
+	} {
+		for _, format := range []string{"text", "json"} {
+			var buf bytes.Buffer
+			lg, _ := newLogger(&buf, format)
+			logStartup(lg, config{Addr: "127.0.0.1:8787", RateLimitPerHour: 7, PublicDemo: tc.on}, nil)
+			want := tc.text
+			if format == "json" {
+				want = tc.json
+			}
+			if out := buf.String(); !strings.Contains(out, want) {
+				t.Fatalf("%s: startup log lacks %q next to the rate limit: %s", format, want, out)
+			}
+		}
+	}
+}
+
 func TestLoadConfigWebhookSecret(t *testing.T) {
 	root := t.TempDir()
 	cfg, _, err := loadConfig(envOf(map[string]string{"WORKSPACE_ROOT": root}))
