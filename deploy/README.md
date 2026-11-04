@@ -82,8 +82,10 @@ On the **server**, fix the permissions and check the file without printing the v
 chmod 600 deploy/.env
 stat -c '%a %U %n' deploy/.env               # expect: 600 <you> deploy/.env
 grep -c '^MODEL_API_KEY=.' deploy/.env       # expect: 1 (prints a count, not the key)
-grep -c '^WEBHOOK_SECRET=.\{32,\}$' deploy/.env   # webhooks only; expect: 1 (a count, not the secret)
+LC_ALL=C grep -c '^WEBHOOK_SECRET=.\{32,\}$' deploy/.env   # webhooks only; expect: 1 (a count, not the secret)
 ```
+
+The `WEBHOOK_SECRET` check counts bytes (`LC_ALL=C`), while the server counts Unicode characters. For the ASCII hex secret that `openssl rand -hex 32` makes, bytes and characters are the same, so the check agrees with the server. For a secret with non-ASCII characters it does not: such a secret of fewer than 32 characters can still print 1, and the server then refuses to start.
 
 `deploy/.env` is ignored by git (`.gitignore`: `.env`) and by the Docker build (`.dockerignore`). To run without the model step, copy `deploy/.env.example` to `deploy/.env` and leave the value empty. Compose refuses to start without the file.
 
@@ -229,7 +231,7 @@ Every line the server logs is JSON. The exceptions are these plain-text lines:
 - the entrypoint's own `entrypoint: …` lines;
 - on a start where `/workspace/pagination-demo` does not exist yet (the first start with a new volume), the four lines of the demo fixture builder that the entrypoint runs: `created /workspace/pagination-demo`, `baseline <sha>`, `refactor <sha>` and `bug      <sha>`. If the builder fails, it prints its error as plain text instead and the container exits.
 
-In the JSON lines, every string value (the message, string fields and error values) has each character from U+0080 to U+009F, each Unicode format character (category Cf, for example U+202E) and U+2028/U+2029 written as the six-character escape `\uXXXX` (four lowercase hex digits); the JSON encoder already escapes U+0000 to U+001F.
+In the JSON lines, the message and every string value of an attribute have each character from U+0080 to U+009F, each Unicode format character (category Cf, for example U+202E) and U+2028/U+2029 replaced by the six-character text `\uXXXX` (four lowercase hex digits). A format character above U+FFFF, for example U+E0041, becomes its UTF-16 surrogate pair, two such texts (`\udb40\udc41`). The JSON encoder then escapes the backslash, so the raw line shows `\\u202e` and a JSON parser reads the six characters `\u202e`, not U+202E. An error value is replaced by its escaped error text only when that text holds such a character; otherwise it is written as before, as its error text or, for an error type with its own JSON encoding, as that encoding. Values of other kinds are written as before. The JSON encoder already escapes U+0000 to U+001F.
 
 A failed webhook delivery is a `WARN` line with the message `notification failed` and the fields `analysis`, `host`, `attempts`, `status_code` and `error`. It never holds the URL path or query.
 
