@@ -358,6 +358,57 @@ func TestValidateReviewKeepsFivePerLens(t *testing.T) {
 	}
 }
 
+// Contract rule 4: the cap keeps the highest severities first, so a high and
+// a medium finding after five lows are kept, and the last two lows are not.
+func TestValidateReviewCapKeepsHighestSeverityFirst(t *testing.T) {
+	var fs []map[string]any
+	for i, sev := range []string{"low", "low", "low", "low", "low", "high", "medium"} {
+		fs = append(fs, titled(finding("code", sev, "src/pagination.ts", 7, 8, "E2"), fmt.Sprintf("t%d", i+1)))
+	}
+	_, kept, rejected, err := ValidateReview(reviewContent(fs...), evR)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, k := range kept {
+		got = append(got, k.ID+":"+k.Title)
+	}
+	if strings.Join(got, " ") != "R1:t6 R2:t7 R3:t1 R4:t2 R5:t3" {
+		t.Fatalf("kept %v", got)
+	}
+	want := []string{`finding 4 ("t4"): more than 5 code findings`, `finding 5 ("t5"): more than 5 code findings`}
+	if !reflect.DeepEqual(rejected, want) {
+		t.Fatalf("rejected %q, want %q", rejected, want)
+	}
+}
+
+// Contract rule 4: the cap counts each lens on its own, so six code and six
+// security findings keep five of each.
+func TestValidateReviewCapIsPerLens(t *testing.T) {
+	var fs []map[string]any
+	for i := 1; i <= 6; i++ {
+		fs = append(fs,
+			titled(finding("code", "medium", "src/pagination.ts", 7, 8, "E2"), fmt.Sprintf("c%d", i)),
+			titled(finding("security", "medium", "src/pagination.ts", 7, 8, "E2"), fmt.Sprintf("s%d", i)))
+	}
+	_, kept, rejected, err := ValidateReview(reviewContent(fs...), evR)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, k := range kept {
+		got = append(got, k.ID+":"+k.Title)
+	}
+	want := "R1:s1 R2:s2 R3:s3 R4:s4 R5:s5 R6:c1 R7:c2 R8:c3 R9:c4 R10:c5"
+	if strings.Join(got, " ") != want {
+		t.Fatalf("kept %v, want %s", got, want)
+	}
+	wantRejected := []string{`finding 11 ("c6"): more than 5 code findings`, `finding 12 ("s6"): more than 5 security findings`}
+	if !reflect.DeepEqual(rejected, wantRejected) {
+		t.Fatalf("rejected %q, want %q", rejected, wantRejected)
+	}
+}
+
 func TestValidateReviewOrderAndIDs(t *testing.T) {
 	var fs []map[string]any
 	for _, ls := range [][2]string{{"feature", "high"}, {"code", "low"}, {"security", "medium"}, {"security", "high"}, {"code", "high"}} {
