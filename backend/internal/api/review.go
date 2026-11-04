@@ -90,10 +90,14 @@ func (s *Server) reviewOutcome(id string, rv model.Review) model.Review {
 
 // closeReview is the review of an analysis that ends while its review is
 // still nil: before its evidence existed, or before the review chain ended.
-// finish calls it with s.mu held. It returns a new value and never changes
-// a.reviewDone.
+// finish calls it with s.mu held, so it must not panic: a server without a
+// model client counts as one without a key. It returns a new value and
+// never changes a.reviewDone.
 func (s *Server) closeReview(a *Analysis) *model.Review {
 	mc := s.cfg.Model
+	if mc == nil {
+		mc = &model.Client{}
+	}
 	var rv model.Review
 	switch done := a.reviewDone; {
 	case !a.reviewOwed:

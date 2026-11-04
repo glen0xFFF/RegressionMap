@@ -849,3 +849,41 @@ func TestCloseReview(t *testing.T) {
 		})
 	}
 }
+
+// A server without a model client ends an analysis as one without a key.
+// finish calls closeReview with s.mu held, so a panic there would leave
+// s.mu held and hang every later request.
+func TestFinishWithoutModelClient(t *testing.T) {
+	cases := []struct {
+		name        string
+		owed        bool
+		status, msg string
+	}{
+		{"before the evidence", false, "skipped", msgReviewSkipped},
+		{"after the evidence", true, "disabled", model.MsgNotConfigured},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			s := New(Config{Root: t.TempDir()})
+			s.mu.Lock()
+			s.insertLocked(&Analysis{ID: "a1", Status: "running", reviewOwed: c.owed})
+			s.mu.Unlock()
+			var p any
+			func() {
+				defer func() { p = recover() }()
+				s.finish("a1", func(a *Analysis) { a.Status, a.Error = "error", "internal error" })
+			}()
+			if p != nil {
+				t.Fatalf("finish panicked: %v", p)
+			}
+			if !s.mu.TryLock() {
+				t.Fatal("finish left s.mu held")
+			}
+			s.mu.Unlock()
+			a, _ := s.snapshot("a1")
+			if a.Status != "error" || a.Review == nil || a.Review.Status != c.status || a.Review.Message != c.msg {
+				t.Fatalf("status %q review %+v, want error with review %s %q", a.Status, a.Review, c.status, c.msg)
+			}
+		})
+	}
+}
