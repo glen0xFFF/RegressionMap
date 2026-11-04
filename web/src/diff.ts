@@ -106,6 +106,9 @@ export function redactPath(p: string): string {
  * and only when exactly one changed file redacts to it.
  */
 export function changedFileFor(evidencePath: string, changedPaths: readonly string[]): string | null {
+  // Exact first: a changed file whose name literally holds the marker (for example
+  // cfg/token=[REDACTED]/a.ts) wins over another changed file that redacts to the
+  // same path (cfg/token=abcd/a.ts), and both hunks then count for the literal one.
   if (changedPaths.includes(evidencePath)) return evidencePath;
   if (!evidencePath.includes("[REDACTED]")) return null;
   const fits = changedPaths.filter((p) => redactPath(p) === evidencePath);
