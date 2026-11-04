@@ -269,3 +269,95 @@ A caller with an `analyze` key gets `403 forbidden_scope` on all `/api/keys*` ro
 ```
 
 Only the host is shown. `last_error` never contains the URL path or query.
+
+## Review fixes to v3 (addendum, 2026-11-04)
+
+A three-lens review (code, feature, SecOps) of the v3 build found the problems this addendum fixes. It was frozen before the fixes were built. It removes no v3 field. Where it changes behaviour, it says so.
+
+### Notification request checks
+
+`POST /api/analyses` checks the notification fields in this order:
+
+1. `notify_url` is present and `WEBHOOK_SECRET` is not set: `400 webhooks_disabled`.
+2. `notify_url` is present and breaks a URL rule: `400 invalid_notify_url`.
+3. `notify_format` is present and is not `json` or `slack`: `400 bad_request`, with or without `notify_url`.
+
+"At most 2048 characters" counts Unicode characters, not bytes.
+
+### Address check (additions)
+
+These addresses are also non-public, so the server never connects to them:
+
+- IPv6 addresses that embed an IPv4 address: 6to4 (`2002::/16`), Teredo (`2001::/32`) and IPv4-translated (`::ffff:0:0:0/96`). An IPv4-mapped address (`::ffff:a.b.c.d`) is judged by the IPv4 address it carries.
+- The documentation ranges `192.0.2.0/24`, `198.51.100.0/24`, `203.0.113.0/24` and `2001:db8::/32`.
+
+### `last_error` and logs
+
+- `last_error` never contains a resolved address. A host with no public address gives `host does not resolve to a public address`.
+- Control characters (U+0000 to U+001F and U+007F to U+009F) are removed from `last_error` and from logged error text.
+- Delivery failures go through the server's structured logger, so with `LOG_FORMAT=json` every log line is JSON.
+
+### Shutdown
+
+On SIGTERM or Ctrl+C the server:
+
+1. stops accepting requests and waits up to 10 s for open requests, as before;
+2. ends every running analysis with status `error` and the error `analysis interrupted: the server stopped while it was running`, which starts its notification;
+3. waits up to 25 s more for deliveries that are still running.
+
+A delivery that has not finished by then is reported as `failed` with `delivery interrupted: the server stopped before it finished`. It is not retried after a restart. The Docker deployment sets `stop_grace_period` to 40 s.
+
+While this process is still delivering, GET shows the notification as `pending`, also when the analysis is no longer held in memory. The outcome of a finished delivery is always recorded, also when the analysis left memory during the delivery.
+
+### Size limits and the new `warnings` field
+
+| Input | Limit | What happens above it |
+|---|---|---|
+| Diff between baseline and HEAD | 8 MiB | The first 8 MiB, cut at a line boundary, are used. |
+| Changed-file list | 1 MiB | The entries that fit are used. |
+| A file read for evidence | 1 MiB | The first 1 MiB, cut at a line boundary, is used. A stack frame beyond the cut shows `(source larger than 1 MiB, not read)`. |
+
+The analysis continues after a cut. Each cut adds one sentence to a new `warnings` field on the analysis, and the model input states that the input was cut:
+
+```jsonc
+"warnings": ["diff larger than 8 MiB: only the first 8 MiB were analysed"]   // omitted when empty
+```
+
+`baseline_run` and `current_run` are saved before the git steps, so a later git failure keeps them. A git failure names its step, for example `changed-file list failed: …`.
+
+### Model input and output
+
+- The `changed_files` list sent to the model uses the same path redaction as evidence: a secret-looking path segment becomes `[REDACTED]`. The API's own `changed_files` keeps the real paths.
+- The system prompt states the output limits below.
+- A `title` over 200 characters, a `reason` over 2000 or a `verification_suggestion` over 500 is cut to its limit and ends with `…[truncated]`. The hypothesis is kept. **Changed:** the v3 build rejected it.
+- An empty `summary` no longer makes the result `invalid`. A missing `summary` field still does.
+
+The complete validation, in the order applied:
+
+1. A missing top-level field (`summary`, `hypotheses` or `limitations`) makes the result `invalid`.
+2. A hypothesis is rejected, with its reason in `rejected`, when it cites no supporting evidence id, cites an unknown id, names an unsafe file or one that is not in the evidence, has an inverted range, has a range that is not within 3 lines of an evidence span for the same file (`0`–`0` is exempt), has an unknown confidence label, has a rank below 1, or repeats the rank of an earlier hypothesis (the first one is kept).
+3. Only the 5 best-ranked hypotheses that remain are kept.
+
+### Test environment
+
+- Test runs, verification runs and git never receive `MODEL_API_KEY`, `MODEL_API_KEY_FILE`, `WEBHOOK_SECRET`, or any variable whose name ends in `_KEY`, `_SECRET`, `_TOKEN` or `_PASSWORD`, in any letter case.
+- New setting `TEST_ENV_ALLOW`: comma-separated variable names that test runs and verification runs receive anyway. Git never receives them. If it names `MODEL_API_KEY`, `MODEL_API_KEY_FILE` or `WEBHOOK_SECRET`, the server refuses to start.
+- At startup the server logs the names, never the values, of the variables it withholds from test runs.
+
+### Server configuration (v3)
+
+| Variable | Meaning |
+|---|---|
+| `WEBHOOK_SECRET` | Enables `notify_url`. At least 32 characters; a shorter value stops the server at startup. When unset, webhooks are disabled. |
+| `TEST_ENV_ALLOW` | Comma-separated variable names passed to test and verification runs despite the name rule above. |
+
+### Clarifications (no behaviour change)
+
+- **Rate limit:** every authenticated remote `POST /api/analyses` counts, including requests the handler rejects (`400`, `409`, `429 too_many_analyses`).
+- **json body:** `baseline_passed` and `current_passed` are `false` when that run did not happen, and `model_status` is `""` when the model step did not run. Read `status` and `error` first.
+- **Host:** `notification.host` is shown to every key holder and stored in `DATA_DIR`. The rest of the URL is the secret part.
+- **Receivers:** a valid signature proves that the body came from this server. It does not prove that the delivery is for your analysis, because `WEBHOOK_SECRET` is one secret for the whole server. Accept only an `id` that your own `POST /api/analyses` returned, process each `id` once, and reject a `finished_at` older than a few minutes.
+
+### Not in this addendum
+
+Per-key webhook secrets and a signed timestamp header need a later contract version. The Slack text still shows URLs from model-written titles as links.
