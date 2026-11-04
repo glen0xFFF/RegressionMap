@@ -490,6 +490,48 @@ func drainNow(t *testing.T, s *Server) {
 	}
 }
 
+// An analysis that ends while the hypothesis call runs already has its
+// evidence, so it owes a review: the review is an error with
+// msgReviewEnded, not skipped (contract rule 7, both of its windows). No
+// review call is made.
+func TestEndDuringHypothesesEndsReview(t *testing.T) {
+	cases := []struct {
+		name    string
+		timeout time.Duration // the job timeout; 0 keeps the default and ends the analysis with Drain
+		err     string
+	}{
+		{"shutdown", 0, msgInterrupted},
+		{"job deadline", 6 * time.Second, msgTimedOut},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			m := newChainModel(t)
+			s, srv, base := chainServer(t, m, func(cfg *Config) { cfg.JobTimeout = c.timeout })
+			m.hold(t, "RegressionHypotheses")
+			var a Analysis
+			if code := do(t, "POST", srv.URL+"/api/analyses", startBody("r1", base, "slow"), &a); code != 202 {
+				t.Fatalf("POST %d", code)
+			}
+			m.waitFor(t, "RegressionHypotheses")
+			if c.timeout == 0 {
+				drainNow(t, s)
+			}
+			got := pollDone(t, srv.URL, a.ID)
+			if got.Status != "error" || got.Error != c.err || got.Model != nil || len(got.Evidence) == 0 {
+				t.Fatalf("status %q error %q model %+v, %d evidence items; want error %q with evidence and no model result",
+					got.Status, got.Error, got.Model, len(got.Evidence), c.err)
+			}
+			rv := got.Review
+			if rv == nil || rv.Status != "error" || rv.Message != msgReviewEnded || rv.CheckStatus != "skipped" || rv.CheckMessage != "no review to check" {
+				t.Fatalf("review %+v, want error %q", rv, msgReviewEnded)
+			}
+			if n := m.Names(); !slices.Equal(n, []string{"RegressionHypotheses"}) {
+				t.Fatalf("model calls %v, want only RegressionHypotheses", n)
+			}
+		})
+	}
+}
+
 // A shutdown during the review call ends the analysis as interrupted. The
 // hypotheses are kept, and the review is an error.
 func TestDrainDuringReviewEndsIt(t *testing.T) {
