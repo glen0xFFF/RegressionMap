@@ -19,6 +19,9 @@ import {
   hostileTypesAnalysis,
   review,
   hostileReviewAnalysis,
+  cappedReviewAnalysis,
+  cappedStatusAnalysis,
+  cappedCheckAnalysis,
   printedSummary,
 } from './harness.mjs';
 
@@ -42,6 +45,9 @@ const fixtures = [
   ['fields of the wrong type', hostileTypesAnalysis],
   ['a Muse review', () => analysis({ review: review() })],
   ['hostile review text', hostileReviewAnalysis],
+  ['review text over its caps', cappedReviewAnalysis],
+  ['a review status and message over their caps', cappedStatusAnalysis],
+  ['a check message over its cap', cappedCheckAnalysis],
 ];
 
 describe('parity: ci-analyze.sh and ci-analyze.ps1', ps.available ? { concurrency: 3 } : { skip: ps.skipReason }, () => {

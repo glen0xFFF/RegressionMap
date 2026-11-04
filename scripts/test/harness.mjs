@@ -292,6 +292,9 @@ export function finding(over = {}) {
 export const unchecked = () => ({ verdict: 'unchecked', reason: '', evidence_ids: [] });
 
 // A review with one finding per verdict. The refuted one (R2) is only counted.
+// The ids follow contract rule 5: severity (high, medium, low), then lens
+// (security, code, feature), so the low code finding R3 comes before the low
+// feature finding R4.
 export function review(over = {}) {
   return {
     status: 'ok',
@@ -318,7 +321,7 @@ export function review(over = {}) {
       }),
       finding({
         id: 'R3',
-        lens: 'feature',
+        lens: 'code',
         severity: 'low',
         title: 'Empty page not handled',
         detail: '',
@@ -331,7 +334,7 @@ export function review(over = {}) {
       }),
       finding({
         id: 'R4',
-        lens: 'code',
+        lens: 'feature',
         severity: 'low',
         title: 'Possible overflow',
         detail: '',
@@ -361,8 +364,8 @@ export const REVIEW_SECTION = reviewSection([
   '- R1 [security · high · confirmed] **Token compared with ==** — `src/auth.ts:12` — evidence: E3',
   '  Timing leak in the token check.',
   '  Muse check: E3 shows a plain == comparison.',
-  '- R3 [feature · low · unchecked] **Empty page not handled** — evidence: E2',
-  '- R4 [code · low · disputed] **Possible overflow** — `src/pagination.ts:7-13` — evidence: E2',
+  '- R3 [code · low · unchecked] **Empty page not handled** — evidence: E2',
+  '- R4 [feature · low · disputed] **Possible overflow** — `src/pagination.ts:7-13` — evidence: E2',
   '  Muse check: Unlikely with page sizes under 1000.',
   '',
   'Refuted by Muse check (not shown): 1',
@@ -561,6 +564,97 @@ export const HOSTILE_REVIEW_SUMMARY =
     '- R1 [security · high · confirmed] **' + HOSTILE_REVIEW_MD + '** — `src/' + HOSTILE_REVIEW_CODE + '.ts:12` — evidence: E3',
     '  ' + HOSTILE_REVIEW_MD,
     '  Muse check: ' + HOSTILE_REVIEW_MD,
+    '',
+    'Refuted by Muse check (not shown): 0',
+    'Rejected by validation: 0',
+  ]);
+
+// Review text over every cap of the review section that the output shows.
+// A cut value keeps max - 1 characters and ends with an ellipsis. The listed
+// finding keeps the verdict "confirmed", so that it is listed; the verdict
+// cap therefore cannot show. The check_status of a failed check is printed
+// only when it is exactly "error" or "invalid", so it has no cap to show.
+const CUT = '…';
+
+export function cappedReviewAnalysis() {
+  return analysis({
+    review: review({
+      counts: { confirmed: 1, disputed: 0, refuted: 0, unchecked: 0 },
+      findings: [
+        finding({
+          id: 'R' + '1'.repeat(20),
+          lens: 'l'.repeat(20),
+          severity: 's'.repeat(20),
+          title: 't'.repeat(250),
+          detail: 'd'.repeat(400),
+          file: 'f'.repeat(250),
+          evidence_ids: ['E' + '7'.repeat(20), 'E' + '8'.repeat(20)],
+          check: { verdict: 'confirmed', reason: 'r'.repeat(400), evidence_ids: ['E3'] },
+        }),
+      ],
+      rejected: [],
+    }),
+  });
+}
+
+export const CAPPED_REVIEW_SUMMARY =
+  BASE_SUMMARY +
+  reviewSection([
+    'Lenses: security 0, code 0, feature 0. Verdicts: 1 confirmed, 0 unchecked, 0 disputed, 0 refuted.',
+    '',
+    // id 12; lens, severity 12 each; title 200; file 200; evidence ids 12 each
+    '- R' + '1'.repeat(10) + CUT +
+      ' [' + 'l'.repeat(11) + CUT + ' · ' + 's'.repeat(11) + CUT + ' · confirmed]' +
+      ' **' + 't'.repeat(199) + CUT + '**' +
+      ' — `' + 'f'.repeat(199) + CUT + ':12`' +
+      ' — evidence: E' + '7'.repeat(10) + CUT + ', E' + '8'.repeat(10) + CUT,
+    // detail 300; check reason 300
+    '  ' + 'd'.repeat(299) + CUT,
+    '  Muse check: ' + 'r'.repeat(299) + CUT,
+    '',
+    'Refuted by Muse check (not shown): 0',
+    'Rejected by validation: 0',
+  ]);
+
+// A review that is not ok, over the status cap (20) and the message cap (300).
+export function cappedStatusAnalysis() {
+  return analysis({
+    review: review({
+      status: 'x'.repeat(30),
+      message: 'm'.repeat(400),
+      check_status: 'skipped',
+      check_message: 'no review to check',
+      counts: { confirmed: 0, disputed: 0, refuted: 0, unchecked: 0 },
+      findings: [],
+      rejected: [],
+    }),
+  });
+}
+
+export const CAPPED_STATUS_SUMMARY =
+  BASE_SUMMARY + reviewSection(['Muse review not available: ' + 'x'.repeat(19) + CUT + ' — ' + 'm'.repeat(299) + CUT]);
+
+// A failed check, over the check message cap (300).
+export function cappedCheckAnalysis() {
+  return analysis({
+    review: review({
+      check_status: 'error',
+      check_message: 'c'.repeat(400),
+      counts: { confirmed: 0, disputed: 0, refuted: 0, unchecked: 1 },
+      findings: [finding({ check: unchecked() })],
+      rejected: [],
+    }),
+  });
+}
+
+export const CAPPED_CHECK_SUMMARY =
+  BASE_SUMMARY +
+  reviewSection([
+    'Lenses: security 1, code 0, feature 0. Verdicts: 0 confirmed, 1 unchecked, 0 disputed, 0 refuted.',
+    'Muse check not available: error — ' + 'c'.repeat(299) + CUT,
+    '',
+    '- R1 [security · high · unchecked] **Token compared with ==** — `src/auth.ts:12` — evidence: E3',
+    '  Timing leak in the token check.',
     '',
     'Refuted by Muse check (not shown): 0',
     'Rejected by validation: 0',

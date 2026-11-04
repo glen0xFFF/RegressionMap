@@ -5,11 +5,12 @@ import type { Evidence, Review } from "../types";
 
 // All model text below is rendered as React text nodes (escaped), never as HTML.
 
-const NOT_OK: Record<Exclude<Review["status"], "ok">, { cls: string; lead: string }> = {
-  disabled: { cls: "card card-warn", lead: "Muse review not available" },
-  error: { cls: "card card-error", lead: "Muse review failed" },
-  invalid: { cls: "card card-error", lead: "Muse review was rejected as invalid" },
-  skipped: { cls: "card card-warn", lead: "Muse review skipped" },
+// fallback: the words HypothesesPanel uses for a failure line that has no message.
+const NOT_OK: Record<Exclude<Review["status"], "ok">, { cls: string; lead: string; fallback: string }> = {
+  disabled: { cls: "card card-warn", lead: "Muse review not available", fallback: "no details" },
+  error: { cls: "card card-error", lead: "Muse review failed", fallback: "unknown error" },
+  invalid: { cls: "card card-error", lead: "Muse review was rejected as invalid", fallback: "no details" },
+  skipped: { cls: "card card-warn", lead: "Muse review skipped", fallback: "no details" },
 };
 
 function Rejected({ items }: { items?: string[] | null }) {
@@ -46,7 +47,7 @@ function Body({
     const s = Object.prototype.hasOwnProperty.call(NOT_OK, rv.status) ? NOT_OK[rv.status] : NOT_OK.error;
     return (
       <>
-        <div className={s.cls}>{`${s.lead}: ${rv.message}`}</div>
+        <div className={s.cls}>{`${s.lead}: ${rv.message || s.fallback}`}</div>
         <Rejected items={rv.rejected} />
       </>
     );
@@ -65,7 +66,7 @@ function Body({
         <div>{`${c.confirmed} confirmed · ${c.unchecked} not checked · ${c.disputed} disputed · ${c.refuted} refuted`}</div>
       </div>
       {(rv.check_status === "error" || rv.check_status === "invalid") && (
-        <div className="card card-warn">{`Muse check ${rv.check_status}: ${rv.check_message}`}</div>
+        <div className="card card-warn">{`Muse check ${rv.check_status}: ${rv.check_message || "no details"}`}</div>
       )}
       {all.length === 0 ? (
         <div className="card muted">No findings.</div>

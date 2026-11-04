@@ -18,6 +18,10 @@
   --fail-soft: #fee2e2;
   --amber: #d97706;
   --amber-soft: #fef3c7;
+  /* text on the v4 review pills only: at least 4.5:1 on their soft backgrounds */
+  --pass-text: #166534;
+  --amber-text: #92400e;
+  --muted-text: #4b5563;
   --add-bg: #e6ffec;
   --add-ln: #ccffd8;
   --del-bg: #ffebe9;
@@ -49,6 +53,9 @@
     --pass-soft: rgba(22, 163, 74, 0.18);
     --fail-soft: rgba(220, 38, 38, 0.18);
     --amber-soft: rgba(217, 119, 6, 0.2);
+    --pass-text: #3fb950;
+    --amber-text: #e3b341;
+    --muted-text: #8b949e;
     --add-bg: rgba(46, 160, 67, 0.15);
     --add-ln: rgba(46, 160, 67, 0.28);
     --del-bg: rgba(248, 81, 73, 0.15);
@@ -151,7 +158,7 @@ button:disabled, select:disabled { opacity: 0.5; cursor: not-allowed; }
 }
 .recent-confirmed {
   font-size: 10.5px; font-weight: 600; padding: 0 6px; border-radius: 999px; white-space: nowrap; align-self: center;
-  background: var(--pass-soft); color: var(--pass); border: 1px solid color-mix(in srgb, var(--pass) 35%, transparent);
+  background: var(--pass-soft); color: var(--pass-text); border: 1px solid color-mix(in srgb, var(--pass) 35%, transparent);
 }
 .recent-item:hover, .recent-item.active { background: var(--bg-muted); }
 .recent-repo { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; }
@@ -363,9 +370,9 @@ details.group[open] > summary::before { transform: rotate(90deg); }
   background: var(--bg-muted); border: 1px solid var(--border); color: var(--text-2);
 }
 .verdict { font-size: 11px; font-weight: 600; padding: 0 8px; border-radius: 999px; line-height: 1.7; border: 1px solid var(--border); }
-.verdict-confirmed { background: var(--pass-soft); color: var(--pass); border-color: color-mix(in srgb, var(--pass) 40%, transparent); }
-.verdict-unchecked { background: var(--bg-muted); color: var(--muted); }
-.verdict-disputed { background: var(--amber-soft); color: var(--amber); border-color: color-mix(in srgb, var(--amber) 40%, transparent); }
+.verdict-confirmed { background: var(--pass-soft); color: var(--pass-text); border-color: color-mix(in srgb, var(--pass) 40%, transparent); }
+.verdict-unchecked { background: var(--bg-muted); color: var(--muted-text); }
+.verdict-disputed { background: var(--amber-soft); color: var(--amber-text); border-color: color-mix(in srgb, var(--amber) 40%, transparent); }
 .verdict-refuted { background: transparent; color: var(--muted); border-style: dashed; }
 .finding-refuted .finding-title { text-decoration: line-through; color: var(--muted); }
 .check-reason { color: var(--text-2); white-space: pre-wrap; word-break: break-word; }

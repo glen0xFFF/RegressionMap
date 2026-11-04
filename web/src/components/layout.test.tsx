@@ -87,6 +87,15 @@ describe("Sidebar", () => {
     rerender(<Sidebar {...baseProps} recent={[{ ...baseProps.recent[0], confirmed: 2 }]} />);
     expect(screen.getByText("2 confirmed")).toHaveClass("recent-confirmed");
   });
+
+  it("the confirmed badge carries the review disclaimer", () => {
+    render(<Sidebar {...baseProps} recent={[{ ...baseProps.recent[0], confirmed: 2 }]} />);
+    const badge = screen.getByText("2 confirmed");
+    expect(badge).toHaveClass("recent-confirmed");
+    expect(badge).toHaveTextContent(/^2 confirmed$/);
+    expect(badge).toHaveAttribute("title", REVIEW_DISCLAIMER);
+    expect(screen.getByRole("button", { name: /pagination-demo/ })).toHaveAttribute("title", "analysis a1 · fail · 2 confirmed");
+  });
 });
 
 const reviewFinding = (o: Partial<ReviewFinding> = {}): ReviewFinding => ({

@@ -61,6 +61,34 @@ describe("visibleFindings", () => {
   });
 });
 
+describe("findings whose verdict is not a known verdict", () => {
+  // A verdict the contract does not name, or none at all, counts as unchecked.
+  const odd: [string, (f: ReviewFinding) => ReviewFinding][] = [
+    ["a missing check", (f) => ({ ...f, check: undefined as unknown as ReviewFinding["check"] })],
+    ["a missing verdict", (f) => ({ ...f, check: { reason: "", evidence_ids: [] } as unknown as ReviewFinding["check"] })],
+    ["an unknown verdict", (f) => ({ ...f, check: { ...f.check, verdict: "maybe" as ReviewVerdict } })],
+    ["an inherited key toString", (f) => ({ ...f, check: { ...f.check, verdict: "toString" as ReviewVerdict } })],
+    ["an inherited key constructor", (f) => ({ ...f, check: { ...f.check, verdict: "constructor" as ReviewVerdict } })],
+  ];
+
+  it.each(odd)("displayOrder puts a finding with %s among the unchecked", (_, make) => {
+    const fs = [
+      finding("R1", "refuted"),
+      finding("R2", "disputed"),
+      make(finding("R3", "unchecked")),
+      finding("R4", "unchecked"),
+      finding("R5", "confirmed"),
+    ];
+    expect(ids(displayOrder(fs))).toEqual(["R5", "R3", "R4", "R2", "R1"]);
+  });
+
+  it.each(odd)("visibleFindings keeps a finding with %s when refuted findings are hidden", (_, make) => {
+    const rv = review([finding("R1", "refuted"), finding("R2", "disputed"), make(finding("R3", "unchecked")), finding("R4", "confirmed")]);
+    expect(ids(visibleFindings(rv, false))).toEqual(["R4", "R3", "R2"]);
+    expect(ids(visibleFindings(rv, true))).toEqual(["R4", "R3", "R2", "R1"]);
+  });
+});
+
 describe("lensCounts", () => {
   it("lensCounts counts each lens", () => {
     const lens = (id: string, l: ReviewLens) => finding(id, "confirmed", { lens: l });

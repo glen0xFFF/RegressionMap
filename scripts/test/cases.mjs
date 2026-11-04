@@ -33,6 +33,12 @@ import {
   REVIEW_SECTION,
   hostileReviewAnalysis,
   HOSTILE_REVIEW_SUMMARY,
+  cappedReviewAnalysis,
+  CAPPED_REVIEW_SUMMARY,
+  cappedStatusAnalysis,
+  CAPPED_STATUS_SUMMARY,
+  cappedCheckAnalysis,
+  CAPPED_CHECK_SUMMARY,
 } from './harness.mjs';
 
 const done = (over) => ({ status: 200, json: analysis(over) });
@@ -654,6 +660,12 @@ export function defineCases(runner) {
         analysis({ review: review({ check_status: 'er' + shy + 'ror', check_message: 'x' }) }),
         BASE_SUMMARY + REVIEW_SECTION,
       );
+    });
+
+    test('review text over a cap is cut with an ellipsis', async () => {
+      await expectSummary(cappedReviewAnalysis(), CAPPED_REVIEW_SUMMARY);
+      await expectSummary(cappedStatusAnalysis(), CAPPED_STATUS_SUMMARY);
+      await expectSummary(cappedCheckAnalysis(), CAPPED_CHECK_SUMMARY);
     });
 
     test('exit codes do not depend on findings', async () => {

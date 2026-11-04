@@ -1,5 +1,6 @@
 import { HistoryIcon, KeyIcon, LogOutIcon, SearchIcon, SparkleIcon } from "./Icons";
 import type { RecentEntry } from "../layout";
+import { REVIEW_DISCLAIMER } from "../review";
 import type { Health, Loadable, Me } from "../types";
 
 export type View = "analyze" | "history" | "keys";
@@ -83,7 +84,12 @@ export function Sidebar({
                 >
                   <span className={`dot dot-${r.dot}`} aria-hidden="true" />
                   <span className="recent-repo">{r.repo}</span>
-                  {confirmed > 0 && <span className="recent-confirmed">{`${confirmed} confirmed`}</span>}
+                  {confirmed > 0 && (
+                    // The badge shows a review result, so it carries the contract disclaimer.
+                    <span className="recent-confirmed" title={REVIEW_DISCLAIMER}>
+                      {`${confirmed} confirmed`}
+                    </span>
+                  )}
                   <span className="recent-date muted">{fmtDate(r.startedAt)}</span>
                 </button>
               </li>
