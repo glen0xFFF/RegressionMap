@@ -208,7 +208,7 @@ func (c *Client) result(status, msg string) Result {
 // named strict JSON schema, and returns the answer's content. status is ""
 // on success, "error" when the request failed (msg is the key-free failure
 // from post) and "invalid" when the response was not a chat completion.
-func (c *Client) complete(ctx context.Context, system, user, schemaName string, schema map[string]any) (content, status, msg string) {
+func (c *Client) complete(ctx context.Context, system, user, schemaName string, answerSchema map[string]any) (content, status, msg string) {
 	body, _ := json.Marshal(map[string]any{
 		"model": c.Model,
 		"messages": []map[string]string{
@@ -217,7 +217,7 @@ func (c *Client) complete(ctx context.Context, system, user, schemaName string, 
 		},
 		"response_format": map[string]any{
 			"type":        "json_schema",
-			"json_schema": map[string]any{"name": schemaName, "strict": true, "schema": schema},
+			"json_schema": map[string]any{"name": schemaName, "strict": true, "schema": answerSchema},
 		},
 	})
 	ctx, cancel := context.WithTimeout(ctx, c.timeout())
