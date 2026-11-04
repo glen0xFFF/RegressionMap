@@ -490,7 +490,7 @@ func TestNotifyIntegrationWithRealSender(t *testing.T) {
 			t.Errorf("slack text lacks %q: %s", want, msg.Text)
 		}
 	}
-	if !strings.HasSuffix(msg.Text, "AI-generated hypothesis, not verified.") {
+	if !strings.HasSuffix(msg.Text, "AI-generated hypothesis and review, not verified.") {
 		t.Fatalf("slack text: %s", msg.Text)
 	}
 	for _, ev := range got.Evidence {
