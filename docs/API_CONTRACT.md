@@ -415,3 +415,13 @@ A delivery still running when the 25 s drain ends is not finished by this proces
 
 - With `DATA_DIR`, the stored analysis keeps the notification as it was when the analysis finished: `status` `pending`, `attempts` 0, `last_status_code` 0 and `last_error` `""`. The next process shows it as `failed` with `last_error` `delivery interrupted: the server stopped before it finished`. `attempts` and `last_status_code` stay 0, also when attempts were made before the stop. The next process never retries the delivery, because the URL was held in memory only.
 - Without `DATA_DIR`, nothing of the analysis remains after the restart.
+
+### 8. Escaped log text, the U+FFFD host character and the secret count (completes entries 3, 4 and 5)
+
+These points complete entries 3, 4 and 5. They change no rule. The code already behaves this way, from the same release as those entries.
+
+- **Entry 3, what a reader gets:** each escape is six characters of text inside the string value: a backslash, `u` and four lowercase hex digits. The JSON encoder escapes that backslash, so the raw line shows `\\u202e` and a JSON parser returns the six characters `\u202e`, not U+202E.
+- **Entry 3, characters above U+FFFF:** a format character above U+FFFF, for example the tag character U+E0041, is written as its UTF-16 surrogate pair, two such escapes: `\udb40\udc41`.
+- **Entry 3, error values:** an error value is replaced by its escaped error text only when that text holds a character entry 3 names. Otherwise it is written as before: as its error text or, for an error type with its own JSON encoding, as that encoding. Values of kinds other than string and error, and any text inside them, are written as before.
+- **Entry 4, U+FFFD:** the host check cannot tell invalid UTF-8 from the replacement character U+FFFD, so a host that holds a validly encoded U+FFFD, raw or percent-encoded as `%EF%BF%BD`, is refused too, with `400 invalid_notify_url` and `notify_url is not a valid URL`.
+- **Entry 5, bytes that are not UTF-8:** each byte of `WEBHOOK_SECRET` that is not part of a valid UTF-8 sequence counts as one character.
