@@ -425,3 +425,7 @@ These points complete entries 3, 4 and 5. They change no rule. The code already 
 - **Entry 3, error values:** an error value is replaced by its escaped error text only when that text holds a character entry 3 names. Otherwise it is written as before: as its error text or, for an error type with its own JSON encoding, as that encoding. Values of kinds other than string and error, and any text inside them, are written as before.
 - **Entry 4, U+FFFD:** the host check cannot tell invalid UTF-8 from the replacement character U+FFFD, so a host that holds a validly encoded U+FFFD, raw or percent-encoded as `%EF%BF%BD`, is refused too, with `400 invalid_notify_url` and `notify_url is not a valid URL`.
 - **Entry 5, bytes that are not UTF-8:** each byte of `WEBHOOK_SECRET` that is not part of a valid UTF-8 sequence counts as one character.
+
+### 9. Strings inside groups and LogValuer values (corrects entry 8)
+
+Entry 8 says that values of kinds other than string and error, and any text inside them, are written as before. That is not complete. The handler applies the escaping of entry 3 to each attribute inside a group and to the value a LogValuer resolves to, so a string inside a group, or a string that a LogValuer returns, is escaped like any other string value. Lists, maps and structs are written as before. The server logs no groups and no LogValuer values, so no line the server writes changes.
