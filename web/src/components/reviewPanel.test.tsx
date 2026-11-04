@@ -173,6 +173,32 @@ describe("ReviewPanel", () => {
     expect(screen.getByRole("button", { name: "Show 2 refuted" })).toBeInTheDocument();
   });
 
+  it("ReviewPanel shows findings the diff view cannot anchor", () => {
+    // src/util.ts has a source item and no diff_hunk; the first finding is about no file.
+    const withSource: Evidence[] = [
+      ...evidence,
+      { id: "E4", type: "source", title: "util source", file: "src/util.ts", line_start: 1, line_end: 30, excerpt: "y" },
+    ];
+    const rv = review({
+      counts: { confirmed: 1, disputed: 0, refuted: 0, unchecked: 1 },
+      findings: [
+        finding("R1", "confirmed", { title: "No file finding", file: "", line_start: 0, line_end: 0 }),
+        finding("R2", "unchecked", { title: "Source only finding", file: "src/util.ts", line_start: 3, line_end: 4, evidence_ids: ["E2", "E4"] }),
+      ],
+    });
+    const { container } = render(
+      <ReviewPanel review={rv} running={false} evidence={withSource} showRefuted={false} onToggleRefuted={() => {}} onSelectEvidence={() => {}} />,
+    );
+    expect([...container.querySelectorAll(".finding-title")].map((e) => e.textContent)).toEqual([
+      "No file finding",
+      "Source only finding",
+    ]);
+    const noFile = screen.getByText("No file finding").closest("article") as HTMLElement;
+    expect(noFile.querySelector(".loc-chip")).toBeNull();
+    const sourceOnly = screen.getByText("Source only finding").closest("article") as HTMLElement;
+    expect(within(sourceOnly).getByText("src/util.ts:L3-L4")).toHaveClass("loc-chip");
+  });
+
   it("review text renders as text", () => {
     const hostile = finding("R1", "confirmed", {
       title: "<img src=x onerror=alert(1)>",
