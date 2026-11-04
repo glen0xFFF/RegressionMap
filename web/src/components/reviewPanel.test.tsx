@@ -153,6 +153,14 @@ describe("ReviewPanel", () => {
     expect(onToggle).toHaveBeenCalledTimes(2);
   });
 
+  it("the refuted toggle names its action and has no pressed state", () => {
+    const rv = review({ counts: { confirmed: 0, disputed: 0, refuted: 1, unchecked: 0 }, findings: [finding("R1", "refuted")] });
+    const { rerender } = render(panel(rv));
+    expect(screen.getByRole("button", { name: "Show 1 refuted" })).not.toHaveAttribute("aria-pressed");
+    rerender(panel(rv, { showRefuted: true }));
+    expect(screen.getByRole("button", { name: "Hide 1 refuted" })).not.toHaveAttribute("aria-pressed");
+  });
+
   it("ReviewPanel keeps the toggle and not No findings when every finding is refuted", () => {
     const rv = review({
       counts: { confirmed: 0, disputed: 0, refuted: 2, unchecked: 0 },

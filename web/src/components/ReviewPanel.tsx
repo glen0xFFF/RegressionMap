@@ -79,7 +79,9 @@ function Body({
         </div>
       )}
       {refuted > 0 && (
-        <button type="button" className="btn-outline btn-sm refuted-toggle" aria-pressed={showRefuted} onClick={onToggleRefuted}>
+        // The label names the action ("Show" / "Hide"), so no aria-pressed: a pressed
+        // state on a label that changes would give a screen reader two signals.
+        <button type="button" className="btn-outline btn-sm refuted-toggle" onClick={onToggleRefuted}>
           {showRefuted ? `Hide ${refuted} refuted` : `Show ${refuted} refuted`}
         </button>
       )}
