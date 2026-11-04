@@ -192,13 +192,13 @@ function place<T extends { file: string; line_start: number; line_end: number }>
   const hunks = diffHunks(evidence);
   const parsed = hunks.map((h) => ({ ev: h, rows: parseHunk(h.excerpt) }));
 
-  for (const h of items) {
-    const mine = parsed.filter((p) => p.ev.file === h.file);
-    if (!h.file || mine.length === 0) continue;
+  for (const item of items) {
+    const mine = parsed.filter((p) => p.ev.file === item.file);
+    if (!item.file || mine.length === 0) continue;
     let placed = false;
-    if (h.line_start > 0) {
-      const start = h.line_start;
-      const end = Math.max(h.line_end || start, start);
+    if (item.line_start > 0) {
+      const start = item.line_start;
+      const end = Math.max(item.line_end || start, start);
       for (const p of mine) {
         const nums = p.rows.map((r) => r.newNo).filter((n): n is number => n !== null);
         if (nums.length === 0) continue;
@@ -229,12 +229,12 @@ function place<T extends { file: string; line_start: number; line_end: number }>
           m = new Map();
           rows.set(p.ev.id, m);
         }
-        m.set(idx, [...(m.get(idx) ?? []), h]);
+        m.set(idx, [...(m.get(idx) ?? []), item]);
         placed = true;
         break;
       }
     }
-    if (!placed) fileLevel.set(h.file, [...(fileLevel.get(h.file) ?? []), h]);
+    if (!placed) fileLevel.set(item.file, [...(fileLevel.get(item.file) ?? []), item]);
   }
   return { rows, fileLevel };
 }
